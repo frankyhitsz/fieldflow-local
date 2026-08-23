@@ -1,0 +1,103 @@
+import { useEffect, useMemo, useState } from 'react'
+import { Beaker, Check, Edit3, Gauge, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react'
+import { api } from './api'
+import type { PlanVersion, Scenario, StrategyExperiment, StrategyProfile, StrategyWeights } from './types'
+
+const pct = (value: number) => `${Math.round(value * 100)}%`
+const defaultWeights: StrategyWeights = {
+  travel_weight: 4, sla_late_weight: 12, overtime_weight: 30,
+  imbalance_weight: 1, replan_change_weight: 80, unassigned_penalty_scale: 1,
+}
+
+type ProfileDraft = { id?: string; name: string; description: string; weights: StrategyWeights; time_limit_seconds: number }
+
+function ProfileEditor({ initial, onClose, onSaved }: { initial?: StrategyProfile; onClose: () => void; onSaved: () => void }) {
+  const [draft, setDraft] = useState<ProfileDraft>(() => initial ? { id: initial.id, name: initial.name, description: initial.description, weights: { ...initial.weights }, time_limit_seconds: initial.time_limit_seconds } : { name: '我的调度策略', description: '结合当前业务偏好的自定义权重', weights: { ...defaultWeights }, time_limit_seconds: 2 })
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const weightFields: { key: keyof StrategyWeights; label: string; step?: number; min?: number; max?: number }[] = [
+    { key: 'travel_weight', label: '行程权重', min: 0, max: 1000 },
+    { key: 'sla_late_weight', label: 'SLA 延迟权重', min: 0, max: 1000 },
+    { key: 'overtime_weight', label: '加班权重', min: 0, max: 1000 },
+    { key: 'imbalance_weight', label: '工作量失衡权重', min: 0, max: 1000 },
+    { key: 'replan_change_weight', label: '重排变更权重', min: 0, max: 2000 },
+    { key: 'unassigned_penalty_scale', label: '未分配惩罚倍率', min: .1, max: 5, step: .1 },
+  ]
+  const save = async () => {
+    setSaving(true); setError('')
+    try {
+      const payload = { name: draft.name, description: draft.description, weights: draft.weights, time_limit_seconds: draft.time_limit_seconds }
+      if (draft.id) await api.updateStrategyProfile(draft.id, payload)
+      else await api.createStrategyProfile(payload)
+      onSaved(); onClose()
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '策略保存失败') }
+    finally { setSaving(false) }
+  }
+  return <div className="modal-backdrop"><section className="editor-modal strategy-editor">
+    <div className="editor-head"><div><span className="eyebrow">STRATEGY PROFILE</span><h2>{initial ? '编辑自定义策略' : '新建自定义策略'}</h2></div><button className="icon-btn" onClick={onClose}><X /></button></div>
+    <div className="form-grid"><label>策略名称<input value={draft.name} onChange={event => setDraft(current => ({ ...current, name: event.target.value }))} /></label><label>单项求解时限（秒）<input type="number" min="0.05" max="30" step="0.5" value={draft.time_limit_seconds} onChange={event => setDraft(current => ({ ...current, time_limit_seconds: Number(event.target.value) }))} /></label><label className="span-2">使用说明<textarea rows={2} value={draft.description} onChange={event => setDraft(current => ({ ...current, description: event.target.value }))} /></label>
+      {weightFields.map(field => <label key={field.key}>{field.label}<input type="number" min={field.min} max={field.max} step={field.step || 1} value={draft.weights[field.key]} onChange={event => setDraft(current => ({ ...current, weights: { ...current.weights, [field.key]: Number(event.target.value) } }))} /></label>)}
+    </div>
+    <p className="profile-note">不同策略的原始目标值不可直接横比。实验室会用固定的均衡公式重新评价所有候选。</p>
+    {error && <p className="form-error">{error}</p>}
+    <div className="editor-actions"><button onClick={onClose}>取消</button><button className="page-primary" disabled={saving || draft.name.trim().length < 2} onClick={save}><Save size={15} />保存策略</button></div>
+  </section></div>
+}
+
+export function StrategyLab({ scenario, profiles, loadingDataset, onSelectDataset, onReloadProfiles, onPublished, onToast }: { scenario: Scenario; profiles: StrategyProfile[]; loadingDataset: boolean; onSelectDataset: (id: string) => void; onReloadProfiles: () => Promise<void>; onPublished: (plan: PlanVersion) => void; onToast: (message: string) => void }) {
+  const selectable = profiles.filter(profile => profile.id !== 'stable')
+  const [selected, setSelected] = useState<string[]>([])
+  const [experiment, setExperiment] = useState<StrategyExperiment>()
+  const [editor, setEditor] = useState<StrategyProfile | null | undefined>()
+  const [working, setWorking] = useState('')
+
+  useEffect(() => {
+    if (!selected.length && selectable.length) setSelected(selectable.map(profile => profile.id))
+  }, [selectable.length])
+
+  useEffect(() => {
+    if (!experiment || !['QUEUED', 'RUNNING'].includes(experiment.status)) return
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      try {
+        const next = await api.experiment(experiment.scenario_id, experiment.id)
+        if (!cancelled) setExperiment(next)
+      } catch (cause) {
+        if (!cancelled) onToast(cause instanceof Error ? cause.message : '实验进度读取失败')
+      }
+    }, 650)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [experiment?.id, experiment?.status])
+
+  const run = async () => {
+    setWorking('正在冻结数据并启动策略实验')
+    try { setExperiment(await api.createExperiment(scenario.id, selected)); onToast('策略实验已启动，候选不会占用公开版本号') }
+    catch (cause) { onToast(cause instanceof Error ? cause.message : '策略实验启动失败') }
+    finally { setWorking('') }
+  }
+
+  const publish = async (candidateId: string) => {
+    if (!experiment) return
+    setWorking('正在发布候选方案')
+    try {
+      const plan = await api.publishExperiment(scenario.id, experiment.id, candidateId, scenario.revision)
+      onPublished(plan); onToast(`已发布为 V${String(plan.number).padStart(3, '0')}`)
+    } catch (cause) { onToast(cause instanceof Error ? cause.message : '候选发布失败') }
+    finally { setWorking('') }
+  }
+
+  const bestScore = useMemo(() => experiment?.candidates.length ? Math.min(...experiment.candidates.map(item => item.evaluation_score)) : undefined, [experiment])
+  return <section className="page-view strategy-lab" aria-busy={loadingDataset}>
+    <div className="page-title"><div><span className="eyebrow">STRATEGY LAB</span><h1>策略实验室</h1><p>在同一份冻结数据上运行多种策略，看清完成率、准时、行程、加班与公平之间的取舍。</p></div><button className="page-primary" disabled={loadingDataset} onClick={() => setEditor(null)}><Plus size={15} />自定义策略</button></div>
+    <div className="lab-dataset"><div><span>实验数据集</span><strong>{loadingDataset ? '正在载入冻结数据…' : scenario.name}</strong><small>{scenario.technicians.length} 名技师 · {scenario.work_orders.length} 个工单 · D{String(scenario.revision).padStart(3, '0')}</small></div><div><button disabled={loadingDataset} className={scenario.id === 'strategy-medium' ? 'active' : ''} onClick={() => onSelectDataset('strategy-medium')}>中型 8 / 60</button><button disabled={loadingDataset} className={scenario.id === 'strategy-stress' ? 'active' : ''} onClick={() => onSelectDataset('strategy-stress')}>压力型 12 / 100</button></div></div>
+    <div className="profile-selector"><div className="lab-section-head"><div><span className="eyebrow">CANDIDATES</span><h2>选择参与实验的策略</h2></div><button className={`run-experiment ${experiment && ['QUEUED', 'RUNNING'].includes(experiment.status) ? 'running' : ''}`} disabled={loadingDataset || !!working || !!(experiment && ['QUEUED', 'RUNNING'].includes(experiment.status)) || !selected.length} onClick={run}>{experiment && ['QUEUED', 'RUNNING'].includes(experiment.status) ? <RefreshCw size={16} /> : <Beaker size={16} />}{experiment?.status === 'QUEUED' ? '等待前序实验' : experiment?.status === 'RUNNING' ? `运行中 ${experiment.progress}%` : '运行所选策略'}</button></div>
+      <div className="profile-grid">{selectable.map(profile => <article className={`profile-card ${selected.includes(profile.id) ? 'selected' : ''}`} key={profile.id}><label><input type="checkbox" disabled={loadingDataset} checked={selected.includes(profile.id)} onChange={event => setSelected(current => event.target.checked ? [...current, profile.id] : current.filter(id => id !== profile.id))} /><span><strong>{profile.name}</strong><small>{profile.description}</small></span></label><div className="profile-weights"><span>行程 {profile.weights.travel_weight}</span><span>SLA {profile.weights.sla_late_weight}</span><span>加班 {profile.weights.overtime_weight}</span><span>公平 {profile.weights.imbalance_weight}</span></div>{!profile.builtin && <div className="profile-actions"><button disabled={loadingDataset} onClick={() => setEditor(profile)}><Edit3 size={14} />编辑</button><button disabled={loadingDataset} onClick={async () => { if (!window.confirm(`删除策略“${profile.name}”？`)) return; try { await api.deleteStrategyProfile(profile.id); await onReloadProfiles(); setSelected(current => current.filter(id => id !== profile.id)) } catch (cause) { onToast(cause instanceof Error ? cause.message : '删除失败') } }}><Trash2 size={14} />删除</button></div>}</article>)}</div>
+    </div>
+    {experiment && <div className="experiment-results"><div className="lab-section-head"><div><span className="eyebrow">RESULT MATRIX</span><h2>同场结果</h2><p>统一评估分越低越好；每列 KPI 均使用相同业务口径。</p></div><span className={`experiment-status ${experiment.status.toLowerCase()}`}>{experiment.status === 'QUEUED' ? '等待运行' : experiment.status === 'RUNNING' ? `${experiment.progress}%` : experiment.status}</span></div>
+      {experiment.error && <div className="stale-banner"><Gauge size={16} /><div><strong>实验没有完成</strong><span>{experiment.error}</span></div></div>}
+      {!!experiment.candidates.length && <div className="candidate-table-wrap"><table className="candidate-table"><thead><tr><th>策略</th><th>完成率</th><th>SLA</th><th>行程</th><th>加班</th><th>公平度</th><th>统一评估分</th><th>操作</th></tr></thead><tbody>{experiment.candidates.map(candidate => <tr key={candidate.id} className={candidate.evaluation_score === bestScore ? 'recommended' : ''}><td><strong>{candidate.profile_name}</strong><div>{candidate.advantages.map(item => <span key={item}>{item}</span>)}</div></td><td>{pct(candidate.schedule.kpis.completion_rate)}</td><td>{pct(candidate.schedule.kpis.sla_on_time_rate)}</td><td>{candidate.schedule.kpis.total_travel_minutes}′</td><td>{candidate.schedule.kpis.total_overtime_minutes}′</td><td>{candidate.schedule.kpis.workload_stddev}</td><td><b>{candidate.evaluation_score.toLocaleString()}</b><small>{candidate.schedule.solver_status} · {candidate.schedule.runtime_ms} ms</small></td><td><button disabled={!candidate.publishable || !!working || experiment.status !== 'COMPLETED'} onClick={() => publish(candidate.id)}><Check size={14} />选择并发布</button></td></tr>)}</tbody></table></div>}
+    </div>}
+    {working && <div className="working lab-working"><RefreshCw size={14} />{working}</div>}
+    {editor !== undefined && <ProfileEditor initial={editor || undefined} onClose={() => setEditor(undefined)} onSaved={onReloadProfiles} />}
+  </section>
+}
