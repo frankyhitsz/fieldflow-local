@@ -12,11 +12,10 @@ test('baseline, optimize, compare, arbitrary restore, and version report', async
 
   await page.getByRole('button', { name: '方案版本' }).click()
   await expect(page.getByRole('heading', { name: '方案版本' })).toBeVisible()
-  await page.getByLabel('比较起点').selectOption({ label: /V001/ })
-  await page.getByLabel('比较终点').selectOption({ label: /V002/ })
+  await page.getByLabel('比较起点').selectOption({ label: 'V001 · 人工基线' })
+  await page.getByLabel('比较终点').selectOption({ label: 'V002 · 均衡优化' })
   await page.getByRole('button', { name: '比较' }).click()
   await expect(page.getByRole('heading', { name: '方案对比' })).toBeVisible()
-  await page.keyboard.press('Escape')
   await page.locator('.compare-modal .icon-btn').click()
 
   const v1 = page.locator('.version-row').filter({ hasText: 'V001' })
