@@ -10,12 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -25,4 +25,13 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npx playwright install --with-deps chromium
         working-directory: frontend
-      - run: make verify
+      - name: Test backend and API
+        run: make test
+      - name: Test React components
+        run: make test-frontend
+      - name: Build frontend
+        run: make build
+      - name: Run demo check
+        run: make demo-check
+      - name: Run Playwright flow
+        run: make test-e2e

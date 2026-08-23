@@ -19,7 +19,7 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   timeout: 30_000,
-  reporter: [['list']],
+  reporter: process.env.CI ? [['github'], ['list']] : [['list']],
   use: {
     baseURL: `http://127.0.0.1:${port}`,
     channel: executablePath || process.env.CI ? undefined : 'chrome',
