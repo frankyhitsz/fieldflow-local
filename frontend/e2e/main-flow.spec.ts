@@ -18,7 +18,7 @@ test('baseline, optimize, compare, arbitrary restore, and version report', async
   await expect(page.getByRole('heading', { name: '方案对比' })).toBeVisible()
   await page.locator('.compare-modal .icon-btn').click()
 
-  const v1 = page.locator('.version-row').filter({ hasText: 'V001' })
+  const v1 = page.getByRole('button', { name: '打开 V001', exact: true }).locator('..')
   page.once('dialog', dialog => dialog.accept())
   await v1.getByRole('button', { name: '恢复为新版本' }).click()
   await expect(page.locator('.command-context').getByText(/V003/)).toBeVisible({ timeout: 15_000 })
