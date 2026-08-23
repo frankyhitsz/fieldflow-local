@@ -5,28 +5,64 @@ import statistics
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
+import ortools
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
+from .hashing import content_hash
 from .models import (
     ScheduleAssignment,
     ScheduleKPI,
     ScheduleResult,
     ScheduleScenario,
     SolverStatus,
+    StrategyProfile,
     Technician,
     TechnicianKPI,
     UnassignedReason,
     UnassignedWorkOrder,
     WorkOrder,
-    StrategyProfile,
 )
 from .timeutils import hhmm, travel_minutes
+from .travel import TRAVEL_MODEL_VERSION
+
+BUSINESS_SCORE_POLICY_VERSION = "FIELD_SERVICE_SCORE_V2"
+METRIC_POLICY_VERSION = "FIELD_SERVICE_METRICS_V2"
+
+
+ROUTING_STATUS_NAMES = {
+    0: "ROUTING_NOT_SOLVED",
+    1: "ROUTING_SUCCESS",
+    2: "ROUTING_PARTIAL_SUCCESS_LOCAL_OPTIMUM_NOT_REACHED",
+    3: "ROUTING_FAIL",
+    4: "ROUTING_FAIL_TIMEOUT",
+    5: "ROUTING_INVALID",
+    6: "ROUTING_INFEASIBLE",
+    7: "ROUTING_OPTIMAL",
+}
+
+
+def solver_status_from_routing(status_code: int, solution_found: bool) -> SolverStatus:
+    if status_code == 7 and solution_found:
+        return SolverStatus.optimal
+    if status_code == 2 and solution_found:
+        return SolverStatus.time_limit_feasible
+    if status_code == 1 and solution_found:
+        return SolverStatus.feasible
+    if status_code == 4:
+        return SolverStatus.time_limit_feasible if solution_found else SolverStatus.time_limit_no_solution
+    if status_code == 5:
+        return SolverStatus.invalid_model
+    if status_code == 6:
+        return SolverStatus.infeasible
+    if status_code == 3:
+        return SolverStatus.no_solution
+    return SolverStatus.failed
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _eligible(tech: Technician, order: WorkOrder) -> bool:
@@ -46,6 +82,7 @@ def _diagnose_unassigned(
             reason=UnassignedReason.no_eligible_technician,
             detail=f"没有技师同时具备 {', '.join(s.value for s in order.required_skills)} 技能",
             suggestions=["调整技能要求", "安排具备复合技能的外援"],
+            evidence={"eligible_technician_ids": []},
         )
     locked_to = locked.get(order.id)
     if locked_to:
@@ -56,6 +93,7 @@ def _diagnose_unassigned(
                 reason=UnassignedReason.locked_plan_conflict,
                 detail=f"锁定技师 {locked_to} 不满足技能要求或已不可用",
                 suggestions=["解除锁定", "改锁到具备所需技能的技师"],
+                evidence={"locked_technician_id": locked_to, "eligible": False},
             )
         eligible = [tech]
     individually_feasible = []
@@ -72,12 +110,14 @@ def _diagnose_unassigned(
                 reason=UnassignedReason.locked_plan_conflict,
                 detail=f"锁定技师 {locked_to} 无法在客户时间窗内到达",
                 suggestions=["解除锁定", "放宽客户时间窗", "调整指定技师班次"],
+                evidence={"locked_technician_id": locked_to, "window_start": order.window_start, "window_end": order.window_end},
             )
         return UnassignedWorkOrder(
             work_order_id=order.id,
             reason=UnassignedReason.time_window_infeasible,
             detail=f"最早可到达时间晚于客户时间窗 {hhmm(order.window_start)}–{hhmm(order.window_end)}",
             suggestions=["与客户协商放宽时间窗", "调整技师班次开始时间"],
+            evidence={"eligible_technician_ids": [item.id for item in eligible], "window_start": order.window_start, "window_end": order.window_end},
         )
     if all(finish > tech.shift_end + tech.overtime_limit for tech, finish in individually_feasible):
         if locked_to:
@@ -86,12 +126,14 @@ def _diagnose_unassigned(
                 reason=UnassignedReason.locked_plan_conflict,
                 detail=f"锁定技师 {locked_to} 执行后会超过允许加班上限",
                 suggestions=["解除锁定", "增加指定技师班次容量"],
+                evidence={"locked_technician_id": locked_to, "overtime_limit": tech.overtime_limit},
             )
         return UnassignedWorkOrder(
             work_order_id=order.id,
             reason=UnassignedReason.shift_capacity_exceeded,
             detail="可选技师即使单独执行也会超过允许加班上限",
             suggestions=["增加班次容量", "拆分或缩短服务任务"],
+            evidence={"eligible_technician_ids": [item.id for item in eligible]},
         )
     if dropped_by_solver:
         return UnassignedWorkOrder(
@@ -99,6 +141,7 @@ def _diagnose_unassigned(
             reason=UnassignedReason.dropped_by_objective,
             detail="按当前策略权重，这张工单没有进入最终路线",
             suggestions=["提高工单优先级", "放宽时间窗", "增加可用技师"],
+            evidence={"eligible_technician_ids": [item.id for item in eligible], "drop_penalty": order.drop_penalty},
         )
     if locked_to:
         return UnassignedWorkOrder(
@@ -106,12 +149,14 @@ def _diagnose_unassigned(
             reason=UnassignedReason.locked_plan_conflict,
             detail=f"锁定技师 {locked_to} 的现有路线无法同时满足该承诺",
             suggestions=["解除锁定", "调整同一技师的其他工单", "放宽客户时间窗"],
+            evidence={"locked_technician_id": locked_to},
         )
     return UnassignedWorkOrder(
         work_order_id=order.id,
         reason=UnassignedReason.shift_capacity_exceeded,
         detail="当前路线剩余容量无法容纳此工单",
         suggestions=["允许更长加班", "将低优先级工单移至下一服务日"],
+        evidence={"eligible_technician_ids": [item.id for item in eligible]},
     )
 
 
@@ -131,14 +176,9 @@ def _explanation(
         f"预计 {hhmm(start)} 开始，满足 {hhmm(order.window_start)}–{hhmm(order.window_end)} 客户时间窗",
         f"本段行程 {travel} 分钟，服务预计于 {hhmm(finish)} 完成",
     ]
-    alternatives = [t for t in scenario.technicians if t.id != tech.id and _eligible(t, order)]
-    if alternatives:
-        best_alt = min(travel_minutes(t.start_location, order.location) for t in alternatives)
-        delta = best_alt - travel_minutes(tech.start_location, order.location)
-        if delta > 0:
-            items.append(f"从班次起点估算，相比其他候选技师至少减少 {delta} 分钟行程")
-        else:
-            items.append(f"在 {len(alternatives) + 1} 名合格技师中平衡了时间窗、路程与工作量")
+    eligible = [item.id for item in scenario.technicians if _eligible(item, order)]
+    if len(eligible) > 1:
+        items.append(f"共有 {len(eligible)} 名技师满足技能要求；路线计算选择 {tech.id}")
     items.append("不会产生加班" if finish <= tech.shift_end else f"产生 {finish - tech.shift_end} 分钟加班，未超过上限")
     if locked:
         items.append("人工锁定已生效，本次求解保持指定技师")
@@ -149,14 +189,91 @@ def _explanation(
     return items
 
 
-def _calculate_kpis(
+def _attach_route_insertion_evidence(
+    scenario: ScheduleScenario,
+    assignments: list[ScheduleAssignment],
+) -> None:
+    """Record route-local travel deltas without claiming a global counterfactual optimum."""
+    orders = {item.id: item for item in scenario.work_orders}
+    technicians = {item.id: item for item in scenario.technicians}
+    grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
+    for assignment in assignments:
+        grouped[assignment.technician_id].append(assignment)
+    for route in grouped.values():
+        route.sort(key=lambda item: item.sequence)
+
+    def cheapest_delta(technician: Technician, route: list[ScheduleAssignment], order: WorkOrder) -> int:
+        points = [technician.start_location, *[orders[item.work_order_id].location for item in route], technician.start_location]
+        return min(
+            travel_minutes(points[index], order.location)
+            + travel_minutes(order.location, points[index + 1])
+            - travel_minutes(points[index], points[index + 1])
+            for index in range(len(points) - 1)
+        )
+
+    for technician_id, route in grouped.items():
+        technician = technicians[technician_id]
+        for index, assignment in enumerate(route):
+            order = orders[assignment.work_order_id]
+            previous_point = technician.start_location if index == 0 else orders[route[index - 1].work_order_id].location
+            next_point = technician.start_location if index == len(route) - 1 else orders[route[index + 1].work_order_id].location
+            insertion_delta = (
+                travel_minutes(previous_point, order.location)
+                + travel_minutes(order.location, next_point)
+                - travel_minutes(previous_point, next_point)
+            )
+            alternatives = {
+                item.id: cheapest_delta(item, grouped.get(item.id, []), order)
+                for item in scenario.technicians
+                if item.id != technician_id and _eligible(item, order)
+            }
+            assignment.evidence["route_insertion_travel_delta_minutes"] = insertion_delta
+            assignment.evidence["alternative_route_travel_delta_minutes"] = alternatives
+            assignment.evidence["alternative_delta_scope"] = "travel_only_without_rescheduling"
+            assignment.explanation.append(f"在当前路线的前后工单之间插入此单，行程净增 {insertion_delta} 分钟")
+            if alternatives:
+                assignment.explanation.append(
+                    f"其他技能匹配路线的最低行程增量估算为 {min(alternatives.values())} 分钟（未重新排时）"
+                )
+
+
+def _mark_replan_changes(
+    assignments: list[ScheduleAssignment],
+    previous: ScheduleResult,
+    relevant_order_ids: set[str],
+) -> None:
+    previous_items = [item for item in previous.assignments if item.work_order_id in relevant_order_ids]
+    previous_ids = {item.work_order_id for item in previous_items}
+    old_predecessor: dict[str, str | None] = {}
+    new_predecessor: dict[str, str | None] = {}
+    old_by_id = {item.work_order_id: item for item in previous_items}
+    for source, target in ((previous_items, old_predecessor), ([item for item in assignments if item.work_order_id in previous_ids], new_predecessor)):
+        grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
+        for item in source:
+            grouped[item.technician_id].append(item)
+        for route in grouped.values():
+            predecessor: str | None = None
+            for item in sorted(route, key=lambda assignment: assignment.sequence):
+                target[item.work_order_id] = predecessor
+                predecessor = item.work_order_id
+    for item in assignments:
+        old = old_by_id.get(item.work_order_id)
+        item.changed = bool(
+            old
+            and (
+                old.technician_id != item.technician_id
+                or old_predecessor.get(item.work_order_id) != new_predecessor.get(item.work_order_id)
+            )
+        )
+
+
+def calculate_kpis(
     scenario: ScheduleScenario,
     assignments: list[ScheduleAssignment],
     unassigned: list[UnassignedWorkOrder],
     previous: ScheduleResult | None = None,
 ) -> ScheduleKPI:
     orders = {o.id: o for o in scenario.work_orders}
-    techs = {t.id: t for t in scenario.technicians}
     grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
     for assignment in assignments:
         grouped[assignment.technician_id].append(assignment)
@@ -166,10 +283,12 @@ def _calculate_kpis(
     total_travel = 0
     total_service = 0
     total_overtime = 0
+    total_waiting = 0
     for tech in scenario.technicians:
         route = sorted(grouped.get(tech.id, []), key=lambda a: a.sequence)
         service = sum(orders[a.work_order_id].service_duration for a in route)
         route_travel = sum(a.travel_minutes for a in route)
+        waiting = sum(max(0, item.start_time - item.arrival_time) for item in route)
         if route:
             route_travel += travel_minutes(orders[route[-1].work_order_id].location, tech.start_location)
             route_end = route[-1].finish_time + travel_minutes(orders[route[-1].work_order_id].location, tech.start_location)
@@ -178,10 +297,12 @@ def _calculate_kpis(
         overtime = max(0, route_end - tech.shift_end)
         shift_minutes = max(1, tech.shift_end - tech.shift_start)
         utilization = service / shift_minutes
+        occupied = route_travel + service + waiting
         workloads.append(service)
         total_travel += route_travel
         total_service += service
         total_overtime += overtime
+        total_waiting += waiting
         tech_kpis.append(
             TechnicianKPI(
                 technician_id=tech.id,
@@ -190,33 +311,85 @@ def _calculate_kpis(
                 overtime_minutes=overtime,
                 utilization=round(utilization, 4),
                 assignment_count=len(route),
+                waiting_minutes=waiting,
+                occupied_minutes=occupied,
+                service_utilization=round(utilization, 4),
+                occupied_utilization=round(occupied / shift_minutes, 4),
+                travel_ratio=round(route_travel / occupied, 4) if occupied else 0,
+                waiting_ratio=round(waiting / occupied, 4) if occupied else 0,
+                overtime_ratio=round(overtime / shift_minutes, 4),
+                normalized_workload=round(service / shift_minutes, 4),
             )
         )
 
-    assigned_count = len(assignments)
-    active_assigned_count = sum(
-        1
-        for assignment in assignments
-        if orders.get(assignment.work_order_id)
-        and orders[assignment.work_order_id].status.value != "completed"
-    )
+    active_assignments = [
+        assignment for assignment in assignments
+        if orders.get(assignment.work_order_id) and orders[assignment.work_order_id].status.value != "completed"
+    ]
+    active_assigned_count = len(active_assignments)
     active_total = len([o for o in scenario.work_orders if o.status.value != "completed"])
-    late_count = sum(1 for a in assignments if a.sla_late_minutes > 0)
-    high_missed = sum(1 for u in unassigned if orders[u.work_order_id].priority.value in {"urgent", "high"})
+    late_values = [item.sla_late_minutes for item in active_assignments]
+    late_count = sum(1 for value in late_values if value > 0)
+    on_time_count = active_assigned_count - late_count
+    high_missed = sum(1 for u in unassigned if orders.get(u.work_order_id) and orders[u.work_order_id].priority.value in {"urgent", "high"})
     stability: float | None = None
+    same_technician_rate: float | None = None
+    adjacency_rate: float | None = None
+    shift_median: float | None = None
+    shift_p90: int | None = None
+    shift_over_15: int | None = None
+    notification_count: int | None = None
     if previous:
         previous_pending = [a for a in previous.assignments if orders.get(a.work_order_id) and orders[a.work_order_id].status.value == "pending"]
         current_by_id = {a.work_order_id: a for a in assignments}
-        kept = 0
-        for old in previous_pending:
-            new = current_by_id.get(old.work_order_id)
-            if new and new.technician_id == old.technician_id and new.sequence == old.sequence:
-                kept += 1
+        previous_ids = {item.work_order_id for item in previous_pending}
+        old_predecessor: dict[str, str | None] = {}
+        new_predecessor: dict[str, str | None] = {}
+        old_routes: dict[str, list[ScheduleAssignment]] = defaultdict(list)
+        new_routes: dict[str, list[ScheduleAssignment]] = defaultdict(list)
+        for item in previous_pending:
+            old_routes[item.technician_id].append(item)
+        for item in assignments:
+            if item.work_order_id in previous_ids:
+                new_routes[item.technician_id].append(item)
+        old_pairs: set[tuple[str, str, str]] = set()
+        for tech_id, route in old_routes.items():
+            predecessor: str | None = None
+            ordered = sorted(route, key=lambda item: item.sequence)
+            for item in ordered:
+                old_predecessor[item.work_order_id] = predecessor
+                if predecessor is not None:
+                    old_pairs.add((tech_id, predecessor, item.work_order_id))
+                predecessor = item.work_order_id
+        new_pairs: set[tuple[str, str, str]] = set()
+        for tech_id, route in new_routes.items():
+            predecessor = None
+            ordered = sorted(route, key=lambda item: item.sequence)
+            for item in ordered:
+                new_predecessor[item.work_order_id] = predecessor
+                if predecessor is not None:
+                    new_pairs.add((tech_id, predecessor, item.work_order_id))
+                predecessor = item.work_order_id
+        same_count = sum(1 for old in previous_pending if current_by_id.get(old.work_order_id) and current_by_id[old.work_order_id].technician_id == old.technician_id)
+        kept = sum(1 for old in previous_pending if current_by_id.get(old.work_order_id) and current_by_id[old.work_order_id].technician_id == old.technician_id and new_predecessor.get(old.work_order_id) == old_predecessor.get(old.work_order_id))
+        shifts = [abs(current_by_id[old.work_order_id].start_time - old.start_time) for old in previous_pending if old.work_order_id in current_by_id]
         stability = kept / len(previous_pending) if previous_pending else 1.0
+        same_technician_rate = same_count / len(previous_pending) if previous_pending else 1.0
+        adjacency_rate = len(old_pairs & new_pairs) / len(old_pairs) if old_pairs else 1.0
+        shift_median = statistics.median(shifts) if shifts else 0
+        shift_p90 = sorted(shifts)[max(0, math.ceil(len(shifts) * .9) - 1)] if shifts else 0
+        shift_over_15 = sum(1 for value in shifts if value > 15)
+        notification_count = sum(1 for old in previous_pending if old.work_order_id not in current_by_id or current_by_id[old.work_order_id].technician_id != old.technician_id or abs(current_by_id[old.work_order_id].start_time - old.start_time) > 15)
+
+    assigned_rate = on_time_count / active_assigned_count if active_assigned_count else 0.0
+    committed_rate = on_time_count / active_total if active_total else 1.0
+    p90_late = sorted(late_values)[max(0, math.ceil(len(late_values) * .9) - 1)] if late_values else 0
+    workload_range = max(workloads) - min(workloads) if workloads else 0
+    normalized_values = [item.normalized_workload for item in tech_kpis]
 
     return ScheduleKPI(
         completion_rate=round(active_assigned_count / active_total, 4) if active_total else 1.0,
-        sla_on_time_rate=round((assigned_count - late_count) / assigned_count, 4) if assigned_count else 0.0,
+        sla_on_time_rate=round(assigned_rate, 4),
         sla_late_count=late_count,
         total_travel_minutes=total_travel,
         total_service_minutes=total_service,
@@ -227,10 +400,24 @@ def _calculate_kpis(
         workload_stddev=round(statistics.pstdev(workloads), 2) if workloads else 0,
         stability_rate=round(stability, 4) if stability is not None else None,
         technician=tech_kpis,
+        assigned_on_time_rate=round(assigned_rate, 4),
+        committed_on_time_rate=round(committed_rate, 4),
+        total_late_minutes=sum(late_values),
+        p90_late_minutes=p90_late,
+        total_waiting_minutes=total_waiting,
+        average_occupied_utilization=round(sum(item.occupied_utilization for item in tech_kpis) / len(tech_kpis), 4) if tech_kpis else 0,
+        workload_range=workload_range,
+        normalized_workload_range=round(max(normalized_values) - min(normalized_values), 4) if normalized_values else 0,
+        same_technician_rate=round(same_technician_rate, 4) if same_technician_rate is not None else None,
+        adjacency_preservation_rate=round(adjacency_rate, 4) if adjacency_rate is not None else None,
+        start_time_shift_median=round(shift_median, 2) if shift_median is not None else None,
+        start_time_shift_p90=shift_p90,
+        start_time_shift_over_15m_count=shift_over_15,
+        customer_notification_count=notification_count,
     )
 
 
-def _objective_breakdown(
+def objective_breakdown(
     scenario: ScheduleScenario,
     kpis: ScheduleKPI,
     unassigned: list[UnassignedWorkOrder],
@@ -246,7 +433,7 @@ def _objective_breakdown(
         "sla_late": round(late_minutes * config.sla_late_weight, 2),
         "overtime": round(kpis.total_overtime_minutes * config.overtime_weight, 2),
         "unassigned": round(drop_cost, 2),
-        "imbalance": round(kpis.workload_stddev * config.imbalance_weight, 2),
+        "imbalance": round(kpis.normalized_workload_range * 1000 * config.imbalance_weight, 2),
         "replan_changes": round(changes * config.replan_change_weight, 2),
     }
 
@@ -262,12 +449,21 @@ def _result(
     previous: ScheduleResult | None = None,
     note: str = "",
     strategy: str = "balanced",
+    requested_time_limit_ms: int | None = None,
+    effective_time_limit_ms: int | None = None,
+    solver_status_code: int | None = None,
+    termination_reason: str | None = None,
+    solution_found: bool = True,
+    solver_objective_value: float | None = None,
+    solver_name: str = "fieldflow-greedy",
+    solver_version: str = "1",
 ) -> ScheduleResult:
-    kpis = _calculate_kpis(scenario, assignments, unassigned, previous)
+    kpis = calculate_kpis(scenario, assignments, unassigned, previous if kind == "replan" else None)
     # Stability is a replanning concern. A normal optimization may be compared
     # with a baseline, but must not pay a penalty merely for improving it.
     changes = sum(1 for a in assignments if a.changed) if kind == "replan" else 0
-    breakdown = _objective_breakdown(scenario, kpis, unassigned, assignments, changes)
+    breakdown = objective_breakdown(scenario, kpis, unassigned, assignments, changes)
+    business_score = round(sum(breakdown.values()), 2)
     return ScheduleResult(
         id=f"SCH-{scenario.id}-{version}-{uuid.uuid4().hex[:6]}",
         scenario_id=scenario.id,
@@ -276,7 +472,7 @@ def _result(
         created_at=_now(),
         solver_status=status,
         runtime_ms=runtime_ms,
-        objective=round(sum(breakdown.values()), 2),
+        objective=business_score,
         assignments=sorted(assignments, key=lambda a: (a.technician_id, a.sequence)),
         unassigned=unassigned,
         kpis=kpis,
@@ -285,7 +481,53 @@ def _result(
         scenario_revision=scenario.revision,
         strategy=strategy,  # type: ignore[arg-type]
         objective_breakdown=breakdown,
+        requested_time_limit_ms=requested_time_limit_ms,
+        effective_time_limit_ms=effective_time_limit_ms,
+        solver_status_code=solver_status_code,
+        termination_reason=termination_reason,
+        solution_found=solution_found,
+        solver_objective_value=solver_objective_value,
+        business_score=business_score,
+        business_score_policy_version=BUSINESS_SCORE_POLICY_VERSION,
+        scenario_snapshot_hash=content_hash(scenario),
+        solver_config_hash=content_hash(scenario.solver_config),
+        travel_model_version=TRAVEL_MODEL_VERSION,
+        metric_policy_version=METRIC_POLICY_VERSION,
+        solver_name=solver_name,
+        solver_version=solver_version,
     )
+
+
+def recompute_business_result(
+    scenario: ScheduleScenario,
+    result: ScheduleResult,
+    previous: ScheduleResult | None = None,
+) -> ScheduleResult:
+    """Bind solver output to the immutable business snapshot and scoring policy."""
+    rebound = result.model_copy(deep=True)
+    rebound.scenario_id = scenario.id
+    rebound.scenario_revision = scenario.revision
+    rebound.scenario_snapshot_hash = content_hash(scenario)
+    rebound.kpis = calculate_kpis(
+        scenario,
+        rebound.assignments,
+        rebound.unassigned,
+        previous if rebound.kind == "replan" else None,
+    )
+    changes = sum(1 for item in rebound.assignments if item.changed) if rebound.kind == "replan" else 0
+    rebound.objective_breakdown = objective_breakdown(
+        scenario,
+        rebound.kpis,
+        rebound.unassigned,
+        rebound.assignments,
+        changes,
+    )
+    rebound.business_score = round(sum(rebound.objective_breakdown.values()), 2)
+    rebound.objective = rebound.business_score
+    rebound.business_score_policy_version = BUSINESS_SCORE_POLICY_VERSION
+    rebound.metric_policy_version = METRIC_POLICY_VERSION
+    rebound.travel_model_version = TRAVEL_MODEL_VERSION
+    return rebound
 
 
 def scenario_for_strategy(scenario: ScheduleScenario, strategy: str) -> ScheduleScenario:
@@ -293,7 +535,7 @@ def scenario_for_strategy(scenario: ScheduleScenario, strategy: str) -> Schedule
     effective = scenario.model_copy(deep=True)
     profiles = {
         "balanced": (4, 12, 30, 1, 80, 1.0),
-        "completion": (1, 1, 1, 1, 60, 5.0),
+        "completion": (1, 1, 1, 0, 60, 5.0),
         "punctuality": (2, 200, 30, 2, 100, 1.0),
         "low_travel": (30, 8, 8, 1, 80, 0.8),
         "low_overtime": (2, 5, 500, 1, 90, 0.5),
@@ -328,7 +570,6 @@ def scenario_for_profile(scenario: ScheduleScenario, profile: StrategyProfile) -
 
 def baseline_schedule(scenario: ScheduleScenario, version: int, strategy: str = "baseline") -> ScheduleResult:
     started_at = time.perf_counter()
-    techs = {t.id: t for t in scenario.technicians}
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     routes: dict[str, list[ScheduleAssignment]] = defaultdict(list)
     state = {t.id: (t.shift_start, t.start_location) for t in scenario.technicians}
@@ -368,12 +609,24 @@ def baseline_schedule(scenario: ScheduleScenario, version: int, strategy: str = 
             travel_minutes=travel,
             sla_late_minutes=max(0, finish - order.sla_deadline),
             explanation=_explanation(order, tech, start, travel, finish, scenario, order.id in locked, False),
+            evidence={
+                "required_skills": [item.value for item in order.required_skills],
+                "eligible_technician_ids": [item.id for item in scenario.technicians if _eligible(item, order)],
+                "window_start": order.window_start,
+                "window_end": order.window_end,
+                "arrival_time": arrival,
+                "start_time": start,
+                "finish_time": finish,
+                "leg_travel_minutes": travel,
+                "overtime_minutes": max(0, finish - tech.shift_end),
+            },
             locked=order.id in locked,
         )
         routes[tech.id].append(assignment)
         assignments.append(assignment)
         state[tech.id] = (finish, order.location)
 
+    _attach_route_insertion_evidence(scenario, assignments)
     runtime_ms = max(1, round((time.perf_counter() - started_at) * 1000))
     return _result(
         scenario, "baseline", version, SolverStatus.feasible, runtime_ms, assignments, unassigned,
@@ -394,7 +647,6 @@ def optimized_schedule(
     started_at = time.perf_counter()
     technicians = scenario.technicians
     active_orders = [o for o in scenario.work_orders if o.status.value != "completed"]
-    tech_index = {t.id: i for i, t in enumerate(technicians)}
     order_by_id = {o.id: o for o in active_orders}
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     previous_by_id = {a.work_order_id: a for a in previous.assignments} if previous else {}
@@ -428,7 +680,7 @@ def optimized_schedule(
 
     time_callbacks: list[int] = []
     cost_callbacks: list[int] = []
-    for vehicle, tech in enumerate(technicians):
+    for vehicle, _tech in enumerate(technicians):
         def time_cb(from_index: int, to_index: int, vehicle: int = vehicle) -> int:
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
@@ -458,7 +710,25 @@ def optimized_schedule(
     # planning horizon so wide customer windows do not become false conflicts.
     routing.AddDimensionWithVehicleTransits(time_callbacks, 1800, 2040, False, "Time")
     time_dimension = routing.GetDimensionOrDie("Time")
-    time_dimension.SetGlobalSpanCostCoefficient(max(0, scenario.solver_config.imbalance_weight))
+    service_callbacks: list[int] = []
+    for technician in technicians:
+        shift_minutes = max(1, technician.shift_end - technician.shift_start)
+        service_callbacks.append(
+            routing.RegisterTransitCallback(
+                lambda from_index, to_index, shift_minutes=shift_minutes: round(
+                    (
+                        node_orders[manager.IndexToNode(from_index)].service_duration
+                        if manager.IndexToNode(from_index) in node_orders
+                        else 0
+                    )
+                    * 10_000
+                    / shift_minutes
+                )
+            )
+        )
+    routing.AddDimensionWithVehicleTransits(service_callbacks, 0, 100_000, True, "ServiceLoad")
+    service_dimension = routing.GetDimensionOrDie("ServiceLoad")
+    service_dimension.SetGlobalSpanCostCoefficient(max(0, scenario.solver_config.imbalance_weight))
 
     for vehicle, tech in enumerate(technicians):
         start_index = routing.Start(vehicle)
@@ -499,24 +769,37 @@ def optimized_schedule(
     # a safety ceiling for unexpectedly hard/custom scenarios.
     # Balancing service load is a global property and needs a deeper local
     # search than route-focused profiles to become visible on larger fixtures.
-    search.solution_limit = 120 if strategy in {"balanced", "completion", "punctuality", "low_overtime", "fair_workload"} else 20
-    limit = time_limit_seconds or scenario.solver_config.time_limit_seconds
-    # Routing's sub-second Duration can behave as an unbounded search on some builds.
-    # Round up to one whole second so every user-supplied limit remains bounded.
-    effective_limit = max(1, int(math.ceil(limit)))
-    search.time_limit.seconds = effective_limit
-    search.time_limit.nanos = 0
+    # Use the same deterministic search budget for every profile. Giving the
+    # route-focused profiles fewer accepted solutions made their displayed KPI
+    # worse than the balanced profile even when travel carried the larger cost.
+    search.solution_limit = 120
+    limit = time_limit_seconds if time_limit_seconds is not None else scenario.solver_config.time_limit_seconds
+    if limit < 1:
+        raise ValueError("time_limit_seconds must be at least 1 second")
+    requested_limit_ms = int(round(limit * 1000))
+    effective_limit_ms = requested_limit_ms
+    search.time_limit.seconds, remainder_ms = divmod(effective_limit_ms, 1000)
+    search.time_limit.nanos = remainder_ms * 1_000_000
     search.log_search = False
     solution = routing.SolveWithParameters(search)
     runtime_ms = max(1, round((time.perf_counter() - started_at) * 1000))
+    routing_status_code = int(routing.status())
+    mapped_status = solver_status_from_routing(routing_status_code, solution is not None)
+    termination_reason = ROUTING_STATUS_NAMES.get(routing_status_code, f"ROUTING_STATUS_{routing_status_code}")
 
     if not solution:
-        status = SolverStatus.time_limit if runtime_ms >= effective_limit * 950 else SolverStatus.infeasible
         unassigned = [_diagnose_unassigned(order, scenario, locked, False) for order in active_orders]
         return _result(
-            scenario, kind, version, status, runtime_ms, [], unassigned, previous,
-            note="在时限内没有排出可执行方案，原方案保持不变。",
+            scenario, kind, version, mapped_status, runtime_ms, [], unassigned, previous,
+            note=f"没有生成可执行候选（{termination_reason}），当前正式方案保持不变。",
             strategy=strategy,
+            requested_time_limit_ms=requested_limit_ms,
+            effective_time_limit_ms=effective_limit_ms,
+            solver_status_code=routing_status_code,
+            termination_reason=termination_reason,
+            solution_found=False,
+            solver_name="ortools-routing",
+            solver_version=ortools.__version__,
         )
 
     assignments: list[ScheduleAssignment] = []
@@ -536,7 +819,7 @@ def optimized_schedule(
                 arrival = available + travel
                 finish = start + order.service_duration
                 old = previous_by_id.get(order.id)
-                changed = bool(old and (old.technician_id != tech.id or old.sequence != sequence))
+                changed = False
                 assignment = ScheduleAssignment(
                     work_order_id=order.id,
                     technician_id=tech.id,
@@ -547,6 +830,17 @@ def optimized_schedule(
                     travel_minutes=travel,
                     sla_late_minutes=max(0, finish - order.sla_deadline),
                     explanation=_explanation(order, tech, start, travel, finish, scenario, order.id in locked, changed),
+                    evidence={
+                        "required_skills": [item.value for item in order.required_skills],
+                        "eligible_technician_ids": [item.id for item in scenario.technicians if _eligible(item, order)],
+                        "window_start": order.window_start,
+                        "window_end": order.window_end,
+                        "arrival_time": arrival,
+                        "start_time": start,
+                        "finish_time": finish,
+                        "leg_travel_minutes": travel,
+                        "overtime_minutes": max(0, finish - tech.shift_end),
+                    },
                     locked=order.id in locked,
                     changed=changed,
                 )
@@ -556,16 +850,36 @@ def optimized_schedule(
                 available = finish
             index = solution.Value(routing.NextVar(index))
 
+    if preserve_previous and previous:
+        _mark_replan_changes(assignments, previous, set(order_by_id))
+
     unassigned = [
         _diagnose_unassigned(order, scenario, locked, dropped_by_solver=order.id not in precheck_unassigned)
         for order in active_orders
         if order.id not in assigned_ids
     ]
+    _attach_route_insertion_evidence(scenario, assignments)
     strategy_names = {"balanced": "均衡", "completion": "完成率优先", "punctuality": "准时优先", "low_travel": "低行程", "low_overtime": "低加班", "fair_workload": "工作量公平", "stable": "稳定优先", "custom": "自定义"}
+    optimality_note = (
+        "求解器已证明当前候选为全局最优解。"
+        if mapped_status is SolverStatus.optimal
+        else "当前候选可执行，但尚未完成全局最优性证明。"
+    )
     return _result(
-        scenario, kind, version, SolverStatus.feasible, runtime_ms, assignments, unassigned, previous,
-        note=f"“{strategy_names.get(strategy, strategy)}”策略在 {effective_limit:g} 秒时限内找到了可执行方案，尚未完成全局最优性证明。",
+        scenario, kind, version, mapped_status, runtime_ms, assignments, unassigned, previous,
+        note=(
+            f"“{strategy_names.get(strategy, strategy)}”策略在 {effective_limit_ms / 1000:g} 秒时限内找到了可执行方案；"
+            f"终止原因：{termination_reason}。{optimality_note}"
+        ),
         strategy=strategy,
+        requested_time_limit_ms=requested_limit_ms,
+        effective_time_limit_ms=effective_limit_ms,
+        solver_status_code=routing_status_code,
+        termination_reason=termination_reason,
+        solution_found=True,
+        solver_objective_value=float(solution.ObjectiveValue()),
+        solver_name="ortools-routing",
+        solver_version=ortools.__version__,
     )
 
 
@@ -592,7 +906,7 @@ def replan_schedule(
     ]
     fixed_ids = {a.work_order_id for a in fixed}
     scenario_copy.work_orders = [o for o in scenario_copy.work_orders if o.id not in fixed_ids]
-    scenario_copy.locked_assignments = [l for l in scenario_copy.locked_assignments if l.work_order_id not in fixed_ids]
+    scenario_copy.locked_assignments = [lock for lock in scenario_copy.locked_assignments if lock.work_order_id not in fixed_ids]
 
     original_orders = {o.id: o for o in scenario.work_orders}
     fixed_by_tech: dict[str, list[ScheduleAssignment]] = defaultdict(list)
@@ -620,18 +934,18 @@ def replan_schedule(
         strategy=strategy,
     )
     offsets = {tech.id: len(fixed_by_tech.get(tech.id, [])) for tech in scenario.technicians}
-    previous_by_id = {a.work_order_id: a for a in previous.assignments}
     replanned: list[ScheduleAssignment] = []
     for item in partial.assignments:
         item.sequence += offsets[item.technician_id]
-        old = previous_by_id.get(item.work_order_id)
-        item.changed = bool(old and (old.technician_id != item.technician_id or old.sequence != item.sequence))
         change_note = "为接纳突发工单或降低 SLA 风险，本项安排发生调整"
         item.explanation = [line for line in item.explanation if line != change_note]
-        if item.changed:
-            item.explanation.append(change_note)
         replanned.append(item)
     merged = fixed + replanned
+    pending_ids = {order.id for order in scenario.work_orders if order.status.value == "pending"}
+    _mark_replan_changes(merged, previous, pending_ids)
+    for item in replanned:
+        if item.changed:
+            item.explanation.append("为接纳突发工单或降低 SLA 风险，本项安排发生调整")
     final = _result(
         scenario,
         "replan",
@@ -643,69 +957,20 @@ def replan_schedule(
         previous,
         note=f"局部重排保留了 {len(fixed)} 个已执行或在途工单；{partial.solver_note}",
         strategy=strategy,
+        requested_time_limit_ms=partial.requested_time_limit_ms,
+        effective_time_limit_ms=partial.effective_time_limit_ms,
+        solver_status_code=partial.solver_status_code,
+        termination_reason=partial.termination_reason,
+        solution_found=partial.solution_found,
+        solver_objective_value=partial.solver_objective_value,
+        solver_name=partial.solver_name,
+        solver_version=partial.solver_version,
     )
     return final
 
 
 def validate_schedule(scenario: ScheduleScenario, result: ScheduleResult) -> list[str]:
-    """Return human-readable hard-constraint violations."""
-    errors: list[str] = []
-    orders = {o.id: o for o in scenario.work_orders}
-    techs = {t.id: t for t in scenario.technicians}
-    locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
-    seen: set[str] = set()
-    grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
-    for assignment in result.assignments:
-        order = orders.get(assignment.work_order_id)
-        tech = techs.get(assignment.technician_id)
-        if not order:
-            errors.append(f"{assignment.work_order_id}: work order does not exist")
-            continue
-        if not tech:
-            errors.append(f"{assignment.work_order_id}: technician {assignment.technician_id} does not exist")
-            continue
-        if order.id in seen:
-            errors.append(f"{order.id}: assigned more than once")
-        seen.add(order.id)
-        if not _eligible(tech, order):
-            errors.append(f"{order.id}: technician lacks required skill")
-        if not order.window_start <= assignment.start_time <= order.window_end:
-            errors.append(f"{order.id}: start outside time window")
-        if assignment.arrival_time > assignment.start_time:
-            errors.append(f"{order.id}: arrival occurs after service start")
-        if assignment.finish_time != assignment.start_time + order.service_duration:
-            errors.append(f"{order.id}: finish time does not match service duration")
-        if assignment.sla_late_minutes != max(0, assignment.finish_time - order.sla_deadline):
-            errors.append(f"{order.id}: SLA lateness is inconsistent")
-        if assignment.start_time < tech.shift_start:
-            errors.append(f"{order.id}: starts before technician shift")
-        if assignment.finish_time > tech.shift_end + tech.overtime_limit:
-            errors.append(f"{order.id}: exceeds overtime limit")
-        if locked.get(order.id) and assignment.technician_id != locked[order.id]:
-            errors.append(f"{order.id}: locked technician changed")
-        grouped[tech.id].append(assignment)
-    for tech_id, assignments in grouped.items():
-        ordered = sorted(assignments, key=lambda item: item.sequence)
-        if [item.sequence for item in ordered] != list(range(1, len(ordered) + 1)):
-            errors.append(f"{tech_id}: route sequence is not contiguous")
-        for before, after in zip(ordered, ordered[1:]):
-            travel = travel_minutes(orders[before.work_order_id].location, orders[after.work_order_id].location)
-            if after.travel_minutes != travel:
-                errors.append(f"{after.work_order_id}: travel minutes do not match route")
-            if after.arrival_time < before.finish_time + travel:
-                errors.append(f"{after.work_order_id}: arrival precedes prior service and travel")
-            if before.finish_time + travel > after.start_time:
-                errors.append(f"{tech_id}: {before.work_order_id} overlaps travel to {after.work_order_id}")
-        if ordered:
-            tech = techs[tech_id]
-            first = ordered[0]
-            first_travel = travel_minutes(tech.start_location, orders[first.work_order_id].location)
-            if first.travel_minutes != first_travel:
-                errors.append(f"{first.work_order_id}: first-leg travel minutes do not match depot")
-            if first.arrival_time < tech.shift_start + first_travel:
-                errors.append(f"{first.work_order_id}: arrival precedes possible depot departure")
-            last = ordered[-1]
-            return_travel = travel_minutes(orders[last.work_order_id].location, tech.start_location)
-            if last.finish_time + return_travel > tech.shift_end + tech.overtime_limit:
-                errors.append(f"{tech_id}: route return exceeds overtime limit")
-    return errors
+    """Compatibility wrapper around the independent publication verifier."""
+    from .verification import verify_schedule
+
+    return [issue.message for issue in verify_schedule(scenario, result).errors]

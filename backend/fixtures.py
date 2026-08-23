@@ -13,7 +13,6 @@ from .models import (
     WorkOrder,
 )
 
-
 SEED = 20260823
 
 
@@ -173,7 +172,7 @@ def all_fixtures() -> dict[str, ScheduleScenario]:
             t.skills.remove(Skill.network)
 
     window_orders = copy.deepcopy(_main_orders()[:8])
-    for i, order in enumerate(window_orders[:5]):
+    for order in window_orders[:5]:
         order.window_start = 540
         order.window_end = 570
         order.sla_deadline = 570

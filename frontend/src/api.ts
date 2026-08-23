@@ -5,13 +5,25 @@ import type {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
+  const controller = new AbortController()
+  const relayAbort = () => controller.abort()
+  init?.signal?.addEventListener('abort', relayAbort, { once: true })
+  const timeout = window.setTimeout(() => controller.abort(), 35_000)
   try {
     response = await fetch(path, {
       ...init,
+      signal: controller.signal,
       headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
     })
-  } catch {
+  } catch (error) {
+    if (controller.signal.aborted && !init?.signal?.aborted) {
+      throw new Error('请求超过 35 秒未完成。求解仍可能在后台结束，请查看方案历史后再重试。')
+    }
+    if (init?.signal?.aborted) throw new Error('请求已取消')
     throw new Error('无法连接 FieldFlow 本地服务。请在项目目录运行“make demo”，并确认终端显示的访问地址与当前地址一致。')
+  } finally {
+    window.clearTimeout(timeout)
+    init?.signal?.removeEventListener('abort', relayAbort)
   }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`
@@ -33,7 +45,7 @@ export const api = {
   restorePlanVersion: (id: string, versionId: string, expectedRevision: number) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}/restore`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) }),
   baseline: (id: string) => request<Schedule>(`/api/scenarios/${id}/baseline`, { method: 'POST' }),
   optimize: (id: string, strategy: Strategy = 'balanced', profileId?: string) => request<Schedule>(`/api/scenarios/${id}/optimize`, { method: 'POST', body: JSON.stringify({ strategy, profile_id: profileId }) }),
-  replan: (id: string, currentTime = 600, strategy: Strategy | 'stable' = 'stable') => request<Schedule>(`/api/scenarios/${id}/replan`, { method: 'POST', body: JSON.stringify({ current_time: currentTime, strategy }) }),
+  replan: (id: string, currentTime = 600, strategy: Strategy | 'stable' = 'stable', emergencyOrder?: WorkOrder, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/replan`, { method: 'POST', body: JSON.stringify({ current_time: currentTime, planning_time: currentTime, strategy, emergency_order: emergencyOrder, idempotency_key: idempotencyKey }) }),
   lock: (scenarioId: string, orderId: string, technicianId: string, locked: boolean) =>
     request<Scenario>(`/api/scenarios/${scenarioId}/lock`, {
       method: 'POST', body: JSON.stringify({ work_order_id: orderId, technician_id: technicianId, locked }),
@@ -44,7 +56,7 @@ export const api = {
   updateStrategyProfile: (id: string, profile: { name: string; description: string; weights: StrategyWeights; time_limit_seconds: number }) => request<StrategyProfile>(`/api/strategy-profiles/${id}`, { method: 'PUT', body: JSON.stringify(profile) }),
   deleteStrategyProfile: (id: string) => request<void>(`/api/strategy-profiles/${id}`, { method: 'DELETE' }),
   createExperiment: (id: string, profileIds: string[], timeLimit?: number) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments`, { method: 'POST', body: JSON.stringify({ dataset: 'current', profile_ids: profileIds, time_limit_seconds: timeLimit }) }),
-  experiment: (id: string, experimentId: string) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments/${experimentId}`),
+  experiment: (id: string, experimentId: string, signal?: AbortSignal) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments/${experimentId}`, { signal }),
   publishExperiment: (id: string, experimentId: string, candidateId: string, expectedRevision: number) => request<PlanVersion>(`/api/scenarios/${id}/strategy-experiments/${experimentId}/publish`, { method: 'POST', body: JSON.stringify({ candidate_id: candidateId, expected_revision: expectedRevision }) }),
   createWorkOrder: (scenarioId: string, order: WorkOrder) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders`, { method: 'POST', body: JSON.stringify(order) }),
   updateWorkOrder: (scenarioId: string, orderId: string, order: Partial<WorkOrder>) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', body: JSON.stringify(order) }),

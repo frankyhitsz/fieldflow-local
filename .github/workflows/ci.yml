@@ -25,6 +25,8 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npx playwright install --with-deps chromium
         working-directory: frontend
+      - name: Run static checks
+        run: make lint
       - name: Test backend and API
         run: make test
       - name: Test React components

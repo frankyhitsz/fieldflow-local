@@ -1,7 +1,10 @@
+import json
 import re
 from pathlib import Path
 
+from backend._version import __version__
 from backend.fixtures import get_fixture
+from backend.main import app
 from backend.report import build_report
 from backend.scheduler import baseline_schedule
 
@@ -37,6 +40,9 @@ def test_user_facing_copy_stays_direct_and_version_numbers_stay_consistent():
     copy = "\n".join(path.read_text() for path in paths)
     banned = [
         "API 文档位于",
+        "本地数据保存在仓库根目录的",
+        "均已排除在 Git 提交之外",
+        "接口调试页面：",
         "显著提高未分配代价",
         "强约束路线",
         "复杂路由未声称",
@@ -49,5 +55,12 @@ def test_user_facing_copy_stays_direct_and_version_numbers_stay_consistent():
     ]
     assert not [phrase for phrase in banned if phrase in copy]
     readme = Path("README.md").read_text()
-    assert "接口调试页面：<http://127.0.0.1:8000/docs>\n\n运行数据" in readme
+    assert "<http://127.0.0.1:8000/docs>" in readme
+    assert "`fieldflow.db`" in readme
+    assert "不会进入 Git" in readme
     assert "V{result.version:03d}" in Path("backend/report.py").read_text()
+
+
+def test_application_version_has_one_checked_release_value():
+    package = json.loads(Path("frontend/package.json").read_text())
+    assert app.version == package["version"] == __version__

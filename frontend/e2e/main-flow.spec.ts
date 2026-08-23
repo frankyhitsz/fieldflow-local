@@ -40,3 +40,17 @@ test('critical navigation remains reachable at 200 percent zoom', async ({ page 
   await page.getByRole('button', { name: '方案版本' }).click()
   await expect(page.getByRole('heading', { name: '方案版本' })).toBeVisible()
 })
+
+test('changing a lock marks the displayed plan stale', async ({ page, request }) => {
+  const versions = await request.get('/api/scenarios/main/plan-versions')
+  const plans = await versions.json()
+  const active = plans.find((item: { active: boolean }) => item.active)
+  const assignment = active.selected.assignments[0]
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '全部' }).click()
+  await page.getByText(assignment.work_order_id, { exact: false }).first().click()
+  await page.getByRole('button', { name: '锁定此工单与技师' }).click()
+  await expect(page.getByText('业务数据已修改，现有方案不再适用')).toBeVisible()
+  await expect(page.getByText(/D\d{3}/).first()).toBeVisible()
+})

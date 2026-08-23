@@ -9,7 +9,7 @@ from backend.main import app
 def compact(result: dict) -> str:
     kpi = result["kpis"]
     return (
-        f"目标={result['objective']:.0f} | SLA超时={kpi['sla_late_count']} | "
+        f"业务评分={result['business_score']:.0f} | SLA超时={kpi['sla_late_count']} | "
         f"行程={kpi['total_travel_minutes']}分 | 加班={kpi['total_overtime_minutes']}分 | "
         f"未分配={kpi['unassigned_count']}"
     )
@@ -21,7 +21,7 @@ with TestClient(app) as client:
     scenario_id = scenario["id"]
     baseline = client.post(f"/api/scenarios/{scenario_id}/baseline").json()
     optimized = client.post(f"/api/scenarios/{scenario_id}/optimize", json={"time_limit_seconds": 1}).json()
-    assert optimized["solver_status"] == "FEASIBLE"
+    assert optimized["solver_status"] in {"OPTIMAL", "FEASIBLE", "TIME_LIMIT_FEASIBLE"}
     assert optimized["objective"] < baseline["objective"]
 
     vip_ids = {"WO-1024", "WO-1032", "WO-1040"}
@@ -33,11 +33,15 @@ with TestClient(app) as client:
     assert response.status_code == 200
 
     emergency = emergency_order().model_dump(mode="json")
-    created = client.post(f"/api/scenarios/{scenario_id}/work-orders", json=emergency)
-    assert created.status_code == 200
     replanned = client.post(
         f"/api/scenarios/{scenario_id}/replan",
-        json={"current_time": 600, "time_limit_seconds": 1, "strategy": "stable"},
+        json={
+            "planning_time": 600,
+            "time_limit_seconds": 1,
+            "strategy": "stable",
+            "emergency_order": emergency,
+            "idempotency_key": f"demo-check:{scenario_id}:emergency",
+        },
     ).json()
     preserved = next(item for item in replanned["assignments"] if item["work_order_id"] == locked["work_order_id"])
     assert preserved["technician_id"] == locked["technician_id"]

@@ -63,6 +63,8 @@ def test_full_demo_flow(monkeypatch, tmp_path):
         assert revised_plan.status_code == 200
         assert revised_plan.json()["scenario_revision"] == 2
         assert revised_plan.json()["strategy"] == "punctuality"
+        revised_version = client.get("/api/scenarios/main/plan-versions").json()[-1]
+        assert revised_version["relation"] == "fresh_after_data_change"
         assert set(revised_plan.json()["objective_breakdown"]) == {
             "travel", "sla_late", "overtime", "unassigned", "imbalance", "replan_changes"
         }
@@ -104,7 +106,7 @@ def test_started_work_requires_local_replan_and_keeps_committed_assignment(monke
     main_module = importlib.reload(main_module)
 
     with TestClient(main_module.app) as client:
-        original = client.post("/api/scenarios/main/optimize", json={"time_limit_seconds": .05}).json()
+        original = client.post("/api/scenarios/main/optimize", json={"time_limit_seconds": 1}).json()
         started = min(original["assignments"], key=lambda item: item["start_time"])
         assert client.put(
             f"/api/scenarios/main/work-orders/{started['work_order_id']}",
@@ -112,7 +114,7 @@ def test_started_work_requires_local_replan_and_keeps_committed_assignment(monke
         ).status_code == 200
         assert client.post("/api/scenarios/main/baseline").status_code == 409
         assert client.post("/api/scenarios/main/optimize").status_code == 409
-        replanned = client.post("/api/scenarios/main/replan", json={"current_time": started["start_time"] + 1, "time_limit_seconds": .05})
+        replanned = client.post("/api/scenarios/main/replan", json={"current_time": started["start_time"] + 1, "time_limit_seconds": 1})
         assert replanned.status_code == 200
         preserved = next(item for item in replanned.json()["assignments"] if item["work_order_id"] == started["work_order_id"])
         assert (preserved["technician_id"], preserved["start_time"], preserved["finish_time"]) == (

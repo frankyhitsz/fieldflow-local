@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import math
-
 from .models import Point
-
+from .travel import DEFAULT_TRAVEL_PROVIDER
 
 DAY_START = 8 * 60
 
@@ -14,5 +12,5 @@ def hhmm(minutes: int) -> str:
 
 
 def travel_minutes(a: Point, b: Point) -> int:
-    """Deterministic offline travel time: 1 grid unit ~= 0.36 minutes."""
-    return max(3, int(round(math.hypot(a.x - b.x, a.y - b.y) * 0.36)))
+    """Deterministic offline travel time shared by solver, verifier and reports."""
+    return DEFAULT_TRAVEL_PROVIDER.minutes(a, b)

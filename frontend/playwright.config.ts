@@ -11,7 +11,9 @@ const cachedHeadless = (() => {
   const installs = readdirSync(root).filter(name => name.startsWith('chromium_headless_shell-')).sort().reverse()
   return installs.map(name => join(root, name, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell')).find(existsSync)
 })()
-const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || cachedHeadless
+const installedChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+  || (!process.env.CI && existsSync(installedChrome) ? installedChrome : cachedHeadless)
 
 export default defineConfig({
   testDir: './e2e',

@@ -1,4 +1,4 @@
-.PHONY: setup test test-frontend test-e2e build verify demo demo-check clean-data
+.PHONY: setup lint test test-frontend test-e2e build verify demo demo-check clean-data
 
 PYTHON := .venv/bin/python
 PYTEST := .venv/bin/pytest
@@ -10,8 +10,12 @@ setup:
 	.venv/bin/pip install -r requirements.txt
 	cd frontend && npm ci --cache $(NPM_CACHE)
 
+lint:
+	$(PYTHON) -m ruff check backend tests scripts
+	cd frontend && npm run typecheck
+
 test:
-	FIELDFLOW_DB=/tmp/fieldflow-tests.db $(PYTEST) -q
+	FIELDFLOW_DB=/tmp/fieldflow-tests.db $(PYTEST) --cov=backend --cov-report=term-missing --cov-fail-under=75 -q
 
 test-frontend:
 	cd frontend && npm test
@@ -25,7 +29,7 @@ build:
 demo-check:
 	PYTHONPATH=. FIELDFLOW_DB=/tmp/fieldflow-demo-check.db $(PYTHON) scripts/demo_check.py
 
-verify: test test-frontend build demo-check test-e2e
+verify: lint test test-frontend build demo-check test-e2e
 
 demo: build
 	@echo "FieldFlow Local → http://127.0.0.1:$(PORT)"

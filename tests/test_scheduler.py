@@ -1,6 +1,12 @@
 from backend.fixtures import get_fixture
 from backend.models import LockedAssignment, Point, ScheduleAssignment, WorkOrder, WorkOrderStatus
-from backend.scheduler import baseline_schedule, optimized_schedule, replan_schedule, scenario_for_profile, validate_schedule
+from backend.scheduler import (
+    baseline_schedule,
+    optimized_schedule,
+    replan_schedule,
+    scenario_for_profile,
+    validate_schedule,
+)
 from backend.storage import BUILTIN_PROFILES
 
 
@@ -29,8 +35,8 @@ def test_optimizer_improves_main_weighted_objective():
     assert optimized.kpis.total_travel_minutes < baseline.kpis.total_travel_minutes
     assert optimized.kpis.total_overtime_minutes <= baseline.kpis.total_overtime_minutes
     assert "尚未完成全局最优性证明" in optimized.solver_note
-    repeated = optimized_schedule(get_fixture("main"), 2, baseline, time_limit_seconds=0.05)
-    assert repeated.solver_status.value in {"FEASIBLE", "TIME_LIMIT"}
+    repeated = optimized_schedule(get_fixture("main"), 2, baseline, time_limit_seconds=1)
+    assert repeated.solver_status.value in {"OPTIMAL", "FEASIBLE", "TIME_LIMIT_FEASIBLE"}
     assert [(a.work_order_id, a.technician_id, a.sequence, a.start_time) for a in repeated.assignments] == [
         (a.work_order_id, a.technician_id, a.sequence, a.start_time) for a in optimized.assignments
     ]
@@ -77,7 +83,7 @@ def test_strategy_fixture_exposes_visible_business_tradeoffs():
             continue
         effective = scenario_for_profile(scenario, profile)
         baseline = baseline_schedule(effective, 0, profile.id)
-        result = optimized_schedule(effective, 0, baseline, time_limit_seconds=.05, strategy=profile.id)
+        result = optimized_schedule(effective, 0, baseline, time_limit_seconds=1, strategy=profile.id)
         assert validate_schedule(effective, result) == []
         results[profile.id] = result
         signatures.add(tuple((item.work_order_id, item.technician_id, item.sequence) for item in result.assignments))
@@ -86,7 +92,7 @@ def test_strategy_fixture_exposes_visible_business_tradeoffs():
     assert results["punctuality"].kpis.sla_on_time_rate >= results["balanced"].kpis.sla_on_time_rate
     assert results["low_travel"].kpis.total_travel_minutes <= results["balanced"].kpis.total_travel_minutes
     assert results["low_overtime"].kpis.total_overtime_minutes <= results["balanced"].kpis.total_overtime_minutes
-    assert results["fair_workload"].kpis.workload_stddev <= results["balanced"].kpis.workload_stddev
+    assert results["fair_workload"].kpis.normalized_workload_range <= results["balanced"].kpis.normalized_workload_range
 
 
 def test_optimizer_allows_waits_longer_than_six_hours_and_records_real_arrival():
@@ -97,19 +103,29 @@ def test_optimizer_allows_waits_longer_than_six_hours_and_records_real_arrival()
         service_duration=30, window_start=1200, window_end=1260, sla_deadline=1260,
     )]
     scenario.technicians = [scenario.technicians[0].model_copy(update={"shift_end": 1320})]
-    result = optimized_schedule(scenario, 1, time_limit_seconds=.05)
+    result = optimized_schedule(scenario, 1, time_limit_seconds=1)
     assert validate_schedule(scenario, result) == []
     assignment = result.assignments[0]
     assert assignment.start_time >= 1200
     assert assignment.arrival_time < assignment.start_time
 
 
+def test_assignment_explanation_uses_route_local_insertion_evidence():
+    scenario = get_fixture("main")
+    result = optimized_schedule(scenario, 1, time_limit_seconds=1)
+    assignment = result.assignments[0]
+    assert isinstance(assignment.evidence["route_insertion_travel_delta_minutes"], int)
+    assert assignment.evidence["alternative_delta_scope"] == "travel_only_without_rescheduling"
+    assert any("行程净增" in line for line in assignment.explanation)
+    assert not any("至少减少" in line or "全局最优" in line for line in assignment.explanation)
+
+
 def test_completed_prefix_does_not_push_completion_rate_above_one():
     scenario = get_fixture("emergency")
-    before = optimized_schedule(scenario, 1, time_limit_seconds=.05)
+    before = optimized_schedule(scenario, 1, time_limit_seconds=1)
     completed = min(before.assignments, key=lambda item: item.start_time)
     next(order for order in scenario.work_orders if order.id == completed.work_order_id).status = WorkOrderStatus.completed
-    after = replan_schedule(scenario, 2, before, current_time=completed.start_time - 1, time_limit_seconds=.05)
+    after = replan_schedule(scenario, 2, before, current_time=completed.start_time - 1, time_limit_seconds=1)
     assert after.kpis.completion_rate <= 1
     assert next(item for item in after.assignments if item.work_order_id == completed.work_order_id).start_time == completed.start_time
 

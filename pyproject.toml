@@ -4,11 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fieldflow-local"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Local field-service scheduling with FastAPI and React"
 requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.116.1",
+  "uvicorn[standard]==0.35.0",
+  "ortools==9.14.6206",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.1",
+  "pytest-cov==6.2.1",
+  "ruff==0.12.9",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "backend._version.__version__"}
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

@@ -19,29 +19,43 @@ export type Scenario = {
 export type Assignment = {
   work_order_id: string; technician_id: string; sequence: number; arrival_time: number
   start_time: number; finish_time: number; travel_minutes: number; sla_late_minutes: number
-  explanation: string[]; locked: boolean; changed: boolean
+  explanation: string[]; evidence: Record<string, unknown>; locked: boolean; changed: boolean
 }
 export type Unassigned = {
-  work_order_id: string; reason: string; detail: string; suggestions: string[]
+  work_order_id: string; reason: string; detail: string; suggestions: string[]; evidence: Record<string, unknown>
 }
 export type TechKpi = {
   technician_id: string; service_minutes: number; travel_minutes: number
   overtime_minutes: number; utilization: number; assignment_count: number
+  waiting_minutes: number; occupied_minutes: number; service_utilization: number
+  occupied_utilization: number; travel_ratio: number; waiting_ratio: number
+  overtime_ratio: number; normalized_workload: number
 }
 export type Kpis = {
   completion_rate: number; sla_on_time_rate: number; sla_late_count: number
   total_travel_minutes: number; total_service_minutes: number; total_overtime_minutes: number
   average_utilization: number; unassigned_count: number; high_priority_missed: number
   workload_stddev: number; stability_rate: number | null; technician: TechKpi[]
+  assigned_on_time_rate: number; committed_on_time_rate: number
+  total_late_minutes: number; p90_late_minutes: number; total_waiting_minutes: number
+  average_occupied_utilization: number; workload_range: number; normalized_workload_range: number
+  same_technician_rate: number | null; adjacency_preservation_rate: number | null
+  start_time_shift_median: number | null; start_time_shift_p90: number | null
+  start_time_shift_over_15m_count: number | null; customer_notification_count: number | null
 }
 export type Schedule = {
   id: string; scenario_id: string; kind: 'baseline' | 'optimized' | 'replan'; version: number
-  created_at: string; solver_status: 'OPTIMAL' | 'FEASIBLE' | 'INFEASIBLE' | 'TIME_LIMIT'
+  created_at: string; solver_status: 'OPTIMAL' | 'FEASIBLE' | 'TIME_LIMIT_FEASIBLE' | 'TIME_LIMIT_NO_SOLUTION' | 'INFEASIBLE' | 'NO_SOLUTION' | 'INVALID_MODEL' | 'FAILED' | 'CANCELLED' | 'TIME_LIMIT'
   runtime_ms: number; objective: number; assignments: Assignment[]; unassigned: Unassigned[]
   kpis: Kpis; source_schedule_id: string | null; solver_note: string
   scenario_revision: number
   strategy: 'baseline' | 'balanced' | 'completion' | 'punctuality' | 'low_travel' | 'low_overtime' | 'fair_workload' | 'stable' | 'custom'
   objective_breakdown: Record<string, number>
+  requested_time_limit_ms: number | null; effective_time_limit_ms: number | null
+  solver_status_code: number | null; termination_reason: string | null; solution_found: boolean
+  solver_objective_value: number | null; business_score: number | null
+  business_score_policy_version: string; scenario_snapshot_hash: string; solver_config_hash: string
+  travel_model_version: string; metric_policy_version: string; solver_name: string; solver_version: string
 }
 export type Comparison = {
   scenario_id: string; before: Schedule; after: Schedule
@@ -54,10 +68,11 @@ export type PlanVersion = {
   id: string; scenario_id: string; number: number
   action: 'baseline' | 'optimize' | 'replan' | 'restore' | 'experiment_publish'
   label: string; data_revision: number; source_version_id: string | null
-  relation: 'new' | 'optimized_from' | 'replanned_from' | 'restored_from' | 'published_from_experiment'
+  relation: 'new' | 'optimized_from' | 'replanned_from' | 'restored_from' | 'published_from_experiment' | 'fresh_after_data_change'
   active: boolean; created_at: string; scenario_snapshot?: Scenario | null
   selected: Schedule
   artifacts: { id: string; role: 'baseline' | 'selected' | 'candidate'; strategy: string; schedule: Schedule }[]
+  candidate_id: string | null; scenario_snapshot_hash: string; source_plan_snapshot_hash: string | null
 }
 
 export type StrategyWeights = {
@@ -73,6 +88,7 @@ export type StrategyProfile = {
 export type StrategyCandidate = {
   id: string; profile_id: string; profile_name: string; schedule: Schedule
   evaluation_score: number; advantages: string[]; publishable: boolean
+  schedule_candidate_id: string | null; pareto_optimal: boolean; dominated_by: string[]
 }
 
 export type StrategyExperiment = {
@@ -80,4 +96,6 @@ export type StrategyExperiment = {
   status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; progress: number
   error: string | null; created_at: string; profile_ids: string[]
   requested_time_limit_seconds: number | null; candidates: StrategyCandidate[]
+  fingerprint: string; scenario_snapshot_hash: string; score_policy_version: string
+  travel_model_version: string; solver_version: string; candidate_errors: Record<string, string>
 }

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import App from '../App'
+import { WorkOrderEditor } from '../Management'
 import type { PlanVersion, Scenario, Schedule, StrategyProfile } from '../types'
 
 const scenario: Scenario = {
@@ -13,10 +14,15 @@ const scenario: Scenario = {
 const schedule: Schedule = {
   id: 'SCH-1', scenario_id: 'main', kind: 'optimized', version: 2, created_at: '2026-08-23T10:00:00Z', solver_status: 'FEASIBLE', runtime_ms: 72, objective: 100,
   // Deliberately reference a missing order: this used to crash RouteMap/Timeline.
-  assignments: [{ work_order_id: 'WO-MISSING', technician_id: 'TECH-01', sequence: 1, arrival_time: 560, start_time: 560, finish_time: 590, travel_minutes: 10, sla_late_minutes: 0, explanation: [], locked: false, changed: false }],
+  assignments: [{ work_order_id: 'WO-MISSING', technician_id: 'TECH-01', sequence: 1, arrival_time: 560, start_time: 560, finish_time: 590, travel_minutes: 10, sla_late_minutes: 0, explanation: [], evidence: {}, locked: false, changed: false }],
   unassigned: [], source_schedule_id: null, solver_note: '测试计划', scenario_revision: 0, strategy: 'balanced',
   objective_breakdown: { travel: 20, sla_late: 0, overtime: 0, unassigned: 0, imbalance: 0, replan_changes: 80 },
-  kpis: { completion_rate: 1, sla_on_time_rate: 1, sla_late_count: 0, total_travel_minutes: 10, total_service_minutes: 30, total_overtime_minutes: 0, average_utilization: .5, unassigned_count: 0, high_priority_missed: 0, workload_stddev: 0, stability_rate: null, technician: [{ technician_id: 'TECH-01', service_minutes: 30, travel_minutes: 10, overtime_minutes: 0, utilization: .5, assignment_count: 1 }] },
+  requested_time_limit_ms: 1000, effective_time_limit_ms: 1000, solver_status_code: 1,
+  termination_reason: 'ROUTING_SUCCESS', solution_found: true, solver_objective_value: 100,
+  business_score: 100, business_score_policy_version: 'FIELD_SERVICE_SCORE_V2',
+  scenario_snapshot_hash: 'test', solver_config_hash: 'test', travel_model_version: 'EUCLIDEAN_GRID_V2',
+  metric_policy_version: 'FIELD_SERVICE_METRICS_V2', solver_name: 'test', solver_version: '1',
+  kpis: { completion_rate: 1, sla_on_time_rate: 1, sla_late_count: 0, total_travel_minutes: 10, total_service_minutes: 30, total_overtime_minutes: 0, average_utilization: .5, unassigned_count: 0, high_priority_missed: 0, workload_stddev: 0, stability_rate: null, assigned_on_time_rate: 1, committed_on_time_rate: 1, total_late_minutes: 0, p90_late_minutes: 0, total_waiting_minutes: 0, average_occupied_utilization: .67, workload_range: 0, normalized_workload_range: 0, same_technician_rate: null, adjacency_preservation_rate: null, start_time_shift_median: null, start_time_shift_p90: null, start_time_shift_over_15m_count: null, customer_notification_count: null, technician: [{ technician_id: 'TECH-01', service_minutes: 30, travel_minutes: 10, overtime_minutes: 0, utilization: .5, assignment_count: 1, waiting_minutes: 0, occupied_minutes: 40, service_utilization: .5, occupied_utilization: .67, travel_ratio: .25, waiting_ratio: 0, overtime_ratio: 0, normalized_workload: .67 }] },
 }
 
 const plan: PlanVersion = {
@@ -24,6 +30,7 @@ const plan: PlanVersion = {
   source_version_id: null, relation: 'new', active: true, created_at: '2026-08-23T10:00:00Z',
   selected: schedule, scenario_snapshot: scenario,
   artifacts: [{ id: 'ART-1', role: 'baseline', strategy: 'balanced', schedule: { ...schedule, id: 'SCH-BASE', kind: 'baseline', version: 1, strategy: 'baseline' } }],
+  candidate_id: 'CAND-1', scenario_snapshot_hash: 'test', source_plan_snapshot_hash: null,
 }
 
 const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', description: '均衡业务指标', builtin: true, time_limit_seconds: 2, created_at: '2026-08-23T00:00:00Z', weights: { travel_weight: 4, sla_late_weight: 12, overtime_weight: 8, imbalance_weight: 1, replan_change_weight: 80, unassigned_penalty_scale: 1 } }]
@@ -73,5 +80,13 @@ describe('FieldFlow navigation and render safety', () => {
     render(<App />)
     expect(await screen.findByText(/请在项目目录运行“make demo”/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '重新连接' })).toBeInTheDocument()
+  })
+
+  it('edits next-day service times without wrapping them to the current day', () => {
+    const order = { ...scenario.work_orders[0], window_end: 1500, sla_deadline: 1530 }
+    render(<WorkOrderEditor initial={order} onClose={() => undefined} onSave={async () => undefined} />)
+    expect(screen.getByRole('combobox', { name: '时间窗结束日期' })).toHaveValue('1')
+    expect(screen.getByLabelText('时间窗结束', { selector: 'input' })).toHaveValue('01:00')
+    expect(screen.getByLabelText('SLA 截止', { selector: 'input' })).toHaveValue('01:30')
   })
 })

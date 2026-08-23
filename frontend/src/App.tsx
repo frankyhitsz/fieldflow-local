@@ -10,12 +10,21 @@ import { ReviewView, TechnicianEditor, TechniciansView, VersionsView, WorkOrderE
 import { StrategyLab } from './StrategyLab'
 import type { Assignment, Comparison, PlanVersion, Scenario, Schedule, Strategy, StrategyProfile, Technician, Unassigned, WorkOrder } from './types'
 
-const hhmm = (minutes: number) => `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`
-const fromTime = (value: string) => { const [hours, minutes] = value.split(':').map(Number); return hours * 60 + minutes }
+const hhmm = (minutes: number) => {
+  const day = Math.floor(minutes / 1440)
+  const clock = ((minutes % 1440) + 1440) % 1440
+  const value = `${String(Math.floor(clock / 60)).padStart(2, '0')}:${String(clock % 60).padStart(2, '0')}`
+  return day > 0 ? `次日 ${value}` : value
+}
 const pct = (value: number) => `${Math.round(value * 100)}%`
 const priorityLabel = { urgent: '紧急', high: '高', normal: '普通', low: '低' }
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
+const solverStatusLabel: Record<Schedule['solver_status'], string> = {
+  OPTIMAL: '已证明最优', FEASIBLE: '已找到可行解', TIME_LIMIT_FEASIBLE: '限时内可行',
+  TIME_LIMIT_NO_SOLUTION: '限时内无解', INFEASIBLE: '已证明无解', NO_SOLUTION: '未找到方案',
+  INVALID_MODEL: '模型无效', FAILED: '求解失败', CANCELLED: '已取消', TIME_LIMIT: '已到时限',
+}
 type View = 'dispatch' | 'versions' | 'technicians' | 'lab' | 'review'
 
 function InkMark() {
@@ -45,19 +54,19 @@ function Sidebar({ scenarios, current, active, busy, onSelect, onNavigate }: { s
 
 function SolverBadge({ schedule }: { schedule?: Schedule }) {
   if (!schedule) return <span className="solver-badge quiet">等待计划</span>
-  const statusClass = schedule.solver_status.toLowerCase().replace('_', '-')
-  return <span className={`solver-badge ${statusClass}`}><span />{schedule.solver_status} · 计算 {schedule.runtime_ms} ms</span>
+  const statusClass = schedule.solver_status.toLowerCase().replaceAll('_', '-')
+  return <span className={`solver-badge ${statusClass}`} title={schedule.solver_note}><span />{solverStatusLabel[schedule.solver_status]} · {schedule.runtime_ms} ms</span>
 }
 
 function KpiStrip({ schedule, baseline }: { schedule?: Schedule; baseline?: Schedule }) {
   const k = schedule?.kpis
   const metrics = [
     { label: '工单完成率', value: k ? pct(k.completion_rate) : '—', sub: k ? `${schedule!.assignments.length} / ${schedule!.assignments.length + k.unassigned_count} 单` : '尚未排程', icon: Check },
-    { label: 'SLA 按时率', value: k ? pct(k.sla_on_time_rate) : '—', sub: k ? `${k.sla_late_count} 单存在延迟` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count },
+    { label: 'SLA 履约率', value: k ? pct(k.committed_on_time_rate) : '—', sub: k ? `已排工单按时率 ${pct(k.assigned_on_time_rate)}` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count || !!k?.unassigned_count },
     { label: '总行程', value: k ? `${k.total_travel_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_travel_minutes - baseline.kpis.total_travel_minutes : null, icon: Route },
     { label: '总加班', value: k ? `${k.total_overtime_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_overtime_minutes - baseline.kpis.total_overtime_minutes : null, icon: Clock3 },
     { label: '未分配', value: k ? `${k.unassigned_count}` : '—', unit: '工单', sub: k ? `${k.high_priority_missed} 单高优先级` : '尚未计算', icon: AlertTriangle, warn: !!k?.unassigned_count },
-    { label: schedule?.kind === 'replan' ? '重排稳定率' : '平均利用率', value: k ? (schedule?.kind === 'replan' && k.stability_rate != null ? pct(k.stability_rate) : pct(k.average_utilization)) : '—', sub: schedule?.kind === 'replan' ? '技师与顺序保持' : '服务 ÷ 班次', icon: TimerReset },
+    { label: schedule?.kind === 'replan' ? '重排稳定率' : '占用利用率', value: k ? (schedule?.kind === 'replan' && k.stability_rate != null ? pct(k.stability_rate) : pct(k.average_occupied_utilization)) : '—', sub: schedule?.kind === 'replan' ? `原技师 ${k?.same_technician_rate == null ? '—' : pct(k.same_technician_rate)}` : '行程 + 等待 + 服务 ÷ 可用时间', icon: TimerReset },
   ]
   return <section className="kpi-strip" aria-label="关键业务指标">
     {metrics.map(({ label, value, unit, sub, delta, icon: Icon, warn }) => <div className={`kpi ${warn ? 'warn' : ''}`} key={label}>
@@ -104,8 +113,9 @@ function RouteMap({ scenario, schedule, selectedId, onSelect }: { scenario: Scen
     tech,
     assignments: (schedule?.assignments.filter(a => a.technician_id === tech.id && orderMap.has(a.work_order_id)) || []).sort((a, b) => a.sequence - b.sequence),
   }))
+  const depots = Array.from(new Map(scenario.technicians.map(tech => [`${tech.start_location.x}:${tech.start_location.y}`, tech.start_location])).values())
   return <section className="map-panel panel">
-    <div className="panel-heading map-heading"><div><span className="eyebrow">服务区域 / 位置与行程估算</span><h2>城西服务网格</h2></div><div className="map-legend"><span><i className="legend depot" />服务中心</span><span><i className="legend job" />已排</span><span><i className="legend risk" />待排</span></div></div>
+    <div className="panel-heading map-heading"><div><span className="eyebrow">服务区域 / 位置与行程估算</span><h2>服务位置图</h2></div><div className="map-legend"><span><i className="legend depot" />技师出发点</span><span><i className="legend job" />已排</span><span><i className="legend risk" />待排</span></div></div>
     <div className="map-canvas">
       <svg viewBox="0 0 100 100" role="img" aria-label="工单位置与技师路线图">
         <defs>
@@ -121,12 +131,12 @@ function RouteMap({ scenario, schedule, selectedId, onSelect }: { scenario: Scen
           const d = points.map((p, i) => `${i ? 'L' : 'M'} ${p.x} ${p.y}`).join(' ')
           return <g key={tech.id} filter="url(#ink-edge)"><path d={d} className="route-shadow" /><path d={d} className="route-line" style={{ stroke: tech.color }} /></g>
         })}
-        <g className="depot-pin"><circle cx="48" cy="52" r="3.6" /><path d="M46 54V50l2-1.6 2 1.6v4z" /><circle cx="48" cy="52" r="7" className="depot-ring" /></g>
+        {depots.map((point, index) => <g className="depot-pin" key={`${point.x}:${point.y}`}><title>{`出发点 ${index + 1}`}</title><circle cx={point.x} cy={point.y} r="3.6" /><circle cx={point.x} cy={point.y} r="7" className="depot-ring" /><path d={`M${point.x - 2} ${point.y + 2}v-4l2-1.6 2 1.6v4z`} /></g>)}
         {scenario.work_orders.map(order => {
           const a = assignedMap.get(order.id)
           const tech = a ? scenario.technicians.find(t => t.id === a.technician_id) : undefined
           const isSelected = selectedId === order.id
-          return <g key={order.id} className={`job-pin ${unassigned.has(order.id) ? 'risk' : ''} ${isSelected ? 'selected' : ''}`} onClick={() => onSelect(order.id)} role="button" tabIndex={0} onKeyDown={e => e.key === 'Enter' && onSelect(order.id)}>
+          return <g key={order.id} className={`job-pin ${unassigned.has(order.id) ? 'risk' : ''} ${isSelected ? 'selected' : ''}`} onClick={() => onSelect(order.id)} role="button" tabIndex={0} aria-label={`查看工单 ${order.id}`} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(order.id) } }}>
             {isSelected && <circle cx={order.location.x} cy={order.location.y} r="4.7" className="selection-ring" />}
             <circle cx={order.location.x} cy={order.location.y} r={isSelected ? 2.5 : 1.8} style={{ fill: unassigned.has(order.id) ? '#b6533f' : tech?.color || '#707a73' }} />
             {order.vip && <circle cx={order.location.x} cy={order.location.y} r="3.1" className="vip-ring" />}
@@ -141,18 +151,22 @@ function RouteMap({ scenario, schedule, selectedId, onSelect }: { scenario: Scen
 
 function Timeline({ scenario, schedule, onSelect, currentTime }: { scenario: Scenario; schedule?: Schedule; onSelect: (id: string) => void; currentTime: number }) {
   const orders = new Map(scenario.work_orders.map(o => [o.id, o]))
-  const start = 480, end = 1140
+  const assignments = schedule?.assignments || []
+  const start = Math.floor(Math.min(currentTime, ...scenario.technicians.map(item => item.shift_start), ...assignments.map(item => item.arrival_time)) / 60) * 60
+  const end = Math.ceil(Math.max(currentTime + 60, ...scenario.technicians.map(item => item.shift_end + item.overtime_limit), ...assignments.map(item => item.finish_time)) / 60) * 60
+  const tickCount = 6
+  const ticks = Array.from({ length: tickCount }, (_, index) => Math.round((start + (end - start) * index / (tickCount - 1)) / 30) * 30)
   const pos = (m: number) => Math.max(0, Math.min(100, ((m - start) / (end - start)) * 100))
   return <section className="timeline panel">
     <div className="panel-heading"><div><span className="eyebrow">TECHNICIAN RUNS</span><h2>技师时间轴</h2></div><CircleHelp size={16} className="muted-icon" /></div>
-    <div className="time-head"><span>08</span><span>10</span><span>12</span><span>14</span><span>16</span><span>18</span></div>
+    <div className="time-head">{ticks.map((tick, index) => <span key={`${tick}-${index}`}>{hhmm(tick)}</span>)}</div>
     <div className="tech-runs">
       {scenario.technicians.map(tech => {
         const items = (schedule?.assignments.filter(a => a.technician_id === tech.id && orders.has(a.work_order_id)) || []).sort((a, b) => a.start_time - b.start_time)
         const kpi = schedule?.kpis.technician.find(k => k.technician_id === tech.id)
         return <div className="tech-run" key={tech.id}>
           <div className="tech-info"><div className="tech-avatar" style={{ '--tech': tech.color } as React.CSSProperties}>{tech.name.slice(-1)}</div><div><strong>{tech.name}</strong><small>{tech.skills.map(s => skillLabel[s]).join(' · ')}</small></div><span className="util">{kpi ? pct(kpi.utilization) : '—'}</span></div>
-          <div className="run-track">
+          <div className="run-track" style={{ '--tick-pct': `${100 / (tickCount - 1)}%` } as React.CSSProperties}>
             <div className="shift-range" style={{ left: `${pos(tech.shift_start)}%`, width: `${pos(tech.shift_end) - pos(tech.shift_start)}%` }} />
             <div className="replan-line" style={{ left: `${pos(currentTime)}%` }} />
             {items.map(item => {
@@ -209,8 +223,8 @@ function CompareDrawer({ data, onClose }: { data: Comparison; onClose: () => voi
     Number(data.delta.sla_late_count) > 0 ? `SLA 超时增加 ${data.delta.sla_late_count} 单` : Number(data.delta.sla_late_count) < 0 ? `SLA 超时减少 ${-Number(data.delta.sla_late_count)} 单` : '',
     Number(data.delta.overtime_minutes) > 0 ? `加班增加 ${data.delta.overtime_minutes} 分钟` : Number(data.delta.overtime_minutes) < 0 ? `加班减少 ${-Number(data.delta.overtime_minutes)} 分钟` : '',
   ].filter(Boolean)
-  return <div className="modal-backdrop" onMouseDown={onClose}><section className="compare-modal" onMouseDown={e => e.stopPropagation()}>
-    <div className="compare-head"><div><span className="eyebrow">BEFORE / AFTER</span><h2>方案对比</h2><p>V{String(data.before.version).padStart(3, '0')} 与 V{String(data.after.version).padStart(3, '0')} · {kindLabel[data.after.kind]}</p></div><button className="icon-btn" onClick={onClose}><X /></button></div>
+  return <div className="modal-backdrop" onMouseDown={onClose}><section className="compare-modal" role="dialog" aria-modal="true" aria-labelledby="compare-title" onMouseDown={e => e.stopPropagation()}>
+    <div className="compare-head"><div><span className="eyebrow">BEFORE / AFTER</span><h2 id="compare-title">方案对比</h2><p>V{String(data.before.version).padStart(3, '0')} 与 V{String(data.after.version).padStart(3, '0')} · {kindLabel[data.after.kind]}</p></div><button className="icon-btn" onClick={onClose} aria-label="关闭方案对比"><X /></button></div>
     <div className="compare-status"><SolverBadge schedule={data.after} /><span>{data.after.solver_note}</span></div>
     <table className="compare-table"><thead><tr><th>指标</th><th>人工基线</th><th>当前方案</th><th>变化</th></tr></thead><tbody>{rows.map(([label, before, after, delta]) => <tr key={String(label)}><td>{label}</td><td>{before}</td><td><b>{after}</b></td><td className={delta == null ? '' : Number(delta) <= 0 ? 'good' : 'bad'}>{delta == null ? '—' : `${Number(delta) > 0 ? '+' : ''}${delta}`}</td></tr>)}</tbody></table>
     {tradeoffs.length > 0 && <p className="compare-explain"><b>变化：</b>{tradeoffs.join('；')}。“计算用时”只指生成方案所花的时间。</p>}
@@ -318,6 +332,24 @@ export default function App() {
   const saveWorkOrder = async (order: WorkOrder, replan: boolean) => {
     setWorking(order.is_emergency ? '正在保存突发工单' : '正在保存工单')
     try {
+      if (replan && order.is_emergency && !workEditor?.initial) {
+        const planningTime = order.reported_at ?? replanTime
+        const result = await api.replan(
+          scenario.id,
+          planningTime,
+          'stable',
+          order,
+          `emergency-ui:${scenario.id}:${order.id}`,
+        )
+        if (activeScenarioId.current !== scenario.id) return
+        const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
+        if (activeScenarioId.current !== scenario.id) return
+        setWorkEditor(undefined); setScenario(fresh); setSchedule(result); setPlans(planItems)
+        setHistoricalScenario(undefined); setView('dispatch')
+        setScenarios(current => current.map(item => item.id === fresh.id ? fresh : item))
+        setToast('突发工单已接入，局部重排已发布')
+        return
+      }
       const next = workEditor?.initial
         ? await api.updateWorkOrder(scenario.id, order.id, order)
         : await api.createWorkOrder(scenario.id, order)
@@ -391,7 +423,7 @@ export default function App() {
         <div className="strategy-select"><select aria-label="优化策略" value={strategy} onChange={e => setStrategy(e.target.value as Strategy)}><option value="balanced">均衡策略</option><option value="completion">完成率优先</option><option value="punctuality">准时优先</option><option value="low_travel">低行程</option><option value="low_overtime">低加班</option><option value="fair_workload">工作量公平</option></select><ChevronDown size={13} /></div>
         <button className="primary" onClick={runOptimize} disabled={!!working}><WandSparkles size={16} />生成推荐方案</button>
         <button className="emergency" onClick={() => setWorkEditor({ emergencyPreset: true })} disabled={!!working}><Zap size={15} />新增突发单</button>
-        <label className="replan-time">重排时点<input type="time" value={hhmm(replanTime)} onChange={event => setReplanTime(fromTime(event.target.value))} /></label>
+        <label className="replan-time">重排时点<span>{hhmm(replanTime)}</span><input aria-label="重排时点（当日起分钟数）" type="number" min="0" max="1800" step="5" value={replanTime} onChange={event => setReplanTime(Number(event.target.value))} /></label>
         <button onClick={runReplan} disabled={!!working || !schedule}><TimerReset size={15} />局部重排</button>
         <span className="divider" />
         <button onClick={async () => { setWorking('正在对比方案'); try { setComparison(await api.comparison(scenario.id)) } catch (e) { setToast(e instanceof Error ? e.message : '无法比较') } finally { setWorking(undefined) } }} disabled={!!working || !schedule || !baseline}><BarChart3 size={15} />方案比较</button>
@@ -402,7 +434,7 @@ export default function App() {
     {schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
     <KpiStrip schedule={schedule} baseline={baseline} />
     <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
-    <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / 3 类技能</span><span className="objective">目标值 <b>{typeof schedule?.objective === 'number' ? schedule.objective.toLocaleString() : '—'}</b></span></footer>
+    <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / 3 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
   </>
 
   return <div className="app-shell">
@@ -451,11 +483,18 @@ export default function App() {
       finally { setWorking(undefined) }
     }} onLock={async (assignment, locked) => {
       setWorking(locked ? '正在锁定安排' : '正在解除锁定')
-      try { const next = await api.lock(scenario.id, assignment.work_order_id, assignment.technician_id, locked); if (activeScenarioId.current !== next.id) return; setScenario(next); setSchedule({ ...schedule!, assignments: schedule!.assignments.map(a => a.work_order_id === assignment.work_order_id ? { ...a, locked } : a) }); setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}，数据已更新为 D${String(next.revision).padStart(3, '0')}`) } catch (e) { setToast(e instanceof Error ? e.message : '锁定失败') } finally { setWorking(undefined) }
+      try {
+        const next = await api.lock(scenario.id, assignment.work_order_id, assignment.technician_id, locked)
+        if (activeScenarioId.current !== next.id) return
+        const planItems = await api.planVersions(next.id)
+        if (activeScenarioId.current !== next.id) return
+        setScenario(next); setPlans(planItems); setSchedule(undefined); setBaseline(undefined); setHistoricalScenario(undefined)
+        setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}，请重新生成或局部重排方案`)
+      } catch (e) { setToast(e instanceof Error ? e.message : '锁定失败') } finally { setWorking(undefined) }
     }} />}
     {comparison && <CompareDrawer data={comparison} onClose={() => setComparison(undefined)} />}
     {workEditor && <WorkOrderEditor initial={workEditor.initial} emergencyPreset={workEditor.emergencyPreset} onClose={() => setWorkEditor(undefined)} onSave={saveWorkOrder} onDelete={deleteWorkOrder} />}
     {techEditor && <TechnicianEditor initial={techEditor.initial} onClose={() => setTechEditor(undefined)} onSave={saveTechnician} />}
-    {toast && <div className="toast" role="status"><Check size={15} />{toast}<button onClick={() => setToast(undefined)}><X size={14} /></button></div>}
+    {toast && <div className="toast" role="status"><span className="toast-mark" aria-hidden="true" />{toast}<button onClick={() => setToast(undefined)} aria-label="关闭提示"><X size={14} /></button></div>}
   </div>
 }
