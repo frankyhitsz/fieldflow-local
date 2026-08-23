@@ -47,5 +47,5 @@ with TestClient(app) as client:
 
     print("✓ 人工基线       ", compact(baseline))
     print("✓ OR-Tools 优化  ", compact(optimized))
-    print("✓ 显式突发单 + 锁定 + 局部重排", compact(replanned), f"| 稳定率={replanned['kpis']['stability_rate']:.0%}")
+    print("✓ 突发单 + 锁定 + 局部重排", compact(replanned), f"| 稳定率={replanned['kpis']['stability_rate']:.0%}")
     print("✓ 对比与静态 HTML 报告已生成")

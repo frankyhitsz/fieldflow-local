@@ -8,6 +8,7 @@ from .timeutils import hhmm
 
 
 def build_report(scenario: ScheduleScenario, result: ScheduleResult) -> str:
+    kind_label = {"baseline": "人工基线", "optimized": "优化方案", "replan": "局部重排"}.get(result.kind, result.kind)
     orders = {o.id: o for o in scenario.work_orders}
     techs = {t.id: t for t in scenario.technicians}
     grouped = defaultdict(list)
@@ -46,8 +47,8 @@ main{{max-width:1080px;margin:auto;padding:48px 28px}}h1{{font-family:"Songti SC
 .kpis{{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:#ccd2cd;border:1px solid #ccd2cd;margin:32px 0}}.kpi{{background:#fff;padding:18px}}.kpi b{{display:block;font:26px "Songti SC",serif}}section{{margin:34px 0}}
 table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:10px 12px;border-bottom:1px solid #dde1dd;text-align:left}}th{{color:#5e6b63;font-size:12px;letter-spacing:.08em}}small,.muted{{color:#6a746e}}li{{margin:10px 0}}@media print{{body{{background:white}}main{{padding:0}}}}
 </style></head><body><main>
-<div class="eyebrow">FIELDFlow / 调度执行报告</div><h1>{html.escape(scenario.name)}</h1>
-<p class="meta">计划版本 v{result.version} · {html.escape(result.kind)} · <span class="status">{result.solver_status.value}</span> · 计算用时 {result.runtime_ms} ms</p>
+<div class="eyebrow">FIELDFLOW / 调度报告</div><h1>{html.escape(scenario.name)}</h1>
+<p class="meta">V{result.version:03d} · {html.escape(kind_label)} · <span class="status">{result.solver_status.value}</span> · 计算 {result.runtime_ms} ms</p>
 <div class="kpis"><div class="kpi"><span>完成率</span><b>{k.completion_rate:.0%}</b></div><div class="kpi"><span>SLA 按时率</span><b>{k.sla_on_time_rate:.0%}</b></div><div class="kpi"><span>总行程</span><b>{k.total_travel_minutes}<small> 分钟</small></b></div><div class="kpi"><span>加班</span><b>{k.total_overtime_minutes}<small> 分钟</small></b></div><div class="kpi"><span>未分配</span><b>{k.unassigned_count}<small> 单</small></b></div></div>
 <p>{html.escape(result.solver_note)}</p>{''.join(route_sections)}
 <section><h2>未分配诊断</h2><ul>{unassigned}</ul></section>

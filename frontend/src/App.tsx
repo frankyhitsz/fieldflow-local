@@ -179,12 +179,12 @@ function ExplanationPanel({ scenario, schedule, orderId, readOnly = false, onClo
   if (!order) return null
   return <aside className="detail-drawer" aria-label="工单详情">
     <div className="drawer-top"><div><span className={`priority ${order.priority}`}>{priorityLabel[order.priority]}</span>{order.is_emergency && <span className="emergency-tag">突发</span>}<span className="mono">{order.id}</span></div><div>{!readOnly && <button className="icon-btn" onClick={() => onEdit(order)} aria-label="编辑工单"><Edit3 size={16} /></button>}<button className="icon-btn" onClick={onClose} aria-label="关闭工单详情"><X size={18} /></button></div></div>
-    {readOnly && <div className="readonly-note">历史快照为只读；如需重新采用，请在方案版本页恢复为新版本。</div>}
+    {readOnly && <div className="readonly-note">这是只读历史。如需使用，请回到版本页恢复。</div>}
     <h2>{order.customer_name}</h2><p className="detail-title">{order.title}</p>
     <div className="detail-grid"><div><small>客户时间窗</small><strong>{hhmm(order.window_start)}–{hhmm(order.window_end)}</strong></div><div><small>SLA 截止</small><strong className={assignment?.sla_late_minutes ? 'danger' : ''}>{hhmm(order.sla_deadline)}</strong></div><div><small>服务时长</small><strong>{order.service_duration} 分钟</strong></div><div><small>所需技能</small><strong>{order.required_skills.map(s => skillLabel[s]).join('、')}</strong></div></div>
     {assignment ? <>
       <div className="assignment-summary"><div className="tech-avatar" style={{ '--tech': tech?.color } as React.CSSProperties}>{tech?.name.slice(-1)}</div><div><small>当前分配</small><strong>{tech?.name} · {hhmm(assignment.start_time)} 到场</strong></div><span>{assignment.travel_minutes}′ 行程</span></div>
-      <div className="explain"><h3><Sparkles size={15} />为何这样安排</h3><ol>{assignment.explanation.map((line, i) => <li key={i}><span>{i + 1}</span>{line}</li>)}</ol></div>
+      <div className="explain"><h3><Sparkles size={15} />安排原因</h3><ol>{assignment.explanation.map((line, i) => <li key={i}><span>{i + 1}</span>{line}</li>)}</ol></div>
       {!readOnly && <button className={`lock-action ${assignment.locked ? 'locked' : ''}`} onClick={() => onLock(assignment, !assignment.locked)}>{assignment.locked ? <Unlock size={16} /> : <Lock size={16} />}{assignment.locked ? '解除人工锁定' : '锁定此工单与技师'}</button>}
     </> : <UnassignedDetail item={unassigned} candidates={candidates} />}
     {!readOnly && order.status !== 'completed' && candidates.length > 0 && <div className="manual-assign"><label>手工改派</label><div><select value={manualTech} onChange={e => setManualTech(e.target.value)}>{candidates.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.skills.map(skill => skillLabel[skill]).join('、')}</option>)}</select><button disabled={!manualTech || manualTech === assignment?.technician_id} onClick={() => onAssign(order.id, manualTech)}>改派并锁定</button></div><small>保存后会局部重排未开始工单，已执行安排不变。</small></div>}
@@ -210,11 +210,11 @@ function CompareDrawer({ data, onClose }: { data: Comparison; onClose: () => voi
     Number(data.delta.overtime_minutes) > 0 ? `加班增加 ${data.delta.overtime_minutes} 分钟` : Number(data.delta.overtime_minutes) < 0 ? `加班减少 ${-Number(data.delta.overtime_minutes)} 分钟` : '',
   ].filter(Boolean)
   return <div className="modal-backdrop" onMouseDown={onClose}><section className="compare-modal" onMouseDown={e => e.stopPropagation()}>
-    <div className="compare-head"><div><span className="eyebrow">BEFORE / AFTER</span><h2>方案对比</h2><p>基线 v{data.before.version} 与 {kindLabel[data.after.kind]} v{data.after.version}</p></div><button className="icon-btn" onClick={onClose}><X /></button></div>
+    <div className="compare-head"><div><span className="eyebrow">BEFORE / AFTER</span><h2>方案对比</h2><p>V{String(data.before.version).padStart(3, '0')} 与 V{String(data.after.version).padStart(3, '0')} · {kindLabel[data.after.kind]}</p></div><button className="icon-btn" onClick={onClose}><X /></button></div>
     <div className="compare-status"><SolverBadge schedule={data.after} /><span>{data.after.solver_note}</span></div>
     <table className="compare-table"><thead><tr><th>指标</th><th>人工基线</th><th>当前方案</th><th>变化</th></tr></thead><tbody>{rows.map(([label, before, after, delta]) => <tr key={String(label)}><td>{label}</td><td>{before}</td><td><b>{after}</b></td><td className={delta == null ? '' : Number(delta) <= 0 ? 'good' : 'bad'}>{delta == null ? '—' : `${Number(delta) > 0 ? '+' : ''}${delta}`}</td></tr>)}</tbody></table>
-    {tradeoffs.length > 0 && <p className="compare-explain"><b>方案取舍：</b>{tradeoffs.join('；')}。计算用时只表示生成方案耗时，不属于现场执行时间。</p>}
-    <div className="compare-footer"><div><b>{data.changed_orders.length}</b><span>个工单安排发生变化</span></div><div><b>{data.after.kpis.stability_rate == null ? '—' : pct(data.after.kpis.stability_rate)}</b><span>重排稳定率</span></div><div><b>{data.delta.objective == null ? '—' : `${Math.round((1 - data.after.objective / data.before.objective) * 100)}%`}</b><span>{data.delta.objective == null ? '不同策略不比较目标值' : '综合目标改善'}</span></div></div>
+    {tradeoffs.length > 0 && <p className="compare-explain"><b>变化：</b>{tradeoffs.join('；')}。“计算用时”只指生成方案所花的时间。</p>}
+    <div className="compare-footer"><div><b>{data.changed_orders.length}</b><span>个工单安排发生变化</span></div><div><b>{data.after.kpis.stability_rate == null ? '—' : pct(data.after.kpis.stability_rate)}</b><span>重排稳定率</span></div><div><b>{data.delta.objective == null ? '—' : `${Math.round((1 - data.after.objective / data.before.objective) * 100)}%`}</b><span>{data.delta.objective == null ? '不同策略不比较目标值' : '目标值下降'}</span></div></div>
   </section></div>
 }
 
@@ -366,7 +366,7 @@ export default function App() {
       if (activeScenarioId.current !== scenario.id) return
       setPlans(planItems); setSchedule(result); setHistoricalScenario(undefined)
       setBaseline(detail?.artifacts.find(item => item.role === 'baseline')?.schedule)
-      setToast('推荐方案已生成，可在运营复盘查看取舍说明')
+      setToast('推荐方案已生成')
     } catch (error) { setToast(error instanceof Error ? error.message : '优化失败') }
     finally { setWorking(undefined) }
   }
@@ -402,7 +402,7 @@ export default function App() {
     {schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
     <KpiStrip schedule={schedule} baseline={baseline} />
     <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
-    <footer className="statusbar"><span><span className="pulse" />今日行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / 3 类技能</span><span className="objective">综合目标值 <b>{typeof schedule?.objective === 'number' ? schedule.objective.toLocaleString() : '—'}</b></span></footer>
+    <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / 3 类技能</span><span className="objective">目标值 <b>{typeof schedule?.objective === 'number' ? schedule.objective.toLocaleString() : '—'}</b></span></footer>
   </>
 
   return <div className="app-shell">

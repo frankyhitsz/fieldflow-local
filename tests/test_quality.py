@@ -20,3 +20,34 @@ def test_static_report_escapes_user_controlled_technician_ids():
     report = build_report(scenario, baseline_schedule(scenario, 0))
     assert malicious not in report
     assert "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;" in report
+
+
+def test_user_facing_copy_stays_direct_and_version_numbers_stay_consistent():
+    paths = [
+        Path("README.md"),
+        Path("backend/fixtures.py"),
+        Path("backend/main.py"),
+        Path("backend/report.py"),
+        Path("backend/scheduler.py"),
+        Path("backend/storage.py"),
+        Path("frontend/src/App.tsx"),
+        Path("frontend/src/Management.tsx"),
+        Path("frontend/src/StrategyLab.tsx"),
+    ]
+    copy = "\n".join(path.read_text() for path in paths)
+    banned = [
+        "API 文档位于",
+        "显著提高未分配代价",
+        "强约束路线",
+        "复杂路由未声称",
+        "更高的综合业务代价",
+        "完整演示日",
+        "用于验证资格诊断",
+        "统一评估推荐",
+        "计划版本 v",
+        "Explainable field service scheduling",
+    ]
+    assert not [phrase for phrase in banned if phrase in copy]
+    readme = Path("README.md").read_text()
+    assert "接口调试页面：<http://127.0.0.1:8000/docs>\n\n运行数据" in readme
+    assert "V{result.version:03d}" in Path("backend/report.py").read_text()

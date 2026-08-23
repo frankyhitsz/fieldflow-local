@@ -97,7 +97,7 @@ def _diagnose_unassigned(
         return UnassignedWorkOrder(
             work_order_id=order.id,
             reason=UnassignedReason.dropped_by_objective,
-            detail="存在可行技师，但纳入当前路线会导致更高的综合业务代价",
+            detail="按当前策略权重，这张工单没有进入最终路线",
             suggestions=["提高工单优先级", "放宽时间窗", "增加可用技师"],
         )
     if locked_to:
@@ -145,7 +145,7 @@ def _explanation(
     if changed:
         items.append("为接纳突发工单或降低 SLA 风险，本项安排发生调整")
     if order.vip:
-        items.append("VIP / 高优先级保护：未分配惩罚已显著提高")
+        items.append("VIP 工单的未分配代价较高")
     return items
 
 
@@ -515,7 +515,7 @@ def optimized_schedule(
         unassigned = [_diagnose_unassigned(order, scenario, locked, False) for order in active_orders]
         return _result(
             scenario, kind, version, status, runtime_ms, [], unassigned, previous,
-            note="求解器未在限制内找到可执行方案；原计划未被覆盖。",
+            note="在时限内没有排出可执行方案，原方案保持不变。",
             strategy=strategy,
         )
 
@@ -561,10 +561,10 @@ def optimized_schedule(
         for order in active_orders
         if order.id not in assigned_ids
     ]
-    strategy_names = {"balanced": "均衡", "completion": "完成率优先", "punctuality": "准时优先", "low_travel": "少跑优先", "stable": "稳定优先"}
+    strategy_names = {"balanced": "均衡", "completion": "完成率优先", "punctuality": "准时优先", "low_travel": "低行程", "low_overtime": "低加班", "fair_workload": "工作量公平", "stable": "稳定优先", "custom": "自定义"}
     return _result(
         scenario, kind, version, SolverStatus.feasible, runtime_ms, assignments, unassigned, previous,
-        note=f"按“{strategy_names.get(strategy, strategy)}”策略在 {effective_limit:g} 秒计算限制内返回可行方案；复杂路由未声称全局最优。",
+        note=f"“{strategy_names.get(strategy, strategy)}”策略在 {effective_limit:g} 秒时限内找到了可执行方案，尚未完成全局最优性证明。",
         strategy=strategy,
     )
 
@@ -599,8 +599,8 @@ def replan_schedule(
     for item in fixed:
         fixed_by_tech[item.technician_id].append(item)
         item.changed = False
-        if "已开始或已完成" not in "".join(item.explanation):
-            item.explanation.append("已开始或已完成，本次局部重排保持原安排不变")
+        if "本次不调整" not in "".join(item.explanation):
+            item.explanation.append("工单已执行或正在路上，本次不调整")
     for tech in scenario_copy.technicians:
         prefix = sorted(fixed_by_tech.get(tech.id, []), key=lambda a: a.sequence)
         if prefix:
@@ -641,7 +641,7 @@ def replan_schedule(
         merged,
         partial.unassigned,
         previous,
-        note=f"局部重排固定了 {len(fixed)} 个已开始/已完成工单；{partial.solver_note}",
+        note=f"局部重排保留了 {len(fixed)} 个已执行或在途工单；{partial.solver_note}",
         strategy=strategy,
     )
     return final

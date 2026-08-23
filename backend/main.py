@@ -55,7 +55,7 @@ experiment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fiel
 
 app = FastAPI(
     title="FieldFlow API",
-    description="Explainable field service scheduling for dispatch operations.",
+    description="本地现场服务排程接口",
     version="2.0.0",
 )
 app.add_middleware(
@@ -504,10 +504,10 @@ def _run_experiment(experiment_id: str, profiles: list[StrategyProfile], overrid
                 "最短行程": min(item.schedule.kpis.total_travel_minutes for item in candidates),
                 "最少加班": min(item.schedule.kpis.total_overtime_minutes for item in candidates),
                 "最公平": min(item.schedule.kpis.workload_stddev for item in candidates),
-                "统一评估推荐": min(item.evaluation_score for item in candidates),
+                "对比得分最低": min(item.evaluation_score for item in candidates),
             }
             for candidate in candidates:
-                values = {"完成率最佳": candidate.schedule.kpis.completion_rate, "最准时": candidate.schedule.kpis.sla_on_time_rate, "最短行程": candidate.schedule.kpis.total_travel_minutes, "最少加班": candidate.schedule.kpis.total_overtime_minutes, "最公平": candidate.schedule.kpis.workload_stddev, "统一评估推荐": candidate.evaluation_score}
+                values = {"完成率最佳": candidate.schedule.kpis.completion_rate, "最准时": candidate.schedule.kpis.sla_on_time_rate, "最短行程": candidate.schedule.kpis.total_travel_minutes, "最少加班": candidate.schedule.kpis.total_overtime_minutes, "最公平": candidate.schedule.kpis.workload_stddev, "对比得分最低": candidate.evaluation_score}
                 candidate.advantages = [label for label, value in values.items() if value == metrics[label]]
         experiment.status = "COMPLETED"
         experiment.progress = 100

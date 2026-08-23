@@ -28,7 +28,7 @@ def test_optimizer_improves_main_weighted_objective():
     assert optimized.objective < baseline.objective
     assert optimized.kpis.total_travel_minutes < baseline.kpis.total_travel_minutes
     assert optimized.kpis.total_overtime_minutes <= baseline.kpis.total_overtime_minutes
-    assert "未声称全局最优" in optimized.solver_note
+    assert "尚未完成全局最优性证明" in optimized.solver_note
     repeated = optimized_schedule(get_fixture("main"), 2, baseline, time_limit_seconds=0.05)
     assert repeated.solver_status.value in {"FEASIBLE", "TIME_LIMIT"}
     assert [(a.work_order_id, a.technician_id, a.sequence, a.start_time) for a in repeated.assignments] == [

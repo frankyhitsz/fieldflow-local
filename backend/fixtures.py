@@ -140,12 +140,12 @@ def _strategy_fixture(scenario_id: str, technician_count: int, order_count: int,
             service_duration=duration, window_start=start, window_end=start + width,
             sla_deadline=start + min(width, [55, 75, 100][index % 3]), priority=Priority.urgent if vip else priority,
             drop_penalty=10000 if vip else {Priority.urgent: 8500, Priority.high: 4800, Priority.normal: 2500, Priority.low: 1400}[priority],
-            vip=vip, note="策略实验中的高价值承诺工单" if vip else "",
+            vip=vip, note="已向客户承诺到场" if vip else "",
         ))
     return ScheduleScenario(
         id=scenario_id,
         name="策略实验 · 中型" if order_count == 60 else "策略实验 · 压力型",
-        description=f"{technician_count} 名技师、{order_count} 个工单的固定种子策略对比场景",
+        description=f"{technician_count} 名技师、{order_count} 个工单，可重复比较不同策略",
         technicians=technicians,
         work_orders=orders,
         solver_config=SolverConfig(time_limit_seconds=2 if order_count == 60 else 4),
@@ -154,7 +154,7 @@ def _strategy_fixture(scenario_id: str, technician_count: int, order_count: int,
 
 
 def all_fixtures() -> dict[str, ScheduleScenario]:
-    main = _scenario("main", "今日调度 · 城西片区", "24 个工单、4 名技师的完整演示日", _main_orders())
+    main = _scenario("main", "今日调度 · 城西片区", "24 个工单、4 名技师", _main_orders())
 
     skill_orders = copy.deepcopy(_main_orders()[:10])
     skill_orders.append(
@@ -165,7 +165,7 @@ def all_fixtures() -> dict[str, ScheduleScenario]:
             drop_penalty=9000, note="需要同时具备暖通与网络技能",
         )
     )
-    skill_scenario = _scenario("skill-shortage", "技能不足", "包含复合技能工单，用于验证资格诊断", skill_orders)
+    skill_scenario = _scenario("skill-shortage", "技能不足", "含一张需要两项技能的工单", skill_orders)
     # Remove the only technician with the exact composite skill combination.
     skill_scenario.technicians = [t for t in skill_scenario.technicians if t.id != "TECH-03"]
     for t in skill_scenario.technicians:
@@ -181,7 +181,7 @@ def all_fixtures() -> dict[str, ScheduleScenario]:
     window_scenario = _scenario("window-conflict", "时间窗冲突", "多个同技能工单争用同一窄时间窗", window_orders)
 
     emergency_orders = copy.deepcopy(_main_orders()[:16])
-    emergency_scenario = _scenario("emergency", "突发工单重排", "先生成计划，再插入紧急工单验证稳定率", emergency_orders)
+    emergency_scenario = _scenario("emergency", "突发工单重排", "已有安排中加入一张紧急工单", emergency_orders)
 
     strategy_medium = _strategy_fixture("strategy-medium", 8, 60, SEED + 60)
     strategy_stress = _strategy_fixture("strategy-stress", 12, 100, SEED + 100)

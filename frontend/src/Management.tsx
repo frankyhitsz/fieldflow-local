@@ -18,7 +18,7 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, { error
   componentDidCatch(error: Error, info: ErrorInfo) { console.error('FieldFlow render error', error, info) }
   render() {
     if (!this.state.error) return this.props.children
-    return <main className="fatal-state"><AlertTriangle size={28} /><h1>页面数据没有完整加载</h1><p>当前内容已停止渲染，避免显示错误计划。请重新读取场景数据。</p><button onClick={() => window.location.reload()}>重新读取数据</button><details><summary>错误详情</summary>{this.state.error.message}</details></main>
+    return <main className="fatal-state"><AlertTriangle size={28} /><h1>这页的数据不完整</h1><p>请重新读取场景。如果问题仍在，请展开错误详情。</p><button onClick={() => window.location.reload()}>重新读取</button><details><summary>错误详情</summary>{this.state.error.message}</details></main>
   }
 }
 
@@ -30,7 +30,7 @@ export function VersionsView({ scenario, plans, onOpen, onRestore, onCompare, on
   const visible = filter === 'all' ? ordered : ordered.filter(item => item.action === filter)
   const sourceById = new Map(plans.map(item => [item.id, item]))
   return <section className="page-view">
-    <div className="page-title"><div><span className="eyebrow">PLAN HISTORY</span><h1>方案版本</h1><p>一次成功操作只增加一个 V 版本；D 表示当时使用的业务数据修订。</p></div><div className="page-title-actions"><span className="revision-badge">数据 D{String(scenario.revision).padStart(3, '0')}</span><button onClick={onReset}>恢复初始数据</button></div></div>
+    <div className="page-title"><div><span className="eyebrow">PLAN HISTORY</span><h1>方案版本</h1><p>V 是方案版本，D 是该方案使用的数据修订号。</p></div><div className="page-title-actions"><span className="revision-badge">数据 D{String(scenario.revision).padStart(3, '0')}</span><button onClick={onReset}>恢复初始数据</button></div></div>
     <div className="version-tools">
       <label>筛选<select value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部动作</option><option value="baseline">人工基线</option><option value="optimize">优化</option><option value="replan">局部重排</option><option value="restore">历史恢复</option><option value="experiment_publish">实验发布</option></select></label>
       <div className="version-compare"><span>跨版本比较</span><select aria-label="比较起点" value={beforeId} onChange={event => setBeforeId(event.target.value)}><option value="">起点版本</option>{plans.map(item => <option key={item.id} value={item.id}>V{String(item.number).padStart(3, '0')} · {item.label}</option>)}</select><span>→</span><select aria-label="比较终点" value={afterId} onChange={event => setAfterId(event.target.value)}><option value="">终点版本</option>{plans.map(item => <option key={item.id} value={item.id}>V{String(item.number).padStart(3, '0')} · {item.label}</option>)}</select><button disabled={!beforeId || !afterId || beforeId === afterId} onClick={() => { const before = plans.find(item => item.id === beforeId); const after = plans.find(item => item.id === afterId); if (before && after) onCompare(before, after) }}><BarChart3 size={15} />比较</button></div>
@@ -56,7 +56,7 @@ export function TechniciansView({ scenario, schedule, onEdit, onAdd }: { scenari
   const coverage = Object.keys(skillLabel).map(skill => ({ skill, count: scenario.technicians.filter(t => t.skills.includes(skill)).length }))
   return <section className="page-view">
     <div className="page-title"><div><span className="eyebrow">TEAM CAPACITY</span><h1>技师与技能</h1><p>维护技能、班次、加班上限和出发点。保存后需重新生成方案。</p></div><button className="page-primary" onClick={onAdd}><Plus size={15} />新增技师</button></div>
-    <div className="coverage-strip">{coverage.map(item => <div key={item.skill}><span>{skillLabel[item.skill]}覆盖</span><b>{item.count}</b><small>{item.count < 2 ? '存在单点风险' : '可交叉调度'}</small></div>)}</div>
+    <div className="coverage-strip">{coverage.map(item => <div key={item.skill}><span>{skillLabel[item.skill]}覆盖</span><b>{item.count}</b><small>{item.count < 2 ? '只有一人可接' : '至少两人可接'}</small></div>)}</div>
     <div className="tech-card-grid">{scenario.technicians.map(tech => {
       const kpi = schedule?.kpis.technician.find(item => item.technician_id === tech.id)
       return <article className="tech-card" key={tech.id}>
@@ -85,9 +85,9 @@ export function ReviewView({ schedule, baseline }: { schedule?: Schedule; baseli
     delta.travel > 0 ? `行程增加 ${delta.travel} 分钟` : delta.travel < 0 ? `行程减少 ${-delta.travel} 分钟` : '行程不变',
   ] : []
   return <section className="page-view">
-    <div className="page-title"><div><span className="eyebrow">OPERATIONS REVIEW</span><h1>运营复盘</h1><p>区分“计算用了多久”和“现场要花多久”，并解释推荐方案的业务取舍。</p></div><span className="revision-badge">{strategyLabel[schedule.strategy]}策略</span></div>
-    <div className="review-summary"><div><small>方案计算用时</small><b>{schedule.runtime_ms}<em> ms</em></b><p>基线是一次贪心扫描；优化会搜索大量路线组合，因此计算时间更长属于正常现象。</p></div><div><small>现场行程时间</small><b>{schedule.kpis.total_travel_minutes}<em> 分钟</em></b><p>这是技师真正花在路上的预计时间，与计算用时不是同一个指标。</p></div><div><small>现场服务时间</small><b>{schedule.kpis.total_service_minutes}<em> 分钟</em></b><p>所有已分配工单的服务时长合计。</p></div></div>
-    {tradeoffs.length > 0 && <div className="tradeoff-card"><ShieldCheck size={20} /><div><h2>为什么仍推荐这个方案</h2><p>{tradeoffs.join('；')}。系统按加权业务目标选择方案，不代表每项指标都会同时下降。</p></div></div>}
+    <div className="page-title"><div><span className="eyebrow">OPERATIONS REVIEW</span><h1>运营复盘</h1><p>查看计算耗时、现场耗时，以及各项指标相对基线的变化。</p></div><span className="revision-badge">{strategyLabel[schedule.strategy]}策略</span></div>
+    <div className="review-summary"><div><small>方案计算用时</small><b>{schedule.runtime_ms}<em> ms</em></b><p>生成本方案所用的时间。</p></div><div><small>现场行程时间</small><b>{schedule.kpis.total_travel_minutes}<em> 分钟</em></b><p>各段路程和返程的预计总时长。</p></div><div><small>现场服务时间</small><b>{schedule.kpis.total_service_minutes}<em> 分钟</em></b><p>已排工单的服务时长合计。</p></div></div>
+    {tradeoffs.length > 0 && <div className="tradeoff-card"><ShieldCheck size={20} /><div><h2>与基线相比</h2><p>{tradeoffs.join('；')}。方案排序依据为当前策略权重。</p></div></div>}
     <div className="review-grid"><article><h2>目标值构成</h2><div className="cost-bars">{Object.entries(schedule.objective_breakdown).map(([key, value]) => <div key={key}><span>{breakdownLabels[key] || key}</span><i><b style={{ width: `${value / maxCost * 100}%` }} /></i><strong>{Math.round(value)}</strong></div>)}</div></article><article><h2>技师工作量</h2>{schedule.kpis.technician.map(item => <div className="util-row" key={item.technician_id}><span>{item.technician_id}</span><i><b style={{ width: `${Math.min(100, item.utilization * 100)}%` }} /></i><strong>{pct(item.utilization)}</strong><small>{item.assignment_count} 单</small></div>)}</article></div>
   </section>
 }
