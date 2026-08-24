@@ -1,53 +1,61 @@
-# `pro-plan.md` 逐项复核
+# `pro-plan.md` 复核结论
 
-## 复核口径
+## 复核方法
 
-审查文件基于网页端静态阅读，部分判断准确指出了契约缺口，也有一些建议需要新数据和新运行时。以下结论沿 FastAPI、SQLite、调度器、Verifier、React 和可运行测试逐项核查。“修复”表示当前实现和回归测试均已覆盖；“门禁”表示先进模型尚未实现，但系统已经停止输出语义错误的结果；“延期”不计作已完成。
+本轮以 2026-08-24 更新的审查文件为准，逐项对照当前模型、SQLite 事务、FastAPI 接口、React 行为和故障注入结果。以下“已修复”均有自动化回归；“延期”表示建议合理，但需要新领域数据、兼容迁移或仓库所有者决策，不能在补丁版本里用占位实现冒充完成。
 
-## P0 与 P1
+## P0
 
-| 编号 | 合理性 | 当前处理 |
+| 编号 | 结论 | 处理 |
 | --- | --- | --- |
-| P0-01 容量分析没有以选中 V 为基准 | 成立 | 默认 `SELECTED_PLAN_DELTA` 固定选中 V 的已有安排，只放置原未服务工单；可选受控重算时，参照和全部选项使用同一确定性政策。响应保存选中、参照和选项排程签名。 |
-| P0-02 风险不遵循正式开始时刻 | 成立 | 默认 `FOLLOW_PUBLISHED_SCHEDULE`，服务与行程波动从已发布开始时刻传播；最早可行执行改成显式策略。固定 seed 回归验证两种策略不同。 |
-| P0-03 分析忽略现场执行上下文 | 成立 | 已加严格门禁：快照含 started 或 completed 时返回 `EXECUTION_ANALYSIS_CONTEXT_REQUIRED`。完整的 actual-plus-forecast 尚未实现，不再用全日数字掩盖缺口。 |
-| P0-04 `INTAKE_COMMITTED` 可永久卡住 | 成立 | 紧急命令保存准确 publication key；启动时对账 `RUNNING`、`REPLAN_RUNNING` 和带发布键的 `INTAKE_COMMITTED`。已有发布则完成，否则变成可重试；没有发布键的纯接收记录不误伤。 |
-| P1-01 决策分析没有冻结旅行模型 | 成立 | 三类分析都要求当前 provider 指纹与 V 中冻结指纹一致，重算返程和新增路径也使用同一 provider；不一致返回结构化 409。 |
-| P1-02 “增加服务站点”名不副实 | 成立 | 采用审查建议中的即时修正：改为“将一名高行程技师的出发点移至需求中心”。完整站点、库存和多站选择不在当前模型中。 |
-| P1-03 成本混合现金和损失 | 成立 | 分为 `cash_operating_cost_cents`、`service_failure_loss_cents` 和 `total_economic_impact_cents`；旧 `total_cost_cents` 仅保留兼容别名。 |
-| P1-04 “计划失效概率”误导 | 成立 | 主指标改为 `additional_disruption_probability`，另列 `baseline_unserved_orders` 与 `expected_total_unserved_orders`；旧字段仅为兼容别名。 |
-| P1-05 分析结果不持久 | 成立 | 新增 `DecisionAnalysisRun` 和 A 编号。记录 V、快照、排程、执行水位、行程、政策、代码、输入哈希和结果；相同输入原子去重。 |
-| P1-06 没有区分全日、已发生和剩余 | 成立 | 当前明确只支持 `FULL_DAY_PLAN`，存在任何执行事实便拒绝。incurred/remaining/actual-plus-forecast 需要执行投影，列为后续范围。 |
-| P1-07 超时固定追加 15 分钟 | 成立 | 开始服务可填 `estimated_remaining_minutes`；缺省值移入 `SolverConfig.active_service_default_remaining_minutes`，调度、验证和开工门禁共享。 |
-| P1-08 历史 replan 激活改变稳定性语义 | 成立 | 分离 `lineage_source_version_id` 与 `stability_baseline_version_id`；激活保持原始重排基准并按该基准重新规范化。 |
-| P1-09 锁定并改派是两个请求 | 成立 | 新增单一幂等命令 `/manual-reassignment`。锁定是持久业务决定；重排失败返回部分成功结果并保留最后正式方案为过期可见状态。 |
-| P1-10 PlanVersion 混合冻结历史与适用状态 | 成立 | `active` 与 `coverage_status` 迁到 `plan_applicability`。数据编辑只改投影，历史 payload 字节保持不变。显式名称编辑仍是允许的展示元数据更新。 |
-| P1-11 单一 D 混合多种修订 | 方向合理但属于破坏性架构变更 | 执行事件已有独立单调水位，A/V 也已独立；公开 D 继续兼容聚合业务修订。拆成 planning/metadata/execution 三套编号需专门迁移和客户端版本，不在补丁版本中强改。 |
-| P1-12 Benchmark smoke 太弱 | 成立 | smoke 已增加选中 V 签名、同政策基准、发布时间语义、旅行指纹拒绝、执行态拒绝、成本对账和元数据检查；它仍明确叫 smoke，不包装成正式性能 benchmark。 |
+| P0-01 执行完成后可生成无水位全日分析 | 成立，已修复 | 用 `EX_ANTE_FROZEN_PLAN` 取代含糊的 `FULL_DAY_PLAN`。存在任何执行事件时必须显式选择范围；A 记录保存当前水位、分析时点、执行上下文哈希和是否包含实绩。其余三个执行感知范围返回稳定的 `ANALYSIS_SCOPE_NOT_SUPPORTED`。 |
+| P0-02 增量容量忽略真实返程仍称可行 | 成立，已修复 | 尾部追加在选择工单时计算返回真实出发点的时间，并对完整结果复核覆盖、唯一性、技能、时间窗、旅行连续性、班次、锁定、固定 assignment、返程和加班上限。`option_applicable` 与 `schedule_feasible` 分开返回。 |
+| P0-03 人工改派锁定后崩溃不可恢复 | 成立，已修复 | 命令阶段改为 `RESERVED / LOCK_COMMITTED / REPLAN_CREATED / PLAN_PUBLISHED / COMPLETED / FAILED_AFTER_LOCK`。锁定提交时预分配稳定 Run ID；重启只恢复因应用中断的原 Run。三个阶段的进程终止测试验证 Lock、D、Run、V 均不重复，请求内容变化返回 409。 |
 
-## 工程、依赖与仓库治理
+## P1
 
-| 项目 | 结论与处理 |
+| 编号 | 结论 | 处理 |
+| --- | --- | --- |
+| P1-01 分析哈希与代码来源不完整 | 成立，已修复 | 排程哈希覆盖除 ID、创建时间和运行耗时外的完整权威 Schedule，包括 assignment、KPI、证据、求解政策和旅行字段。分析前重新核对场景哈希、排程快照、政策指纹、旅行指纹、服务时长、SLA 和重算 KPI。记录算法版本与构建 SHA；CI 注入 `${{ github.sha }}`，本地使用源码哈希。 |
+| P1-02 固定投入与单日成本混算 | 成立，已修复 | 新增 `AnalysisHorizon`、`CostCadence` 和 `LaborCostMode`。一次性投入、日运营变化、周期总影响和盈亏平衡日分开返回；不适用选项不再计入固定投入。 |
+| P1-03 新技师和补技能假设过于乐观 | 成立，已修复 | 新技师接受显式 archetype；缺省时只使用最高损失未服务工单所需技能，不再自动全技能。技能投资绑定具体技师和技能；缺省建议按可解锁未服务损失选择。每个选项返回 `changed_inputs`。 |
+| P1-04 只在路线尾部追加低估收益 | 成立，按能力明确化 | 当前算法明确命名 `TAIL_APPEND_ONLY`，页面说明它不是完整插入优化。固定承诺间隙插入会改变搜索空间和稳定性政策，列入后续版本，不在本轮暗示已经支持。 |
+| P1-05 风险统计名称含糊 | 成立，已修复 | 区分 `monte_carlo_mean_ci_*` 与 `full_day_total_late_minutes_p*`；分别输出缺勤、客户不在、窗口、加班和突发容量扰动概率。兼容别名保留但不再作为页面主标签。 |
+| P1-06 A 只有成功终态 | 成立，已修复当前同步范围 | A 在计算前以 `RUNNING` 预留，随后进入 `COMPLETED`、`FAILED` 或 `INTERRUPTED`，错误结构持久化且相同输入去重。持久 worker、进度和取消属于 v0.6.0。 |
+| P1-07 页面自动写 A，部分失败隐藏成功 | 成立，已修复 | 页面进入只 GET 已有 A。用户显式点击才 POST；成本与风险使用 `Promise.allSettled()`，单项失败不清除另一项结果，并显示失败或中断记录提示。 |
+| P1-08 直接接口绕过 A | 成立，兼容性处理 | 正式 UI 只调用 A-run 接口；三个同步接口在 OpenAPI 标记 deprecated，并共享完全相同的范围门禁。暂不删除旧接口，避免破坏已有本地客户端。 |
+| P1-09 单一 D 仍混合多类修订 | 方向合理，延期 | 执行事件已有独立单调 sequence，A/V 也独立。把公开 D 拆为 planning、metadata、execution 会改变所有 CAS 和迁移契约，安排到 v0.6.0。 |
+| P1-10 浮点坐标缺少稳定位置 ID | 成立，延期 | 当前离线欧氏模型可复现；矩阵、多站点和分时交通需要 `Location/CustomerSite/Depot` 稳定 ID，安排到位置模型工作包。 |
+| P1-11 PlanVersion 仍有兼容可变字段 | 成立，分步处理 | 运行时 active/coverage 已移出冻结 payload。名称仍是显式可编辑展示元数据，旧字段仍需兼容读取；删除需要版本化迁移，不在补丁版本破坏历史库。 |
+| P1-12 v1 历史无法迁移时会重建 | 风险成立，保留既定行为 | 该路径来自先前确认的“一次性备份后重建”决定，当前仍先生成时间戳备份。正式发布前应改成显式迁移 CLI、导出和恢复演练；本轮不静默改变已有迁移语义。 |
+
+## P2 与产品扩展
+
+| 项目 | 结论 |
 | --- | --- |
-| P2-01 静态门禁与属性测试不足 | Pyright basic 已进 `make lint` 和 CI；增加 Hypothesis 属性测试、v1–v12 迁移矩阵、恢复故障测试和 OpenAPI 快照。前端 ESLint 建议合理，但当前 TypeScript 7 超出已发布 `typescript-eslint` peer 范围；本轮保留严格 `tsc`，不安装声明不兼容的工具链。 |
-| P2-02 Pydantic 是传递依赖 | 成立；已在 `requirements.txt` 和 `pyproject.toml` 直接声明。 |
-| P2-03 开发服务器监听 `0.0.0.0` | 成立；Vite host 改为 `127.0.0.1`，FastAPI 启动保持本机地址。 |
-| P2-04 缺少 LICENSE 与分支保护 | 事实成立，但不是可自行决定的代码缺陷。许可证需要所有者选择法律文本；分支保护是额外 GitHub 治理操作，未在仅提交代码的授权下代替所有者修改。 |
-| 依赖和兼容矩阵 | 增加 Python 3.11 作业、`pip-audit` 和 npm production audit。修复审计发现的 FastAPI/Starlette、pytest 和 protobuf/OR-Tools 问题，并处理新版 OR-Tools Python 绑定不再接受车辆列表的兼容变化。 |
+| 属性测试和 Benchmark | 属性测试新增随机加班容量、完整可行性和成本周期不变量；故障注入覆盖人工改派三个持久阶段。`benchmark_smoke.py` 仍明确只是确定性回归，不宣称正式性能 Benchmark。 |
+| Python 依赖锁定 | `pyproject.toml` 和 `requirements.txt` 的直接依赖均精确固定，但传递依赖尚无跨平台锁文件。统一 lock/同步工具属于独立工程变更，不能用一次 `pip freeze` 生成的平台快照代替。 |
+| LICENSE 与分支保护 | 事实成立，但需要所有者选择 MIT 或 Apache-2.0，并授权 GitHub 治理变更。本轮不擅自选择法律文本或修改仓库规则。 |
+| 更完整业务域 | Booking 生命周期、收件箱、技师端模拟、拖拽调度、资产、周期维护、库存、Crew、组合容量、风险校准和计划-实际绩效都合理，但需要新模型、Fixture 和业务验收，保留在 M1–M3。 |
 
-## 里程碑判断
+## M0 交付状态
 
-| 里程碑 | 已完成 | 仍需后续项目 |
+| 任务 | 状态 | 证据 |
 | --- | --- | --- |
-| M0 v0.5.1 经营分析正确性 | 选中 V 基准、风险计划时刻、旅行指纹、成本与风险命名、执行态门禁、紧急恢复、选项文案和专项测试均完成。 | 执行水位下的实际加预测分析。 |
-| M1 v0.6.0 持久运行时 | `DecisionAnalysisRun`、PlanApplicability、OpenAPI/类型/属性/迁移/安全门禁已提前完成。 | 独立 worker、正式 Booking 表、三类修订号、矩阵旅行模型和更彻底依赖注入。 |
-| M2 v0.7.0 运营闭环 | 已有执行事件、人工改派命令、策略实验和计划/实际基础字段。 | 收件箱、完整 Booking 生命周期、执行模拟器、资产周期维护、库存和 Crew。 |
-| M3 v0.8.0 决策科学 | 已有可审计成本、容量和固定 seed 风险分析。 | 风险校准、组合容量、敏感性/Pareto 和有多 seed、p50/p95、硬件说明的正式 benchmark。 |
-| M4 v1.0.0 开源发布 | README、贡献、安全与行为准则已存在。 | 所有者选择许可证、仓库治理和可复现 Release。 |
+| FF-901 分析范围与执行水位 | 完成 | started/completed API、显式事前范围、稳定未支持错误、范围哈希和 D/V 不变测试。 |
+| FF-902 容量完整验证 | 完成 | 真实返程、超加班、固定 assignment、完整覆盖和属性测试。 |
+| FF-903 可恢复改派 Saga | 完成 | `LOCK_COMMITTED`、`REPLAN_CREATED`、`PLAN_PUBLISHED` 三阶段进程终止与重启测试。 |
+| FF-904 输入完整性与代码来源 | 完成 | KPI、旅行分钟、证据、build SHA 哈希测试；损坏方案生成持久 FAILED A。 |
+| FF-905 周期与成本频率 | 完成 | 单日/多日成本、一次性投入、付费班次人工测试。 |
+| FF-906 容量选项真实性 | 完成当前模式 | 保守/显式 archetype、目标技能、changed inputs、`TAIL_APPEND_ONLY`。间隙插入延期。 |
+| FF-907 风险统计契约 | 完成 | 新字段、兼容别名一致性和概率范围测试。 |
+| FF-908 A-run 页面与旧接口 | 完成 | 首屏零 POST、显式生成、部分成功组件测试、deprecated OpenAPI。 |
+| FF-909 M0 回归 | 完成 | 后端、属性、故障、组件、OpenAPI、Demo、Smoke 和 E2E 纳入统一验证。 |
 
-## 对静态推断的修正
+## 明确未冒充完成的工作
 
-- 审查提出的 `DecisionAnalysisRun` 并不要求引入云服务或在线队列；在当前 SQLite 事务内可以严谨实现，因此本轮已完成。
-- “增加站点”不能仅靠新名称变成真实站点模型，本轮明确降级为出发点假设，没有添加虚假的 Depot 实体。
-- 正式 Benchmark 不能靠扩大 smoke 用例数量完成。当前脚本只作确定性回归，性能、可行率和统计分布仍不对外宣称。
-- 完整执行感知分析若缺少实际成本、位置和水位，继续计算比返回 409 更危险；因此当前门禁是刻意的正确行为，不是悄悄忽略需求。
+- `INCURRED_ACTUAL`、`REMAINING_FORECAST`、`ACTUAL_PLUS_FORECAST` 只有契约和拒绝门禁，没有实际计算。
+- 容量仍是单选项、单日计划的尾部追加或受控重算，不是组合优化、敏感性分析或多日人力规划。
+- A 运行仍由当前 FastAPI 进程同步执行；没有独立 worker、取消和进度恢复。
+- SQLite 启动迁移、单一 D、坐标身份、PlanVersion 兼容字段和依赖锁定仍需 M1 工程包。
+- LICENSE、required checks 和分支保护等待仓库所有者决定与授权。

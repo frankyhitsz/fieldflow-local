@@ -35,6 +35,18 @@ test('baseline, optimize, compare, arbitrary activation, and version report', as
   const report = await request.get(`/api/scenarios/${scenarioId}/plan-versions/${plans[0].id}/report`)
   expect(report.ok()).toBeTruthy()
   expect(await report.text()).toContain('FieldFlow 调度台')
+
+  await page.getByRole('button', { name: '运营复盘' }).click()
+  await expect(page.getByText('事前冻结计划分析，不含实际执行')).toBeVisible()
+  await expect(page.getByText(/当前版本还没有经营分析/)).toBeVisible()
+  const beforeAnalysis = await request.get(`/api/scenarios/${scenarioId}/plan-versions/${plans[2].id}/analysis-runs`)
+  expect(await beforeAnalysis.json()).toEqual([])
+  await page.getByRole('button', { name: '生成成本与风险分析' }).click()
+  await expect(page.getByText(/日总经济影响/)).toBeVisible({ timeout: 15_000 })
+  await expect.poll(async () => {
+    const runs = await request.get(`/api/scenarios/${scenarioId}/plan-versions/${plans[2].id}/analysis-runs`)
+    return (await runs.json()).length
+  }).toBe(2)
 })
 
 test('critical navigation remains reachable at 200 percent zoom', async ({ page }) => {

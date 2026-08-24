@@ -3,7 +3,7 @@ import {
   AlertTriangle, BarChart3, Edit3, Plus, Save, ShieldCheck, Trash2, X, Zap,
 } from 'lucide-react'
 import { api } from './api'
-import type { CapacityAnalysis, CostAnalysis, PlanVersion, RiskSimulation, Scenario, Schedule, Technician, WorkOrder } from './types'
+import type { CapacityAnalysis, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, Scenario, Schedule, Technician, WorkOrder } from './types'
 
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
@@ -98,24 +98,64 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   const [capacity, setCapacity] = useState<CapacityAnalysis>()
   const [analysisNumbers, setAnalysisNumbers] = useState<{ cost?: number; risk?: number; capacity?: number }>({})
   const [capacityMode, setCapacityMode] = useState<'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'>('SELECTED_PLAN_DELTA')
-  const [decisionError, setDecisionError] = useState<string>()
+  const [horizonDays, setHorizonDays] = useState(1)
+  const [decisionErrors, setDecisionErrors] = useState<string[]>([])
+  const [loadingExisting, setLoadingExisting] = useState(false)
   const [loadingDecision, setLoadingDecision] = useState(false)
   useEffect(() => {
     let cancelled = false
-    setCost(undefined); setRisk(undefined); setCapacity(undefined); setAnalysisNumbers({}); setDecisionError(undefined)
+    setCost(undefined); setRisk(undefined); setCapacity(undefined); setAnalysisNumbers({}); setDecisionErrors([])
     if (!planVersionId) return () => { cancelled = true }
-    setLoadingDecision(true)
-    Promise.all([
-      api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST'),
-      api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK'),
-    ])
-      .then(([costRun, riskRun]) => { if (!cancelled) { setCost(costRun.result); setRisk(riskRun.result); setAnalysisNumbers({ cost: costRun.number, risk: riskRun.number }) } })
-      .catch(error => { if (!cancelled) setDecisionError(error instanceof Error ? error.message : '经营分析失败') })
-      .finally(() => { if (!cancelled) setLoadingDecision(false) })
+    setLoadingExisting(true)
+    api.analysisRuns(scenarioId, planVersionId)
+      .then(runs => {
+        if (cancelled) return
+        const latest = (type: DecisionAnalysisRun['analysis_type']) => [...runs].reverse().find(item => item.analysis_type === type && item.status === 'COMPLETED' && item.result)
+        const costRun = latest('COST') as DecisionAnalysisRun<CostAnalysis> | undefined
+        const riskRun = latest('RISK') as DecisionAnalysisRun<RiskSimulation> | undefined
+        const capacityRun = latest('CAPACITY') as DecisionAnalysisRun<CapacityAnalysis> | undefined
+        setCost(costRun?.result || undefined); setRisk(riskRun?.result || undefined); setCapacity(capacityRun?.result || undefined)
+        setAnalysisNumbers({ cost: costRun?.number, risk: riskRun?.number, capacity: capacityRun?.number })
+        const failed = runs.filter(item => item.status === 'FAILED' || item.status === 'INTERRUPTED')
+        if (failed.length) setDecisionErrors(failed.slice(-3).map(item => `A${String(item.number).padStart(3, '0')} ${typeof item.error?.message === 'string' ? item.error.message : item.status === 'INTERRUPTED' ? '分析被中断' : '分析失败'}`))
+      })
+      .catch(error => { if (!cancelled) setDecisionErrors([error instanceof Error ? error.message : '读取经营分析失败']) })
+      .finally(() => { if (!cancelled) setLoadingExisting(false) })
     return () => { cancelled = true }
   }, [scenarioId, planVersionId])
   if (!schedule) return <section className="page-view"><div className="empty-view">请先生成一个方案，再查看运营复盘。</div></section>
+  const completedResult = <T,>(run: DecisionAnalysisRun<T>, label: string): T => {
+    if (run.status === 'COMPLETED' && run.result) return run.result
+    const message = typeof run.error?.message === 'string' ? run.error.message : `${label}没有完成`
+    throw new Error(`A${String(run.number).padStart(3, '0')}：${message}`)
+  }
+  const runCostAndRisk = async () => {
+    if (!planVersionId) return
+    setLoadingDecision(true); setDecisionErrors([])
+    const [costOutcome, riskOutcome] = await Promise.allSettled([
+      api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { horizonDays }),
+      api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { horizonDays }),
+    ])
+    const errors: string[] = []
+    if (costOutcome.status === 'fulfilled') {
+      try { setCost(completedResult(costOutcome.value, '成本分析')); setAnalysisNumbers(current => ({ ...current, cost: costOutcome.value.number })) } catch (error) { errors.push(error instanceof Error ? error.message : '成本分析失败') }
+    } else errors.push(costOutcome.reason instanceof Error ? costOutcome.reason.message : '成本分析失败')
+    if (riskOutcome.status === 'fulfilled') {
+      try { setRisk(completedResult(riskOutcome.value, '风险分析')); setAnalysisNumbers(current => ({ ...current, risk: riskOutcome.value.number })) } catch (error) { errors.push(error instanceof Error ? error.message : '风险分析失败') }
+    } else errors.push(riskOutcome.reason instanceof Error ? riskOutcome.reason.message : '风险分析失败')
+    setDecisionErrors(errors); setLoadingDecision(false)
+  }
+  const runCapacity = async () => {
+    if (!planVersionId) return
+    setLoadingDecision(true); setDecisionErrors([])
+    try {
+      const run = await api.createDecisionAnalysisRun<CapacityAnalysis>(scenarioId, planVersionId, 'CAPACITY', { referenceMode: capacityMode, horizonDays })
+      setCapacity(completedResult(run, '容量分析')); setAnalysisNumbers(current => ({ ...current, capacity: run.number }))
+    } catch (error) { setDecisionErrors([error instanceof Error ? error.message : '容量分析失败']) }
+    finally { setLoadingDecision(false) }
+  }
   const breakdownLabels: Record<string, string> = { travel: '行程代价', sla_late: 'SLA 延迟代价', overtime: '加班代价', unassigned: '未分配代价', imbalance: '负载不均代价', replan_changes: '方案变更代价' }
+  const cadenceLabel = { ONE_TIME: '一次性', PER_DAY: '每日', PER_SHIFT: '每班', PER_ORDER: '每单', PER_MONTH: '每月' }
   const maxCost = Math.max(1, ...Object.values(schedule.objective_breakdown))
   const delta = baseline && baseline.id !== schedule.id ? {
     travel: schedule.kpis.total_travel_minutes - baseline.kpis.total_travel_minutes,
@@ -134,19 +174,22 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     <div className="review-summary"><div><small>方案计算用时</small><b>{schedule.runtime_ms}<em> ms</em></b><p>生成本方案所用的时间。</p></div><div><small>业务评分</small><b>{schedule.business_score?.toLocaleString() ?? '—'}</b><p>{schedule.business_score_policy_version} 重算结果；求解器原始目标为 {schedule.solver_objective_value?.toLocaleString() ?? '—'}。</p></div><div><small>计划占用时间</small><b>{schedule.kpis.total_travel_minutes + schedule.kpis.total_waiting_minutes + schedule.kpis.total_service_minutes}<em> 分钟</em></b><p>计划行程、等待和服务时间合计，不代表实际工时。</p></div></div>
     {tradeoffs.length > 0 && <div className="tradeoff-card"><ShieldCheck size={20} /><div><h2>与基线相比</h2><p>{tradeoffs.join('；')}。方案排序依据为当前策略权重。</p></div></div>}
     <div className="review-grid"><article><h2>目标值构成</h2><div className="cost-bars">{Object.entries(schedule.objective_breakdown).map(([key, value]) => <div key={key}><span>{breakdownLabels[key] || key}</span><i><b style={{ width: `${value / maxCost * 100}%` }} /></i><strong>{Math.round(value)}</strong></div>)}</div></article><article><h2>技师工作量</h2>{schedule.kpis.technician.map(item => <div className="util-row" key={item.technician_id}><span>{item.technician_id}</span><i><b style={{ width: `${Math.min(100, item.utilization * 100)}%` }} /></i><strong>{pct(item.utilization)}</strong><small>{item.assignment_count} 单</small></div>)}</article></div>
-    <div className="decision-head"><div><span className="eyebrow">DECISION SUPPORT</span><h2>经营决策测算</h2><p>成本与风险绑定 V{String(cost?.plan_number ?? risk?.plan_number ?? schedule.version).padStart(3, '0')} 的方案、旅行模型和政策快照；{analysisNumbers.cost && analysisNumbers.risk ? `已保存为 A${String(analysisNumbers.cost).padStart(3, '0')}、A${String(analysisNumbers.risk).padStart(3, '0')}` : '正在建立分析记录'}，不会生成 D 或 V。</p></div><div className="decision-actions"><label>容量参照<select aria-label="容量分析参照" value={capacityMode} onChange={event => { setCapacityMode(event.target.value as typeof capacityMode); setCapacity(undefined); setAnalysisNumbers(current => ({ ...current, capacity: undefined })) }}><option value="SELECTED_PLAN_DELTA">相对当前 V</option><option value="CONTROLLED_REOPTIMIZATION">相对同算法重算基线</option></select></label><button disabled={!planVersionId || loadingDecision} onClick={async () => { if (!planVersionId) return; setLoadingDecision(true); setDecisionError(undefined); try { const run = await api.createDecisionAnalysisRun<CapacityAnalysis>(scenarioId, planVersionId, 'CAPACITY', { referenceMode: capacityMode }); setCapacity(run.result); setAnalysisNumbers(current => ({ ...current, capacity: run.number })) } catch (error) { setDecisionError(error instanceof Error ? error.message : '容量分析失败') } finally { setLoadingDecision(false) } }}>测算六种容量方案</button></div></div>
+    <div className="decision-head"><div><span className="eyebrow">DECISION SUPPORT</span><h2>经营决策测算</h2><p>分析绑定 V{String(cost?.plan_number ?? risk?.plan_number ?? schedule.version).padStart(3, '0')} 的冻结方案、旅行模型、政策与代码来源。进入页面只读取已有 A；点击生成才会新增记录，不会生成 D 或 V。</p></div><div className="decision-actions"><label>成本/容量周期（工作日）<input aria-label="分析工作日" type="number" min="1" max="365" value={horizonDays} onChange={event => setHorizonDays(Math.max(1, Math.min(365, Number(event.target.value) || 1)))} /></label><button disabled={!planVersionId || loadingDecision} onClick={runCostAndRisk}>生成成本与风险分析</button><label>容量参照<select aria-label="容量分析参照" value={capacityMode} onChange={event => { setCapacityMode(event.target.value as typeof capacityMode); setCapacity(undefined); setAnalysisNumbers(current => ({ ...current, capacity: undefined })) }}><option value="SELECTED_PLAN_DELTA">相对当前 V</option><option value="CONTROLLED_REOPTIMIZATION">相对同算法重算基线</option></select></label><button disabled={!planVersionId || loadingDecision} onClick={runCapacity}>测算六种容量方案</button></div></div>
+    <div className="decision-scope-banner"><ShieldCheck size={18} /><div><b>事前冻结计划分析，不含实际执行</b><span>不代表当前剩余预测。{Math.max(cost?.current_execution_watermark || 0, risk?.current_execution_watermark || 0, capacity?.current_execution_watermark || 0) > 0 ? ` 已绑定执行水位 ${Math.max(cost?.current_execution_watermark || 0, risk?.current_execution_watermark || 0, capacity?.current_execution_watermark || 0)}。` : ''}</span></div></div>
     {!planVersionId && <div className="empty-view compact">当前显示的排程尚未对应公开版本，无法冻结经营测算输入。</div>}
-    {loadingDecision && <div className="decision-status">正在计算冻结快照的成本、风险与容量取舍…</div>}
-    {decisionError && <div className="decision-status error">{decisionError}</div>}
+    {loadingExisting && <div className="decision-status">正在读取已有分析记录…</div>}
+    {loadingDecision && <div className="decision-status">正在生成冻结快照分析记录…</div>}
+    {decisionErrors.map(error => <div className="decision-status error" key={error}>{error}</div>)}
+    {!loadingExisting && !cost && !risk && !capacity && planVersionId && <div className="empty-view compact">当前版本还没有经营分析。选择周期后显式生成，已执行事实不会被混入事前口径。</div>}
     {(cost || risk) && <div className="decision-summary">
-      <article><small>预计现金运营成本</small><b>{cost ? money(cost.breakdown.cash_operating_cost_cents) : '—'}</b><p>人工、行程、加班溢价与外包现金支出</p></article>
+      <article><small>预计现金运营成本</small><b>{cost ? money(cost.breakdown.cash_operating_cost_cents) : '—'}</b><p>{cost ? `单日口径 · A${String(analysisNumbers.cost).padStart(3, '0')}` : '人工、行程、加班溢价与外包现金支出'}</p></article>
       <article><small>预计服务损失</small><b>{cost ? money(cost.breakdown.service_failure_loss_cents) : '—'}</b><p>SLA 损失与未服务机会损失，不是现金支出</p></article>
-      <article><small>总经济影响</small><b>{cost ? money(cost.breakdown.total_economic_impact_cents) : '—'}</b><p>现金成本与服务损失之和，不等同于财务结算</p></article>
-      <article><small>风险调整后 SLA</small><b>{risk ? pct(risk.expected_sla_on_time_rate) : '—'}</b><p>{risk ? `95% 区间 ${pct(risk.sla_rate_ci_low)}–${pct(risk.sla_rate_ci_high)}` : '—'}；服从已发布时间</p></article>
-      <article><small>迟到 P95</small><b>{risk ? `${risk.late_minutes_p95} 分钟` : '—'}</b><p>P50 {risk?.late_minutes_p50 ?? '—'} · P90 {risk?.late_minutes_p90 ?? '—'} 分钟</p></article>
-      <article><small>新增扰动概率</small><b>{risk ? pct(risk.additional_disruption_probability) : '—'}</b><p>基线未服务 {risk?.baseline_unserved_orders ?? '—'} 单；扰动后预计总未服务 {risk?.expected_total_unserved_orders ?? '—'} 单</p></article>
+      <article><small>{cost ? `${cost.analysis_horizon.days} 日总经济影响` : '总经济影响'}</small><b>{cost ? money(cost.horizon_total_economic_impact_cents) : '—'}</b><p>现金成本与服务损失之和，不等同于财务结算</p></article>
+      <article><small>风险调整后 SLA</small><b>{risk ? pct(risk.expected_sla_on_time_rate) : '—'}</b><p>{risk ? `模拟均值抽样区间 ${pct(risk.monte_carlo_mean_ci_low)}–${pct(risk.monte_carlo_mean_ci_high)} · A${String(analysisNumbers.risk).padStart(3, '0')}` : '—'}</p></article>
+      <article><small>全日总迟到分钟 P95</small><b>{risk ? `${risk.full_day_total_late_minutes_p95} 分钟` : '—'}</b><p>P50 {risk?.full_day_total_late_minutes_p50 ?? '—'} · P90 {risk?.full_day_total_late_minutes_p90 ?? '—'} 分钟</p></article>
+      <article><small>新增扰动概率</small><b>{risk ? pct(risk.additional_disruption_probability) : '—'}</b><p>{risk ? `缺勤 ${pct(risk.absence_disruption_probability)} · 客户不在 ${pct(risk.no_show_disruption_probability)} · 窗口失败 ${pct(risk.window_failure_probability)}` : '—'}</p></article>
     </div>}
-    {capacity && <div className="capacity-table-wrap"><div className="capacity-reference"><b>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V' : '相对同算法重算基线'}</b><span>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '当前安排保持不动，只增量安置原未服务需求。' : '基准和选项都使用相同贪心政策，唯一变化是容量输入。'}{analysisNumbers.capacity ? ` · 分析记录 A${String(analysisNumbers.capacity).padStart(3, '0')}` : ''}</span></div><table className="capacity-table"><thead><tr><th>容量方案</th><th>完成率改善<br /><small>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V' : '相对同算法基线'}</small></th><th>SLA 改善<br /><small>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V' : '相对同算法基线'}</small></th><th>未服务变化</th><th>边际经济影响</th></tr></thead><tbody>{capacity.options.map(item => <tr key={item.option_id}><td><b>{item.name}</b><small>{item.assumption}</small></td><td>{item.completion_improvement_percentage_points > 0 ? '+' : ''}{item.completion_improvement_percentage_points}pp</td><td>{item.sla_improvement_percentage_points > 0 ? '+' : ''}{item.sla_improvement_percentage_points}pp</td><td>{item.unassigned_delta > 0 ? '+' : ''}{item.unassigned_delta} 单</td><td>{money(item.marginal_cost_cents)}</td></tr>)}</tbody></table><p className="decision-note">固定投入来自返回的容量政策快照；“出发点迁移”不代表新增 Depot、库存或仓容。</p></div>}
+    {capacity && <div className="capacity-table-wrap"><div className="capacity-reference"><b>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V · 尾部追加' : '相对同算法重算基线'}</b><span>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '保留现有 assignment，仅在路线尾部追加；这不是完整插入优化。' : '基准和选项使用相同贪心政策。'}{analysisNumbers.capacity ? ` · A${String(analysisNumbers.capacity).padStart(3, '0')}` : ''} · {capacity.analysis_horizon.days} 个工作日</span></div><table className="capacity-table"><thead><tr><th>容量方案</th><th>可执行性</th><th>完成率改善</th><th>SLA 改善</th><th>周期总影响</th><th>固定成本口径</th></tr></thead><tbody>{capacity.options.map(item => <tr key={item.option_id}><td><b>{item.name}</b><small>{item.assumption}</small></td><td>{item.feasible ? '可执行' : item.option_applicable ? '不可执行' : '不适用'}<small>{item.violations[0]?.message || '完整约束校验通过'}</small></td><td>{item.completion_improvement_percentage_points > 0 ? '+' : ''}{item.completion_improvement_percentage_points}pp</td><td>{item.sla_improvement_percentage_points > 0 ? '+' : ''}{item.sla_improvement_percentage_points}pp</td><td>{money(item.horizon_total_impact_cents)}</td><td>{cadenceLabel[item.fixed_cost_cadence]} {money(item.fixed_capacity_cost_cents)}<small>{item.break_even_days == null ? '无可计算盈亏平衡点' : `${item.break_even_days} 日回本`}</small></td></tr>)}</tbody></table><p className="decision-note">固定投入与日运营变化分开计算；“出发点迁移”不创建 Depot、库存或仓容。</p></div>}
   </section>
 }
 

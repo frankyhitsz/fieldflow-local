@@ -4,11 +4,12 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal, NoReturn
 from urllib.parse import urlsplit
 
 import ortools
@@ -19,7 +20,14 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ._version import __version__
-from .decision import DecisionAnalysisError, capacity_analysis, cost_analysis, simulate_plan_risk
+from .decision import (
+    DecisionAnalysisError,
+    canonical_decision_input_hash,
+    capacity_analysis,
+    cost_analysis,
+    schedule_signature,
+    simulate_plan_risk,
+)
 from .execution import execution_context_for_planning
 from .fixtures import get_fixture
 from .hashing import content_hash
@@ -30,8 +38,10 @@ from .models import (
     CloneScenarioRequest,
     Comparison,
     CostAnalysis,
+    DecisionAnalysisContext,
     DecisionAnalysisRun,
     DecisionAnalysisRunRequest,
+    DecisionAnalysisScope,
     ExecutionSourceContext,
     ExperimentPublishRequest,
     FreezeReason,
@@ -71,6 +81,7 @@ from .models import (
     WorkOrderUpdate,
 )
 from .normalization import normalize_schedule
+from .provenance import DECISION_ALGORITHM_VERSION, decision_build_sha
 from .report import build_report
 from .scheduler import (
     baseline_schedule,
@@ -86,6 +97,8 @@ DB_PATH = Path(os.getenv("FIELDFLOW_DB", Path(__file__).resolve().parents[1] / "
 store: Store | None = None
 experiment_executor: ThreadPoolExecutor | None = None
 experiment_slots: threading.BoundedSemaphore | None = None
+manual_reassignment_locks: dict[str, threading.RLock] = {}
+manual_reassignment_locks_guard = threading.Lock()
 EXPERIMENT_QUEUE_CAPACITY = 4
 router = APIRouter()
 
@@ -401,6 +414,9 @@ def prepare_replan_run(
     scenario: ScheduleScenario,
     source: PlanVersion | None,
     request: ReplanRequest,
+    *,
+    run_id: str | None = None,
+    run_started_at: str | None = None,
 ) -> tuple[
     ScheduleResult,
     list[ScheduleArtifact],
@@ -446,6 +462,8 @@ def prepare_replan_run(
         requested_time_limit_seconds=profile.time_limit_seconds,
         planning_context=planning_context,
         solver_config_hash=content_hash(effective.solver_config),
+        run_id=run_id,
+        started_at=run_started_at,
     )
     return (
         previous,
@@ -468,10 +486,12 @@ def start_schedule_run(
     solver_name: str = "ortools-routing",
     planning_context: PlanningContext | None = None,
     solver_config_hash: str | None = None,
+    run_id: str | None = None,
+    started_at: str | None = None,
 ) -> ScheduleRun:
     requested_ms = int(round(requested_time_limit_seconds * 1000))
     run = ScheduleRun(
-        id=f"RUN-{uuid.uuid4().hex[:12]}",
+        id=run_id or f"RUN-{uuid.uuid4().hex[:12]}",
         scenario_id=scenario.id,
         action=action,
         scenario_revision=scenario.revision,
@@ -484,11 +504,18 @@ def start_schedule_run(
         requested_time_limit_ms=requested_ms,
         effective_time_limit_ms=requested_ms,
         status=ScheduleRunStatus.running,
-        started_at=_now(),
+        started_at=started_at or _now(),
         planning_context=planning_context,
         planning_context_hash=content_hash(planning_context) if planning_context else None,
     )
-    return require_store().save_schedule_run(run)
+    existing = require_store().get_schedule_run(run.id)
+    if not existing:
+        return require_store().save_schedule_run(run)
+    if existing.model_dump(mode="json") == run.model_dump(mode="json"):
+        return existing
+    if existing.status is ScheduleRunStatus.failed and existing.termination_reason == "APPLICATION_RESTARTED":
+        return require_store().resume_interrupted_schedule_run(run)
+    raise PublicationConflict("相同求解标识已经对应其他输入或终态")
 
 
 def fail_schedule_run(run: ScheduleRun, reason: str) -> None:
@@ -966,97 +993,234 @@ def lock_assignment(scenario_id: str, request: LockRequest) -> ScheduleScenario:
     return _lock_assignment(scenario_id, request)
 
 
-@router.post(
-    "/api/scenarios/{scenario_id}/manual-reassignment",
-    response_model=ManualReassignmentResult,
-)
-def manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -> ManualReassignmentResult:
-    """Persist a manual lock and run its replan as one idempotent business command.
-
-    The lock is a durable dispatcher decision. If solving fails, the response
-    explicitly reports that partial outcome and keeps the last published plan
-    visible as stale instead of hiding the new business state.
-    """
+def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -> ManualReassignmentResult:
+    """Recoverable saga: persist the lock once, then idempotently publish replan."""
     scenario = require_scenario(scenario_id)
     namespace = f"{scenario_id}:manual-reassignment"
+    publication_key = f"{scenario_id}:replan:{request.idempotency_key}"
     fingerprint = content_hash({"scenario_id": scenario_id, "request": request})
     try:
         existing = require_store().get_command_record(namespace, request.idempotency_key, fingerprint)
     except PublicationConflict as error:
         raise HTTPException(409, str(error)) from error
-    if existing and existing["status"] == "COMPLETED":
+    if existing and existing["status"] in {"COMPLETED", "FAILED_AFTER_LOCK"}:
         return ManualReassignmentResult.model_validate(existing["payload"]["result"])
     if existing and existing["status"] == "FAILED":
         payload = existing["payload"]
         raise HTTPException(int(payload.get("http_status", 409)), detail=payload.get("detail", payload))
-    if scenario.revision != request.expected_revision:
-        raise HTTPException(
-            409,
-            detail={
-                "code": "SCENARIO_REVISION_CONFLICT",
-                "message": "业务数据已变化，请刷新后重试",
-                "expected_revision": request.expected_revision,
-                "current_revision": scenario.revision,
-            },
+    if not existing:
+        if scenario.revision != request.expected_revision:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "SCENARIO_REVISION_CONFLICT",
+                    "message": "业务数据已变化，请刷新后重试",
+                    "expected_revision": request.expected_revision,
+                    "current_revision": scenario.revision,
+                },
+            )
+        try:
+            created = require_store().begin_command_record(
+                namespace,
+                request.idempotency_key,
+                fingerprint,
+                status="RESERVED",
+                resource_type="work_order",
+                resource_id=request.work_order_id,
+                publication_key=publication_key,
+                payload={
+                    "phase": "RESERVED",
+                    "base_revision": request.expected_revision,
+                    "work_order_id": request.work_order_id,
+                    "target_technician_id": request.technician_id,
+                    "planning_time": request.planning_time,
+                },
+            )
+            if not created:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "IDEMPOTENT_REQUEST_IN_PROGRESS",
+                        "message": "相同人工改派请求正在处理，请稍后重试",
+                    },
+                )
+        except PublicationConflict as error:
+            raise HTTPException(409, str(error)) from error
+        existing = require_store().get_command_record(namespace, request.idempotency_key, fingerprint)
+        assert existing
+
+    payload = dict(existing["payload"])
+    published = require_store().plan_for_publication_key(publication_key)
+    if published:
+        current = require_scenario(scenario_id)
+        result = ManualReassignmentResult(
+            lock_persisted=True,
+            replan_status="COMPLETED",
+            active_plan_preserved=True,
+            scenario=current,
+            schedule=published.selected,
         )
-    try:
-        created = require_store().begin_command_record(
-            namespace,
-            request.idempotency_key,
-            fingerprint,
-            status="RUNNING",
-            resource_type="work_order",
-            resource_id=request.work_order_id,
-            payload={"phase": "LOCK_PENDING"},
-        )
-    except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
-    if not created:
-        raise HTTPException(
-            409,
-            detail={"code": "IDEMPOTENT_REQUEST_IN_PROGRESS", "message": "相同改派请求正在处理"},
-        )
-    try:
-        _lock_assignment(
-            scenario_id,
-            LockRequest(
-                work_order_id=request.work_order_id,
-                technician_id=request.technician_id,
-                locked=True,
-            ),
-            expected_revision=request.expected_revision,
-        )
-    except HTTPException as error:
-        detail = error.detail if isinstance(error.detail, dict) else {"message": str(error.detail)}
         require_store().update_command_record(
             namespace,
             request.idempotency_key,
             fingerprint,
-            status="FAILED",
+            status="COMPLETED",
+            resource_type="plan_version",
+            resource_id=published.id,
+            publication_key=publication_key,
+            payload={
+                **payload,
+                "phase": "COMPLETED",
+                "plan_version_id": published.id,
+                "result": result.model_dump(mode="json"),
+            },
+        )
+        return result
+
+    if existing["status"] == "RESERVED":
+        scenario = require_scenario(scenario_id)
+        exact_lock = next(
+            (
+                item
+                for item in scenario.locked_assignments
+                if item.work_order_id == request.work_order_id and item.technician_id == request.technician_id
+            ),
+            None,
+        )
+        if exact_lock and scenario.revision in {request.expected_revision, request.expected_revision + 1}:
+            locked_scenario = scenario
+        else:
+            try:
+                locked_scenario = _lock_assignment(
+                    scenario_id,
+                    LockRequest(
+                        work_order_id=request.work_order_id,
+                        technician_id=request.technician_id,
+                        locked=True,
+                    ),
+                    expected_revision=request.expected_revision,
+                )
+            except HTTPException as error:
+                detail = error.detail if isinstance(error.detail, dict) else {"message": str(error.detail)}
+                require_store().update_command_record(
+                    namespace,
+                    request.idempotency_key,
+                    fingerprint,
+                    status="FAILED",
+                    resource_type="work_order",
+                    resource_id=request.work_order_id,
+                    publication_key=publication_key,
+                    payload={**payload, "phase": "FAILED", "http_status": error.status_code, "detail": detail},
+                )
+                raise
+        payload.update(
+            {
+                "phase": "LOCK_COMMITTED",
+                "lock_revision": locked_scenario.revision,
+                "run_id": f"RUN-MR-{content_hash({'namespace': namespace, 'key': request.idempotency_key, 'fingerprint': fingerprint})[:12]}",
+                "run_started_at": _now(),
+            }
+        )
+        require_store().update_command_record(
+            namespace,
+            request.idempotency_key,
+            fingerprint,
+            status="LOCK_COMMITTED",
             resource_type="work_order",
             resource_id=request.work_order_id,
-            payload={"http_status": error.status_code, "detail": detail},
+            publication_key=publication_key,
+            payload=payload,
         )
-        raise
+    else:
+        lock_revision = int(payload.get("lock_revision", -1))
+        current = require_scenario(scenario_id)
+        exact_lock = any(
+            item.work_order_id == request.work_order_id and item.technician_id == request.technician_id
+            for item in current.locked_assignments
+        )
+        if not exact_lock or current.revision != lock_revision:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "MANUAL_REASSIGNMENT_CONTEXT_CHANGED",
+                    "message": "锁定提交后的业务数据又发生变化，不能静默恢复原重排",
+                    "lock_revision": lock_revision,
+                    "current_revision": current.revision,
+                },
+            )
+        if not payload.get("run_id") or not payload.get("run_started_at"):
+            payload.update(
+                {
+                    "phase": "LOCK_COMMITTED",
+                    "run_id": f"RUN-MR-{content_hash({'namespace': namespace, 'key': request.idempotency_key, 'fingerprint': fingerprint})[:12]}",
+                    "run_started_at": _now(),
+                }
+            )
+            require_store().update_command_record(
+                namespace,
+                request.idempotency_key,
+                fingerprint,
+                status="LOCK_COMMITTED",
+                resource_type="work_order",
+                resource_id=request.work_order_id,
+                publication_key=publication_key,
+                payload=payload,
+            )
+
+    run_id = str(payload["run_id"])
+    run_started_at = str(payload["run_started_at"])
+
+    def record_replan_created(run: ScheduleRun) -> None:
+        if run.id != run_id:
+            raise PublicationConflict("人工改派恢复了错误的求解记录")
+        payload.update({"phase": "REPLAN_CREATED", "run_id": run.id})
+        require_store().update_command_record(
+            namespace,
+            request.idempotency_key,
+            fingerprint,
+            status="REPLAN_CREATED",
+            resource_type="schedule_run",
+            resource_id=run.id,
+            publication_key=publication_key,
+            payload=payload,
+        )
 
     try:
-        schedule = run_replan(
+        schedule = _run_replan(
             scenario_id,
             ReplanRequest(
                 planning_time=request.planning_time,
                 strategy="stable",
                 idempotency_key=request.idempotency_key,
             ),
+            run_identity=(run_id, run_started_at),
+            on_run_created=record_replan_created,
         )
         current = require_scenario(scenario_id)
+        published_plan = require_store().active_plan_version(scenario_id)
+        if not published_plan or published_plan.selected.id != schedule.id:
+            raise PublicationConflict("局部重排返回结果未绑定活动方案")
         result = ManualReassignmentResult(
             lock_persisted=True,
             replan_status="COMPLETED",
-            active_plan_preserved=require_store().active_plan_version(scenario_id) is not None,
+            active_plan_preserved=True,
             scenario=current,
             schedule=schedule,
         )
+        payload.update({"phase": "PLAN_PUBLISHED", "plan_version_id": published_plan.id})
+        require_store().update_command_record(
+            namespace,
+            request.idempotency_key,
+            fingerprint,
+            status="PLAN_PUBLISHED",
+            resource_type="plan_version",
+            resource_id=published_plan.id,
+            publication_key=publication_key,
+            payload=payload,
+        )
     except HTTPException as error:
+        if isinstance(error.detail, dict) and error.detail.get("code") == "IDEMPOTENT_REQUEST_IN_PROGRESS":
+            raise
         current = require_scenario(scenario_id)
         detail = error.detail if isinstance(error.detail, dict) else {"message": str(error.detail)}
         result = ManualReassignmentResult(
@@ -1079,17 +1243,36 @@ def manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) ->
                 "error_type": type(error).__name__,
             },
         )
-    active_plan = require_store().active_plan_version(scenario_id)
+    result_plan = require_store().plan_for_publication_key(publication_key) if result.schedule else None
     require_store().update_command_record(
         namespace,
         request.idempotency_key,
         fingerprint,
-        status="COMPLETED",
+        status="COMPLETED" if result.schedule else "FAILED_AFTER_LOCK",
         resource_type="plan_version" if result.schedule else "work_order",
-        resource_id=(active_plan.id if result.schedule and active_plan else request.work_order_id),
-        payload={"result": result.model_dump(mode="json")},
+        resource_id=(result_plan.id if result_plan else request.work_order_id),
+        publication_key=publication_key,
+        payload={
+            **payload,
+            "phase": "COMPLETED" if result.schedule else "FAILED_AFTER_LOCK",
+            "plan_version_id": result_plan.id if result_plan else None,
+            "result": result.model_dump(mode="json"),
+        },
     )
     return result
+
+
+@router.post(
+    "/api/scenarios/{scenario_id}/manual-reassignment",
+    response_model=ManualReassignmentResult,
+)
+def manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -> ManualReassignmentResult:
+    """Serialize one local idempotency key while the recoverable saga advances."""
+    lock_key = f"{scenario_id}:{request.idempotency_key}"
+    with manual_reassignment_locks_guard:
+        command_lock = manual_reassignment_locks.setdefault(lock_key, threading.RLock())
+    with command_lock:
+        return _manual_reassignment(scenario_id, request)
 
 
 @router.get("/api/scenarios/{scenario_id}/schedules", response_model=list[ScheduleResult])
@@ -1282,8 +1465,13 @@ def run_optimize(
         raise
 
 
-@router.post("/api/scenarios/{scenario_id}/replan", response_model=ScheduleResult)
-def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
+def _run_replan(
+    scenario_id: str,
+    request: ReplanRequest,
+    *,
+    run_identity: tuple[str, str] | None = None,
+    on_run_created: Callable[[ScheduleRun], None] | None = None,
+) -> ScheduleResult:
     scenario = require_scenario(scenario_id)
     incoming = request.emergency_order
     idempotency_key = request.idempotency_key or (f"emergency-replan:{scenario_id}:{incoming.id}" if incoming else None)
@@ -1395,7 +1583,15 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
             planning_time,
             planning_context,
             run,
-        ) = prepare_replan_run(scenario, source, request)
+        ) = prepare_replan_run(
+            scenario,
+            source,
+            request,
+            run_id=run_identity[0] if run_identity else None,
+            run_started_at=run_identity[1] if run_identity else None,
+        )
+        if on_run_created:
+            on_run_created(run)
     except HTTPException as error:
         if incoming and idempotency_key and request_fingerprint:
             detail: dict[str, object] = (
@@ -1579,6 +1775,11 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
     return published
 
 
+@router.post("/api/scenarios/{scenario_id}/replan", response_model=ScheduleResult)
+def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
+    return _run_replan(scenario_id, request)
+
+
 @router.get("/api/scenarios/{scenario_id}/plan-versions", response_model=list[PlanVersion])
 def list_plan_versions(scenario_id: str) -> list[PlanVersion]:
     require_scenario(scenario_id)
@@ -1603,36 +1804,79 @@ def rename_plan_version(scenario_id: str, version_id: str, request: PlanVersionP
     return plan
 
 
-def reject_live_started_analysis(scenario_id: str, plan: PlanVersion) -> None:
-    if not plan.active:
-        return
+def resolve_decision_analysis_context(
+    scenario_id: str,
+    plan: PlanVersion,
+    requested_scope: DecisionAnalysisScope | None,
+) -> DecisionAnalysisContext:
     current = require_scenario(scenario_id)
-    started = sorted(item.id for item in current.work_orders if item.status is WorkOrderStatus.started)
-    if started:
+    events = require_store().list_execution_events(scenario_id)
+    snapshot_has_execution = bool(
+        plan.scenario_snapshot
+        and any(item.status is not WorkOrderStatus.pending for item in plan.scenario_snapshot.work_orders)
+    )
+    if requested_scope is None and (events or snapshot_has_execution):
         raise HTTPException(
             409,
             detail={
-                "code": "EXECUTION_ANALYSIS_CONTEXT_REQUIRED",
-                "message": "当前方案包含服务中的工单；请先完成服务，或等待执行水位分析功能",
-                "started_work_order_ids": started,
+                "code": "ANALYSIS_SCOPE_REQUIRED",
+                "message": "场景已有执行事实；请选择“事前冻结计划分析”，或等待执行感知预测功能",
+                "supported_scope": DecisionAnalysisScope.ex_ante_frozen_plan.value,
+                "current_execution_watermark": events[-1].sequence if events else 0,
             },
         )
+    scope = requested_scope or DecisionAnalysisScope.ex_ante_frozen_plan
+    if scope is not DecisionAnalysisScope.ex_ante_frozen_plan:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "ANALYSIS_SCOPE_NOT_SUPPORTED",
+                "message": "当前版本只支持事前冻结计划分析；实际与剩余预测尚未实现",
+                "requested_scope": scope.value,
+                "supported_scopes": [DecisionAnalysisScope.ex_ante_frozen_plan.value],
+            },
+        )
+    started_ids = {item.id for item in current.work_orders if item.status is WorkOrderStatus.started}
+    active_booking_ids = sorted(
+        {event.booking_id for event in events if event.action == "start" and event.work_order_id in started_ids}
+    )
+    return DecisionAnalysisContext(
+        analysis_scope=scope,
+        current_execution_watermark=events[-1].sequence if events else 0,
+        analysis_as_of_time=max((event.occurred_at for event in events), default=None),
+        execution_context_hash=(content_hash([event.model_dump(mode="json") for event in events]) if events else None),
+        actual_execution_included=False,
+        active_booking_ids=active_booking_ids,
+    )
+
+
+def raise_decision_analysis_http(error: DecisionAnalysisError) -> NoReturn:
+    status_code = 422 if error.code.endswith("NOT_SUPPORTED") else 409
+    raise HTTPException(
+        status_code,
+        detail={"code": error.code, "message": error.message, **error.details},
+    ) from error
 
 
 @router.get(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/cost-analysis",
     response_model=CostAnalysis,
+    deprecated=True,
 )
-def get_cost_analysis(scenario_id: str, version_id: str) -> CostAnalysis:
+def get_cost_analysis(
+    scenario_id: str,
+    version_id: str,
+    analysis_scope: Annotated[DecisionAnalysisScope | None, Query()] = None,
+) -> CostAnalysis:
     require_scenario(scenario_id)
     plan = require_store().get_plan_version(scenario_id, version_id)
     if not plan:
         raise HTTPException(404, "方案版本不存在")
-    reject_live_started_analysis(scenario_id, plan)
+    context = resolve_decision_analysis_context(scenario_id, plan, analysis_scope)
     try:
-        return cost_analysis(plan, provider=require_store().travel_provider)
+        return cost_analysis(plan, provider=require_store().travel_provider, context=context)
     except DecisionAnalysisError as error:
-        raise HTTPException(409, detail={"code": error.code, "message": error.message, **error.details}) from error
+        raise_decision_analysis_http(error)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
 
@@ -1640,6 +1884,7 @@ def get_cost_analysis(scenario_id: str, version_id: str) -> CostAnalysis:
 @router.post(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/capacity-analysis",
     response_model=CapacityAnalysis,
+    deprecated=True,
 )
 def post_capacity_analysis(
     scenario_id: str,
@@ -1650,11 +1895,11 @@ def post_capacity_analysis(
     plan = require_store().get_plan_version(scenario_id, version_id)
     if not plan:
         raise HTTPException(404, "方案版本不存在")
-    reject_live_started_analysis(scenario_id, plan)
+    context = resolve_decision_analysis_context(scenario_id, plan, request.analysis_scope)
     try:
-        return capacity_analysis(plan, request, require_store().travel_provider)
+        return capacity_analysis(plan, request, require_store().travel_provider, context=context)
     except DecisionAnalysisError as error:
-        raise HTTPException(409, detail={"code": error.code, "message": error.message, **error.details}) from error
+        raise_decision_analysis_http(error)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
 
@@ -1662,6 +1907,7 @@ def post_capacity_analysis(
 @router.post(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/risk-simulation",
     response_model=RiskSimulationResult,
+    deprecated=True,
 )
 def post_risk_simulation(
     scenario_id: str,
@@ -1672,11 +1918,11 @@ def post_risk_simulation(
     plan = require_store().get_plan_version(scenario_id, version_id)
     if not plan:
         raise HTTPException(404, "方案版本不存在")
-    reject_live_started_analysis(scenario_id, plan)
+    context = resolve_decision_analysis_context(scenario_id, plan, request.analysis_scope)
     try:
-        return simulate_plan_risk(plan, request, require_store().travel_provider)
+        return simulate_plan_risk(plan, request, require_store().travel_provider, context=context)
     except DecisionAnalysisError as error:
-        raise HTTPException(409, detail={"code": error.code, "message": error.message, **error.details}) from error
+        raise_decision_analysis_http(error)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
 
@@ -1695,50 +1941,114 @@ def create_decision_analysis_run(
     plan = require_store().get_plan_version(scenario_id, version_id)
     if not plan:
         raise HTTPException(404, "方案版本不存在")
-    reject_live_started_analysis(scenario_id, plan)
+    context = resolve_decision_analysis_context(scenario_id, plan, request.analysis_scope)
     provider = require_store().travel_provider
+    capacity_request = request.capacity_request.model_copy(
+        update={
+            "analysis_scope": context.analysis_scope,
+            "analysis_horizon": request.analysis_horizon,
+        }
+    )
+    risk_request = request.risk_request.model_copy(update={"analysis_scope": context.analysis_scope})
+    if request.analysis_type == "COST":
+        authoritative_request: object = {
+            "policy": request.cost_policy,
+            "analysis_horizon": request.analysis_horizon,
+        }
+        policy_version = request.cost_policy.policy_version
+        policy_snapshot = {
+            "cost_policy": request.cost_policy.model_dump(mode="json"),
+            "analysis_horizon": request.analysis_horizon.model_dump(mode="json"),
+        }
+    elif request.analysis_type == "CAPACITY":
+        authoritative_request = capacity_request
+        policy_version = capacity_request.capacity_policy.policy_version
+        policy_snapshot = capacity_request.model_dump(mode="json")
+    else:
+        resolved_seed = (
+            plan.scenario_snapshot.seed if risk_request.seed is None and plan.scenario_snapshot else risk_request.seed
+        )
+        authoritative_request = {"request": risk_request, "resolved_seed": resolved_seed}
+        policy_version = "FIELD_SERVICE_SIMULATION_V2"
+        policy_snapshot = risk_request.model_dump(mode="json")
+    input_hash = canonical_decision_input_hash(
+        plan,
+        request.analysis_type,
+        authoritative_request,
+        context,
+        provider,
+    )
+    reserved, created = require_store().reserve_decision_analysis_run(
+        DecisionAnalysisRun(
+            id="pending",
+            scenario_id=scenario_id,
+            number=0,
+            plan_version_id=plan.id,
+            plan_number=plan.number,
+            analysis_type=request.analysis_type,
+            analysis_scope=context.analysis_scope,
+            scenario_snapshot_hash=plan.scenario_snapshot_hash,
+            schedule_hash=schedule_signature(plan.selected),
+            current_execution_watermark=context.current_execution_watermark,
+            analysis_as_of_time=context.analysis_as_of_time,
+            execution_context_hash=context.execution_context_hash,
+            actual_execution_included=context.actual_execution_included,
+            active_booking_ids=context.active_booking_ids,
+            travel_model_fingerprint=provider.fingerprint,
+            policy_version=policy_version,
+            policy_snapshot=policy_snapshot,
+            code_version=__version__,
+            algorithm_version=DECISION_ALGORITHM_VERSION,
+            build_sha=decision_build_sha(),
+            input_hash=input_hash,
+            status="RUNNING",
+            created_at=_now(),
+        )
+    )
+    if not created or reserved.status != "RUNNING":
+        return reserved
     try:
         if request.analysis_type == "COST":
-            result = cost_analysis(plan, request.cost_policy, provider)
-            input_hash = result.analysis_input_hash
-            policy_version = request.cost_policy.policy_version
-            policy_snapshot = request.cost_policy.model_dump(mode="json")
-            schedule_hash = result.schedule_signature
+            result = cost_analysis(
+                plan,
+                request.cost_policy,
+                provider,
+                context=context,
+                horizon=request.analysis_horizon,
+            )
+            result_hash = result.analysis_input_hash
         elif request.analysis_type == "CAPACITY":
-            result = capacity_analysis(plan, request.capacity_request, provider)
-            input_hash = result.analysis_input_hash
-            policy_version = request.capacity_request.capacity_policy.policy_version
-            policy_snapshot = request.capacity_request.model_dump(mode="json")
-            schedule_hash = result.selected_plan_signature
+            result = capacity_analysis(plan, capacity_request, provider, context=context)
+            result_hash = result.analysis_input_hash
         else:
-            result = simulate_plan_risk(plan, request.risk_request, provider)
-            input_hash = result.simulation_input_hash
-            policy_version = result.simulation_policy_version
-            policy_snapshot = request.risk_request.model_dump(mode="json")
-            schedule_hash = result.schedule_signature
+            result = simulate_plan_risk(plan, risk_request, provider, context=context)
+            result_hash = result.simulation_input_hash
+        if result_hash != input_hash:
+            raise DecisionAnalysisError(
+                "ANALYSIS_INPUT_HASH_MISMATCH",
+                "经营分析的预留输入与计算输入不一致",
+            )
     except DecisionAnalysisError as error:
-        raise HTTPException(409, detail={"code": error.code, "message": error.message, **error.details}) from error
-    except ValueError as error:
-        raise HTTPException(409, str(error)) from error
-    run = DecisionAnalysisRun(
-        id="pending",
-        scenario_id=scenario_id,
-        number=0,
-        plan_version_id=plan.id,
-        plan_number=plan.number,
-        analysis_type=request.analysis_type,
-        scenario_snapshot_hash=plan.scenario_snapshot_hash,
-        schedule_hash=schedule_hash,
-        execution_watermark=None,
-        travel_model_fingerprint=provider.fingerprint,
-        policy_version=policy_version,
-        policy_snapshot=policy_snapshot,
-        code_version=__version__,
-        input_hash=input_hash,
-        result=result,
-        created_at=_now(),
-    )
-    return require_store().save_decision_analysis_run(run)
+        failed = reserved.model_copy(deep=True)
+        failed.status = "FAILED"
+        failed.error = {"code": error.code, "message": error.message, **error.details}
+        failed.finished_at = _now()
+        return require_store().finish_decision_analysis_run(failed)
+    except Exception as error:
+        failed = reserved.model_copy(deep=True)
+        failed.status = "FAILED"
+        failed.error = {
+            "code": "ANALYSIS_FAILED",
+            "message": "经营分析计算失败",
+            "error_type": type(error).__name__,
+        }
+        failed.finished_at = _now()
+        return require_store().finish_decision_analysis_run(failed)
+    completed = reserved.model_copy(deep=True)
+    completed.status = "COMPLETED"
+    completed.result = result
+    completed.finished_at = _now()
+    return require_store().finish_decision_analysis_run(completed)
 
 
 @router.get(

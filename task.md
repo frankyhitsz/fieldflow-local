@@ -4,61 +4,60 @@
 
 ## 本轮目标
 
-逐项复核 `pro-plan.md` 对当前项目的判断，修复能被运行环境证实的问题，记录暂不成立或需要新业务模型的建议，并在三轮独立审计和 Linux CI 通过后提交。
+复核新版 `pro-plan.md`，完成 v0.5.2 的经营分析可信性工作包，记录需要后续领域模型或仓库治理授权的项目；经过三轮独立审计、整套本地验证和 Linux CI 后提交。
 
-## 第一轮：经营分析语义与恢复
+## 第一轮：分析语义与反事实正确性
 
-- [x] 容量分析默认相对选中的 V 做增量测算，不再静默生成另一份贪心基线；另提供同政策受控重算模式。
-- [x] 风险仿真默认遵循正式方案开始时刻，最早可行执行改为显式政策。
-- [x] 成本、容量和风险严格绑定快照、排程、行程模型、求解政策和代码版本。
-- [x] 当前仅允许无执行事实的全日分析；started/completed 方案明确返回执行上下文错误。
-- [x] 成本拆分现金运营成本、服务失败经济损失和总经济影响；风险改为额外中断概率并列出原始与预计总未服务数。
-- [x] 紧急重排命令保存独立 publication key；重启可对账 `INTAKE_COMMITTED`，且不会误处理仅接收工单的记录。
+- [x] 以 `EX_ANTE_FROZEN_PLAN` 替代含糊的 `FULL_DAY_PLAN`；执行后必须显式选择，并持久化水位、时点和执行上下文。
+- [x] 为未实现的 actual、remaining forecast 和 combined 范围返回稳定错误。
+- [x] 完整哈希权威 Schedule；校验场景、排程快照、政策、旅行模型、服务时长、SLA 和重算 KPI。
+- [x] 保存算法版本和 build SHA，CI 使用提交 SHA，本地使用后端源码哈希。
+- [x] 容量尾部追加计算真实 Depot 返程，并用独立 Verifier 复核完整反事实。
+- [x] 修复不适用容量选项仍计固定投入的边界错误。
 
-## 第二轮：运行时模型与业务命令
+## 第二轮：恢复、成本与页面流程
 
-- [x] 新增持久 `DecisionAnalysisRun`，按场景分配 A001、A002；相同 V、类型和输入指纹去重。
-- [x] Schema v12 将 `active` 和 `coverage_status` 移到 `plan_applicability` 投影；业务数据变化不会再改写历史方案 payload。
-- [x] Schema v13 增加经营分析表；v1–v12 迁移矩阵覆盖完整性、外键和新表。
-- [x] 历史重排分开保存操作来源和原始稳定性基准，激活不会改变稳定率参照。
-- [x] “锁定并改派”合并成一个幂等命令；求解失败时锁定保留、最后方案保持可见并标记过期。
-- [x] 开始服务可填写预计剩余分钟；保守默认改为求解政策配置，调度、验证和执行门禁共用。
-- [x] “增加服务站点”更名为“调整一名技师出发点”，与实际模型能力一致。
+- [x] 人工改派增加 `LOCK_COMMITTED`、`REPLAN_CREATED`、`PLAN_PUBLISHED` 阶段和稳定 Run ID。
+- [x] 在三个持久阶段注入进程终止；重启后 Lock、D、Run、V 不重复，不同请求复用键返回 409。
+- [x] A 运行增加 `RUNNING / COMPLETED / FAILED / INTERRUPTED`，失败结果可审计并按完整输入去重。
+- [x] 新增分析周期、成本频率、人工模式、一次性投入、日运营变化、周期影响和盈亏平衡字段。
+- [x] 新技师改为显式或保守 archetype；补技能绑定可解锁的未服务需求；尾部追加能力在接口和页面明确命名。
+- [x] 风险指标拆分 Monte Carlo 均值抽样区间、全日总迟到分位和五类扰动概率。
+- [x] 运营复盘首屏只 GET 已有 A；显式按钮才创建，成本与风险部分成功不互相遮蔽。
+- [x] 三个同步分析接口标记 deprecated；正式 UI 仅使用 A-run。
 
-## 第三轮：工程与边界审计
+## 第三轮：属性、兼容和交付审计
 
-- [x] 增加 Pyright basic 门禁并清零错误。
-- [x] Pydantic 改为直接依赖；升级受审计影响的 FastAPI、Starlette、OR-Tools、pytest 等依赖。
-- [x] 增加 Hypothesis 属性测试、v1–v12 迁移矩阵、恢复故障测试和经营分析专项回归。
-- [x] 增加 OpenAPI 快照检查、Python 3.11 兼容作业和 Python/npm 依赖审计。
-- [x] 前端开发服务器只监听 `127.0.0.1`。
-- [x] Benchmark smoke 增加选中 V 基准、风险计划时刻、旅行指纹、成本对账和执行态拒绝检查。
-- [x] 复核 TypeScript 7 与当前 `typescript-eslint` peer 范围；上游尚不支持该版本，本轮不安装一套声明不兼容的 ESLint 依赖。
-- [x] 边界复查修复外包方案漏计自定义固定投入、容量参照控件字号和改派 CAS 校验；OpenAPI 快照阻止了内部参数意外暴露成查询参数。
-- [x] 本机 Playwright API 生命周期通过；页面进程在 macOS 沙箱中以 `SIGTRAP` 退出，等待 Linux CI 作最终页面证据。
+- [x] 增加 KPI/旅行/证据/build SHA 哈希、损坏方案、成本周期、付费班次和风险标签测试。
+- [x] 增加随机加班容量、完整可行性与一次性成本周期属性测试。
+- [x] Schema 升至 v14，v1–v13 迁移矩阵和备份路径断言同步更新。
+- [x] OpenAPI 快照、前端类型、README、架构、指标、逐项复核和 Changelog 更新到 v0.5.2。
+- [x] Benchmark smoke 改用完整排程一致性校验，并检查容量违规和风险新字段；仍明确不称正式性能 Benchmark。
+- [ ] 整套本地 `make verify` 通过。
+- [ ] 提交并推送；确认最新提交的 `python-compat` 与 `fieldflow` CI 均通过。
 
 ## 明确保留的后续范围
 
-- [ ] `INCURRED_ACTUAL`、`REMAINING_FORECAST` 和执行水位绑定分析需要正式执行投影；当前以拒绝门禁保证不输出错误数字。
-- [ ] 独立持久 worker、OR-Tools 子进程硬取消和 Outbox 属于异步运行时改造。
-- [ ] planning/metadata/execution 三套公开修订号会破坏现有 D API，需要专门迁移版本。
-- [ ] Crew、跨日、库存、组合容量、敏感性和风险校准需要新领域数据，不能从现有单日 Fixture 推断。
-- [ ] LICENSE 需要仓库所有者选择法律文本；分支保护属于 GitHub 治理操作，本轮不代替所有者决定。
+- [ ] 实际已发生成本、剩余预测和 actual-plus-forecast 需要正式执行投影。
+- [ ] A/Run 的独立 worker、取消、进度和 Outbox 属于 v0.6.0 运行时。
+- [ ] 单一 D 拆分、稳定 Location ID、显式迁移 CLI、PlanVersion 兼容字段清理和生成式 OpenAPI 客户端需要版本化迁移。
+- [ ] 固定承诺间隙插入、组合容量、敏感性、风险校准、Booking、收件箱、资产、周期维护、库存和 Crew 需要新领域数据与验收。
+- [ ] Python 传递依赖统一锁文件需要选定跨平台锁定工具；不以本机 `pip freeze` 代替。
+- [ ] LICENSE 和 GitHub 分支保护等待所有者选择与额外治理授权。
 
 ## 当前验证
 
-三轮“发现—修复—回归”已经完成，提交前的本地证据如下：
-
 ```text
-make lint                         通过（Ruff、Pyright、OpenAPI、TypeScript）
-后端与接口                        138 passed，coverage 88.96%
-React 组件                        7 passed
+make lint                         通过
+React 组件                        8 passed
 生产构建                          通过
+后端与接口                        156 passed，coverage 88.92%
+决策/属性/并发改派最终专项         35 passed
+人工改派三阶段故障注入            3 passed
+Playwright API 生命周期           1 passed
 Demo check                       通过
 Benchmark smoke                  通过
-pip-audit                        0 known vulnerabilities
-npm audit --offline              0 vulnerabilities（本机在线端点两次 ECONNRESET）
-Playwright API 生命周期           1 passed
+npm production audit             0 vulnerabilities
+pip-audit                        本机两次连接 PyPI 均被对端重置，等待 Linux CI 在线复核
+Playwright 页面流程              本机 Chromium 启动受沙箱 SIGTRAP 阻止，等待 Linux CI 复核
 ```
-
-页面级 Playwright 在本机尚未进入应用断言，Chromium 启动时被 macOS 进程沙箱以 `SIGTRAP` 终止。GitHub Actions 运行 `32715170478` 已在 Linux 上完成在线依赖审计和全部 Playwright 流程；`python-compat` 与 `fieldflow` 两个作业均通过。

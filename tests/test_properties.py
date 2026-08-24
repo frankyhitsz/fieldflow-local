@@ -1,9 +1,10 @@
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from backend.decision import analyze_plan_cost
+from backend.decision import analyze_plan_cost, capacity_analysis
 from backend.fixtures import get_fixture
-from backend.models import DecisionCostPolicy
+from backend.hashing import content_hash
+from backend.models import AnalysisHorizon, CapacityAnalysisRequest, DecisionCostPolicy, PlanVersion
 from backend.scheduler import baseline_schedule
 
 
@@ -55,3 +56,47 @@ def test_generated_integer_cost_policies_always_reconcile(
     assert breakdown.total_economic_impact_cents == (
         breakdown.cash_operating_cost_cents + breakdown.service_failure_loss_cents
     )
+
+
+@settings(max_examples=20, deadline=None)
+@given(
+    overtime_limits=st.lists(st.integers(min_value=0, max_value=240), min_size=4, max_size=4),
+    option=st.sampled_from(["add_technician", "add_skill", "extend_shift", "allow_overtime", "outsource_unserved"]),
+    horizon_days=st.integers(min_value=1, max_value=30),
+)
+def test_any_capacity_option_marked_feasible_has_no_verification_violations(
+    overtime_limits: list[int],
+    option: str,
+    horizon_days: int,
+):
+    scenario = get_fixture("main")
+    for technician, overtime_limit in zip(scenario.technicians, overtime_limits, strict=True):
+        technician.overtime_limit = overtime_limit
+    schedule = baseline_schedule(scenario, 1)
+    plan = PlanVersion(
+        id="PV-property-capacity",
+        scenario_id=scenario.id,
+        number=1,
+        action="baseline",
+        label="属性测试",
+        data_revision=scenario.revision,
+        created_at=schedule.created_at,
+        scenario_snapshot=scenario,
+        selected=schedule,
+        scenario_snapshot_hash=content_hash(scenario),
+    )
+    request = CapacityAnalysisRequest.model_validate(
+        {
+            "option_ids": [option],
+            "analysis_horizon": AnalysisHorizon(days=horizon_days).model_dump(mode="json"),
+        }
+    )
+    result = capacity_analysis(plan, request).options[0]
+    if result.feasible:
+        assert result.option_applicable
+        assert result.schedule_feasible
+        assert result.violations == []
+    if result.fixed_cost_cadence.value == "ONE_TIME":
+        assert result.horizon_total_impact_cents == (
+            result.daily_operating_delta_cents * horizon_days + result.one_time_investment_cents
+        )

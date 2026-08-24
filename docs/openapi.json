@@ -22,11 +22,63 @@
         "title": "ActivatePlanRequest",
         "type": "object"
       },
+      "AnalysisHorizon": {
+        "properties": {
+          "currency": {
+            "const": "CNY",
+            "default": "CNY",
+            "title": "Currency",
+            "type": "string"
+          },
+          "days": {
+            "default": 1,
+            "maximum": 365.0,
+            "minimum": 1.0,
+            "title": "Days",
+            "type": "integer"
+          },
+          "workdays_per_month": {
+            "default": 22,
+            "maximum": 31.0,
+            "minimum": 1.0,
+            "title": "Workdays Per Month",
+            "type": "integer"
+          }
+        },
+        "title": "AnalysisHorizon",
+        "type": "object"
+      },
       "CapacityAnalysis": {
         "properties": {
+          "actual_execution_included": {
+            "default": false,
+            "title": "Actual Execution Included",
+            "type": "boolean"
+          },
+          "algorithm_version": {
+            "default": "FIELD_SERVICE_DECISION_V2",
+            "title": "Algorithm Version",
+            "type": "string"
+          },
+          "analysis_as_of_time": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis As Of Time"
+          },
           "analysis_code_version": {
             "title": "Analysis Code Version",
             "type": "string"
+          },
+          "analysis_horizon": {
+            "$ref": "#/components/schemas/AnalysisHorizon"
           },
           "analysis_input_hash": {
             "title": "Analysis Input Hash",
@@ -34,13 +86,18 @@
           },
           "analysis_scope": {
             "$ref": "#/components/schemas/DecisionAnalysisScope",
-            "default": "FULL_DAY_PLAN"
+            "default": "EX_ANTE_FROZEN_PLAN"
           },
           "base_cost": {
             "$ref": "#/components/schemas/PlanCostBreakdown"
           },
           "base_schedule_signature": {
             "title": "Base Schedule Signature",
+            "type": "string"
+          },
+          "build_sha": {
+            "default": "legacy-unknown",
+            "title": "Build Sha",
             "type": "string"
           },
           "capacity_policy": {
@@ -54,9 +111,26 @@
             "title": "Cost Policy Fingerprint",
             "type": "string"
           },
+          "current_execution_watermark": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Current Execution Watermark",
+            "type": "integer"
+          },
           "evaluation_method": {
             "title": "Evaluation Method",
             "type": "string"
+          },
+          "execution_context_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Context Hash"
           },
           "options": {
             "items": {
@@ -64,6 +138,10 @@
             },
             "title": "Options",
             "type": "array"
+          },
+          "placement_mode": {
+            "$ref": "#/components/schemas/CapacityPlacementMode",
+            "default": "TAIL_APPEND_ONLY"
           },
           "plan_number": {
             "title": "Plan Number",
@@ -130,6 +208,29 @@
       },
       "CapacityAnalysisRequest": {
         "properties": {
+          "analysis_horizon": {
+            "$ref": "#/components/schemas/AnalysisHorizon"
+          },
+          "analysis_scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DecisionAnalysisScope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate_technician": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TechnicianArchetype"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "capacity_policy": {
             "$ref": "#/components/schemas/CapacityPolicy"
           },
@@ -152,9 +253,23 @@
             "title": "Option Ids",
             "type": "array"
           },
+          "placement_mode": {
+            "$ref": "#/components/schemas/CapacityPlacementMode",
+            "default": "TAIL_APPEND_ONLY"
+          },
           "reference_mode": {
             "$ref": "#/components/schemas/CapacityReferenceMode",
             "default": "SELECTED_PLAN_DELTA"
+          },
+          "skill_investment_target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SkillInvestmentTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "CapacityAnalysisRequest",
@@ -166,6 +281,23 @@
             "title": "Assumption",
             "type": "string"
           },
+          "break_even_days": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Break Even Days"
+          },
+          "changed_inputs": {
+            "additionalProperties": true,
+            "title": "Changed Inputs",
+            "type": "object"
+          },
           "completion_improvement_percentage_points": {
             "title": "Completion Improvement Percentage Points",
             "type": "number"
@@ -176,6 +308,11 @@
             "title": "Completion Rate",
             "type": "number"
           },
+          "daily_operating_delta_cents": {
+            "default": 0,
+            "title": "Daily Operating Delta Cents",
+            "type": "integer"
+          },
           "feasible": {
             "title": "Feasible",
             "type": "boolean"
@@ -185,6 +322,15 @@
             "title": "Fixed Capacity Cost Cents",
             "type": "integer"
           },
+          "fixed_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "PER_DAY"
+          },
+          "horizon_total_impact_cents": {
+            "default": 0,
+            "title": "Horizon Total Impact Cents",
+            "type": "integer"
+          },
           "marginal_cost_cents": {
             "title": "Marginal Cost Cents",
             "type": "integer"
@@ -192,6 +338,17 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "one_time_investment_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "One Time Investment Cents",
+            "type": "integer"
+          },
+          "option_applicable": {
+            "default": true,
+            "title": "Option Applicable",
+            "type": "boolean"
           },
           "option_id": {
             "enum": [
@@ -214,10 +371,19 @@
             "title": "Overtime Minutes",
             "type": "integer"
           },
+          "placement_mode": {
+            "$ref": "#/components/schemas/CapacityPlacementMode",
+            "default": "TAIL_APPEND_ONLY"
+          },
           "projected_total_cost_cents": {
             "minimum": 0.0,
             "title": "Projected Total Cost Cents",
             "type": "integer"
+          },
+          "schedule_feasible": {
+            "default": true,
+            "title": "Schedule Feasible",
+            "type": "boolean"
           },
           "schedule_signature": {
             "title": "Schedule Signature",
@@ -250,6 +416,13 @@
           "unassigned_delta": {
             "title": "Unassigned Delta",
             "type": "integer"
+          },
+          "violations": {
+            "items": {
+              "$ref": "#/components/schemas/CapacityViolation"
+            },
+            "title": "Violations",
+            "type": "array"
           }
         },
         "required": [
@@ -275,13 +448,28 @@
         "title": "CapacityOptionResult",
         "type": "object"
       },
+      "CapacityPlacementMode": {
+        "enum": [
+          "TAIL_APPEND_ONLY"
+        ],
+        "title": "CapacityPlacementMode",
+        "type": "string"
+      },
       "CapacityPolicy": {
         "properties": {
+          "add_skill_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "ONE_TIME"
+          },
           "add_skill_fixed_cost_cents": {
             "default": 15000,
             "minimum": 0.0,
             "title": "Add Skill Fixed Cost Cents",
             "type": "integer"
+          },
+          "add_technician_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "PER_DAY"
           },
           "add_technician_fixed_cost_cents": {
             "default": 60000,
@@ -289,17 +477,29 @@
             "title": "Add Technician Fixed Cost Cents",
             "type": "integer"
           },
+          "allow_overtime_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "PER_DAY"
+          },
           "allow_overtime_fixed_cost_cents": {
             "default": 0,
             "minimum": 0.0,
             "title": "Allow Overtime Fixed Cost Cents",
             "type": "integer"
           },
+          "extend_shift_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "PER_DAY"
+          },
           "extend_shift_fixed_cost_cents": {
             "default": 0,
             "minimum": 0.0,
             "title": "Extend Shift Fixed Cost Cents",
             "type": "integer"
+          },
+          "outsource_unserved_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "PER_ORDER"
           },
           "outsource_unserved_fixed_cost_cents": {
             "default": 0,
@@ -308,9 +508,13 @@
             "type": "integer"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_CAPACITY_V2",
+            "default": "FIELD_SERVICE_CAPACITY_V3",
             "title": "Policy Version",
             "type": "string"
+          },
+          "relocate_one_technician_start_cost_cadence": {
+            "$ref": "#/components/schemas/CostCadence",
+            "default": "ONE_TIME"
           },
           "relocate_one_technician_start_fixed_cost_cents": {
             "default": 40000,
@@ -329,6 +533,46 @@
         ],
         "title": "CapacityReferenceMode",
         "type": "string"
+      },
+      "CapacityViolation": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "technician_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Technician Id"
+          },
+          "work_order_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Order Id"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "CapacityViolation",
+        "type": "object"
       },
       "CloneScenarioRequest": {
         "properties": {
@@ -445,9 +689,35 @@
       },
       "CostAnalysis": {
         "properties": {
+          "actual_execution_included": {
+            "default": false,
+            "title": "Actual Execution Included",
+            "type": "boolean"
+          },
+          "algorithm_version": {
+            "default": "FIELD_SERVICE_DECISION_V2",
+            "title": "Algorithm Version",
+            "type": "string"
+          },
+          "analysis_as_of_time": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis As Of Time"
+          },
           "analysis_code_version": {
             "title": "Analysis Code Version",
             "type": "string"
+          },
+          "analysis_horizon": {
+            "$ref": "#/components/schemas/AnalysisHorizon"
           },
           "analysis_input_hash": {
             "title": "Analysis Input Hash",
@@ -455,7 +725,7 @@
           },
           "analysis_scope": {
             "$ref": "#/components/schemas/DecisionAnalysisScope",
-            "default": "FULL_DAY_PLAN"
+            "default": "EX_ANTE_FROZEN_PLAN"
           },
           "assumptions": {
             "items": {
@@ -466,6 +736,34 @@
           },
           "breakdown": {
             "$ref": "#/components/schemas/PlanCostBreakdown"
+          },
+          "build_sha": {
+            "default": "legacy-unknown",
+            "title": "Build Sha",
+            "type": "string"
+          },
+          "current_execution_watermark": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Current Execution Watermark",
+            "type": "integer"
+          },
+          "execution_context_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Context Hash"
+          },
+          "horizon_total_economic_impact_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Horizon Total Economic Impact Cents",
+            "type": "integer"
           },
           "plan_number": {
             "title": "Plan Number",
@@ -514,6 +812,17 @@
         ],
         "title": "CostAnalysis",
         "type": "object"
+      },
+      "CostCadence": {
+        "enum": [
+          "ONE_TIME",
+          "PER_DAY",
+          "PER_SHIFT",
+          "PER_ORDER",
+          "PER_MONTH"
+        ],
+        "title": "CostCadence",
+        "type": "string"
       },
       "CoverageSummary": {
         "properties": {
@@ -568,6 +877,40 @@
       },
       "DecisionAnalysisRun": {
         "properties": {
+          "active_booking_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Active Booking Ids",
+            "type": "array"
+          },
+          "actual_execution_included": {
+            "default": false,
+            "title": "Actual Execution Included",
+            "type": "boolean"
+          },
+          "algorithm_version": {
+            "default": "FIELD_SERVICE_DECISION_V2",
+            "title": "Algorithm Version",
+            "type": "string"
+          },
+          "analysis_as_of_time": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis As Of Time"
+          },
+          "analysis_scope": {
+            "$ref": "#/components/schemas/DecisionAnalysisScope",
+            "default": "EX_ANTE_FROZEN_PLAN"
+          },
           "analysis_type": {
             "enum": [
               "COST",
@@ -575,6 +918,11 @@
               "RISK"
             ],
             "title": "Analysis Type",
+            "type": "string"
+          },
+          "build_sha": {
+            "default": "legacy-unknown",
+            "title": "Build Sha",
             "type": "string"
           },
           "code_version": {
@@ -585,17 +933,45 @@
             "title": "Created At",
             "type": "string"
           },
-          "execution_watermark": {
+          "current_execution_watermark": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Current Execution Watermark",
+            "type": "integer"
+          },
+          "error": {
             "anyOf": [
               {
-                "minimum": 0.0,
-                "type": "integer"
+                "additionalProperties": true,
+                "type": "object"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Execution Watermark"
+            "title": "Error"
+          },
+          "execution_context_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Context Hash"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
           },
           "id": {
             "title": "Id",
@@ -638,6 +1014,9 @@
               },
               {
                 "$ref": "#/components/schemas/RiskSimulationResult"
+              },
+              {
+                "type": "null"
               }
             ],
             "title": "Result"
@@ -655,8 +1034,13 @@
             "type": "string"
           },
           "status": {
-            "const": "COMPLETED",
-            "default": "COMPLETED",
+            "default": "RUNNING",
+            "enum": [
+              "RUNNING",
+              "COMPLETED",
+              "FAILED",
+              "INTERRUPTED"
+            ],
             "title": "Status",
             "type": "string"
           },
@@ -679,7 +1063,6 @@
           "policy_snapshot",
           "code_version",
           "input_hash",
-          "result",
           "created_at"
         ],
         "title": "DecisionAnalysisRun",
@@ -687,6 +1070,19 @@
       },
       "DecisionAnalysisRunRequest": {
         "properties": {
+          "analysis_horizon": {
+            "$ref": "#/components/schemas/AnalysisHorizon"
+          },
+          "analysis_scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DecisionAnalysisScope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "analysis_type": {
             "enum": [
               "COST",
@@ -714,7 +1110,10 @@
       },
       "DecisionAnalysisScope": {
         "enum": [
-          "FULL_DAY_PLAN"
+          "EX_ANTE_FROZEN_PLAN",
+          "INCURRED_ACTUAL",
+          "REMAINING_FORECAST",
+          "ACTUAL_PLUS_FORECAST"
         ],
         "title": "DecisionAnalysisScope",
         "type": "string"
@@ -726,6 +1125,10 @@
             "default": "CNY",
             "title": "Currency",
             "type": "string"
+          },
+          "labor_cost_mode": {
+            "$ref": "#/components/schemas/LaborCostMode",
+            "default": "OCCUPIED_MINUTES"
           },
           "outsourcing_cost_per_order_cents": {
             "default": 25000,
@@ -741,7 +1144,7 @@
             "type": "integer"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_COST_V1",
+            "default": "FIELD_SERVICE_COST_V2",
             "title": "Policy Version",
             "type": "string"
           },
@@ -1065,6 +1468,15 @@
         },
         "title": "HTTPValidationError",
         "type": "object"
+      },
+      "LaborCostMode": {
+        "enum": [
+          "OCCUPIED_MINUTES",
+          "PAID_SHIFT",
+          "SALARIED_ALLOCATION"
+        ],
+        "title": "LaborCostMode",
+        "type": "string"
       },
       "LockRequest": {
         "properties": {
@@ -1781,6 +2193,16 @@
       },
       "RiskSimulationRequest": {
         "properties": {
+          "analysis_scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DecisionAnalysisScope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "customer_no_show_basis_points": {
             "default": 400,
             "maximum": 10000.0,
@@ -1844,11 +2266,41 @@
       },
       "RiskSimulationResult": {
         "properties": {
+          "absence_disruption_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Absence Disruption Probability",
+            "type": "number"
+          },
+          "actual_execution_included": {
+            "default": false,
+            "title": "Actual Execution Included",
+            "type": "boolean"
+          },
           "additional_disruption_probability": {
             "maximum": 1.0,
             "minimum": 0.0,
             "title": "Additional Disruption Probability",
             "type": "number"
+          },
+          "algorithm_version": {
+            "default": "FIELD_SERVICE_DECISION_V2",
+            "title": "Algorithm Version",
+            "type": "string"
+          },
+          "analysis_as_of_time": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis As Of Time"
           },
           "analysis_code_version": {
             "title": "Analysis Code Version",
@@ -1856,7 +2308,7 @@
           },
           "analysis_scope": {
             "$ref": "#/components/schemas/DecisionAnalysisScope",
-            "default": "FULL_DAY_PLAN"
+            "default": "EX_ANTE_FROZEN_PLAN"
           },
           "assumptions": {
             "items": {
@@ -1869,6 +2321,35 @@
             "minimum": 0.0,
             "title": "Baseline Unserved Orders",
             "type": "integer"
+          },
+          "build_sha": {
+            "default": "legacy-unknown",
+            "title": "Build Sha",
+            "type": "string"
+          },
+          "current_execution_watermark": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Current Execution Watermark",
+            "type": "integer"
+          },
+          "emergency_capacity_disruption_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Emergency Capacity Disruption Probability",
+            "type": "number"
+          },
+          "execution_context_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Context Hash"
           },
           "execution_policy": {
             "$ref": "#/components/schemas/RiskExecutionPolicy"
@@ -1899,6 +2380,24 @@
             "title": "Expected Unserved Orders",
             "type": "number"
           },
+          "full_day_total_late_minutes_p50": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Full Day Total Late Minutes P50",
+            "type": "integer"
+          },
+          "full_day_total_late_minutes_p90": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Full Day Total Late Minutes P90",
+            "type": "integer"
+          },
+          "full_day_total_late_minutes_p95": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Full Day Total Late Minutes P95",
+            "type": "integer"
+          },
           "late_minutes_p50": {
             "minimum": 0.0,
             "title": "Late Minutes P50",
@@ -1913,6 +2412,34 @@
             "minimum": 0.0,
             "title": "Late Minutes P95",
             "type": "integer"
+          },
+          "monte_carlo_mean_ci_high": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Monte Carlo Mean Ci High",
+            "type": "number"
+          },
+          "monte_carlo_mean_ci_low": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Monte Carlo Mean Ci Low",
+            "type": "number"
+          },
+          "no_show_disruption_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "No Show Disruption Probability",
+            "type": "number"
+          },
+          "overtime_failure_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Overtime Failure Probability",
+            "type": "number"
           },
           "plan_failure_probability": {
             "maximum": 1.0,
@@ -1972,6 +2499,13 @@
           "trials": {
             "title": "Trials",
             "type": "integer"
+          },
+          "window_failure_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Window Failure Probability",
+            "type": "number"
           }
         },
         "required": [
@@ -3117,6 +3651,25 @@
         "title": "Skill",
         "type": "string"
       },
+      "SkillInvestmentTarget": {
+        "properties": {
+          "skill": {
+            "$ref": "#/components/schemas/Skill"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "technician_id",
+          "skill"
+        ],
+        "title": "SkillInvestmentTarget",
+        "type": "object"
+      },
       "SolverConfig": {
         "properties": {
           "active_service_default_remaining_minutes": {
@@ -3799,6 +4352,61 @@
           "start_location"
         ],
         "title": "Technician",
+        "type": "object"
+      },
+      "TechnicianArchetype": {
+        "properties": {
+          "cost_per_minute_cents": {
+            "default": 100,
+            "exclusiveMinimum": 0.0,
+            "maximum": 10000.0,
+            "title": "Cost Per Minute Cents",
+            "type": "integer"
+          },
+          "name": {
+            "default": "候选技师",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "overtime_limit": {
+            "default": 60,
+            "maximum": 240.0,
+            "minimum": 0.0,
+            "title": "Overtime Limit",
+            "type": "integer"
+          },
+          "shift_end": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Shift End",
+            "type": "integer"
+          },
+          "shift_start": {
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Shift Start",
+            "type": "integer"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/Skill"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "start_location": {
+            "$ref": "#/components/schemas/Point"
+          }
+        },
+        "required": [
+          "skills",
+          "shift_start",
+          "shift_end",
+          "start_location"
+        ],
+        "title": "TechnicianArchetype",
         "type": "object"
       },
       "TechnicianExecutionProjection": {
@@ -4726,7 +5334,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.1"
+    "version": "0.5.2"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -5117,7 +5725,7 @@
     },
     "/api/scenarios/{scenario_id}/manual-reassignment": {
       "post": {
-        "description": "Persist a manual lock and run its replan as one idempotent business command.\n\nThe lock is a durable dispatcher decision. If solving fails, the response\nexplicitly reports that partial outcome and keeps the last published plan\nvisible as stale instead of hiding the new business state.",
+        "description": "Serialize one local idempotency key while the recoverable saga advances.",
         "operationId": "manual_reassignment_api_scenarios__scenario_id__manual_reassignment_post",
         "parameters": [
           {
@@ -5552,6 +6160,7 @@
     },
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/capacity-analysis": {
       "post": {
+        "deprecated": true,
         "operationId": "post_capacity_analysis_api_scenarios__scenario_id__plan_versions__version_id__capacity_analysis_post",
         "parameters": [
           {
@@ -5668,6 +6277,7 @@
     },
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/cost-analysis": {
       "get": {
+        "deprecated": true,
         "operationId": "get_cost_analysis_api_scenarios__scenario_id__plan_versions__version_id__cost_analysis_get",
         "parameters": [
           {
@@ -5686,6 +6296,22 @@
             "schema": {
               "title": "Version Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "analysis_scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/DecisionAnalysisScope"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Analysis Scope"
             }
           }
         ],
@@ -5822,6 +6448,7 @@
     },
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/risk-simulation": {
       "post": {
+        "deprecated": true,
         "operationId": "post_risk_simulation_api_scenarios__scenario_id__plan_versions__version_id__risk_simulation_post",
         "parameters": [
           {

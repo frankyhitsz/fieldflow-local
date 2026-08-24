@@ -48,11 +48,11 @@ Strategy experiments use one worker and a bounded four-slot queue. Cancellation 
 
 Cost, capacity, and risk analysis validate the selected plan's snapshot, solver policy, schedule and travel fingerprints. The UI creates a `DecisionAnalysisRun` instead of displaying an untracked recalculation. Runs receive a scenario-local `A` number and persist the complete input policy, code version, input hash and result; identical inputs for the same V and analysis type are deduplicated.
 
-The current analysis contract is `FULL_DAY_PLAN`. A plan snapshot containing started or completed work is rejected until an execution-watermarked actual/forecast model exists. Capacity defaults to selected-plan incremental placement; controlled reoptimization uses one deterministic policy for both the reference and every option.
+The implemented decision scope is `EX_ANTE_FROZEN_PLAN`. Once execution events exist, clients must select it explicitly; the record binds the current event watermark and states that actual execution is excluded. Actual, remaining-forecast, and combined scopes are reserved enum values and return a stable unsupported error. Capacity defaults to selected-plan `TAIL_APPEND_ONLY` placement, then verifies the complete counterfactual route, fixed assignments, real-depot return, and overtime limits. Controlled reoptimization uses one deterministic policy for both the reference and every option.
 
 ## Storage
 
-SQLite schema v13 uses foreign keys for scenario-owned data, enforces one parent for every schedule artifact, limits each schedule run to one candidate, separates plan applicability, and stores work-order execution events and decision-analysis runs. Connections use WAL and a busy timeout. Migrations create a timestamped backup before changing an existing database.
+SQLite schema v14 uses foreign keys for scenario-owned data, enforces one parent for every schedule artifact, limits each schedule run to one candidate, separates plan applicability, and stores work-order execution events and decision-analysis runs. Analysis runs keep running, completed, failed, and interrupted states. Manual reassignment preallocates a stable schedule-run identity so restart recovery cannot duplicate the lock, revision, run, or plan version. Connections use WAL and a busy timeout. Migrations create a timestamped backup before changing an existing database.
 
 The legacy `schedules` table remains as an API compatibility projection of published plans. New business logic uses `plan_versions`, `plan_applicability`, `schedule_runs`, `schedule_candidates`, `decision_analysis_runs`, and `work_order_execution_events`. Saved candidates are immutable; publication rechecks their run, source, snapshot, planning context, and solver configuration.
 

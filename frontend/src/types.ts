@@ -140,43 +140,63 @@ export type CostBreakdown = {
   total_cost_cents: number; technician_cost_cents: Record<string, number>
 }
 
-export type CostAnalysis = {
+export type DecisionAnalysisScope = 'EX_ANTE_FROZEN_PLAN' | 'INCURRED_ACTUAL' | 'REMAINING_FORECAST' | 'ACTUAL_PLUS_FORECAST'
+export type AnalysisHorizon = { days: number; workdays_per_month: number; currency: 'CNY' }
+export type CostCadence = 'ONE_TIME' | 'PER_DAY' | 'PER_SHIFT' | 'PER_ORDER' | 'PER_MONTH'
+export type AnalysisContextFields = {
+  analysis_scope: DecisionAnalysisScope; current_execution_watermark: number
+  analysis_as_of_time: number | null; execution_context_hash: string | null
+  actual_execution_included: boolean; algorithm_version: string; build_sha: string
+}
+
+export type CostAnalysis = AnalysisContextFields & {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
-  schedule_signature: string; analysis_scope: 'FULL_DAY_PLAN'; travel_model_fingerprint: string
+  schedule_signature: string; travel_model_fingerprint: string
   analysis_code_version: string; analysis_input_hash: string
+  analysis_horizon: AnalysisHorizon; horizon_total_economic_impact_cents: number
   policy: Record<string, unknown>; policy_fingerprint: string; breakdown: CostBreakdown; assumptions: string[]
 }
 
+export type CapacityViolation = { code: string; message: string; work_order_id: string | null; technician_id: string | null }
+
 export type CapacityOption = {
   option_id: 'add_technician' | 'add_skill' | 'extend_shift' | 'allow_overtime' | 'outsource_unserved' | 'relocate_one_technician_start'
-  name: string; assumption: string; feasible: boolean
+  name: string; assumption: string; option_applicable: boolean; schedule_feasible: boolean; feasible: boolean
+  violations: CapacityViolation[]; changed_inputs: Record<string, unknown>; placement_mode: 'TAIL_APPEND_ONLY'
   completion_rate: number; sla_on_time_rate: number; unassigned_count: number
   travel_minutes: number; overtime_minutes: number
   completion_improvement_percentage_points: number; sla_improvement_percentage_points: number
   unassigned_delta: number; travel_delta_minutes: number; overtime_delta_minutes: number
   fixed_capacity_cost_cents: number; marginal_cost_cents: number; projected_total_cost_cents: number
+  fixed_cost_cadence: CostCadence; one_time_investment_cents: number; daily_operating_delta_cents: number
+  horizon_total_impact_cents: number; break_even_days: number | null
   schedule_signature: string
 }
 
-export type CapacityAnalysis = {
+export type CapacityAnalysis = AnalysisContextFields & {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
-  analysis_scope: 'FULL_DAY_PLAN'; analysis_code_version: string; analysis_input_hash: string; evaluation_method: string
+  analysis_code_version: string; analysis_input_hash: string; evaluation_method: string
   reference_mode: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'
   selected_plan_signature: string; reference_schedule_signature: string
   reference_solver_policy_fingerprint: string; reference_travel_model_fingerprint: string
   reference_kpis: Kpis; cost_policy_fingerprint: string
   capacity_policy: Record<string, unknown>; capacity_policy_fingerprint: string
+  analysis_horizon: AnalysisHorizon; placement_mode: 'TAIL_APPEND_ONLY'
   base_schedule_signature: string; base_cost: CostBreakdown; options: CapacityOption[]
 }
 
-export type RiskSimulation = {
+export type RiskSimulation = AnalysisContextFields & {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
-  schedule_signature: string; analysis_scope: 'FULL_DAY_PLAN'; travel_model_fingerprint: string
+  schedule_signature: string; travel_model_fingerprint: string
   execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE' | 'EARLIEST_FEASIBLE_EXECUTION'; execution_policy_version: string
   simulation_policy_version: string; analysis_code_version: string; simulation_input_hash: string; seed: number; trials: number
   expected_sla_on_time_rate: number; sla_rate_ci_low: number; sla_rate_ci_high: number
+  monte_carlo_mean_ci_low: number; monte_carlo_mean_ci_high: number
+  full_day_total_late_minutes_p50: number; full_day_total_late_minutes_p90: number; full_day_total_late_minutes_p95: number
   late_minutes_p50: number; late_minutes_p90: number; late_minutes_p95: number
   expected_overtime_minutes: number; additional_disruption_probability: number
+  absence_disruption_probability: number; no_show_disruption_probability: number
+  window_failure_probability: number; overtime_failure_probability: number; emergency_capacity_disruption_probability: number
   baseline_unserved_orders: number; expected_total_unserved_orders: number
   plan_failure_probability: number; expected_unserved_orders: number
   assumptions: string[]
@@ -184,8 +204,12 @@ export type RiskSimulation = {
 
 export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimulation> = {
   id: string; scenario_id: string; number: number; plan_version_id: string; plan_number: number
-  analysis_type: 'COST' | 'CAPACITY' | 'RISK'; scenario_snapshot_hash: string; schedule_hash: string
-  execution_watermark: number | null; travel_model_fingerprint: string
-  policy_version: string; policy_snapshot: Record<string, unknown>; code_version: string; input_hash: string
-  status: 'COMPLETED'; result: T; created_at: string
+  analysis_type: 'COST' | 'CAPACITY' | 'RISK'; analysis_scope: DecisionAnalysisScope
+  scenario_snapshot_hash: string; schedule_hash: string; current_execution_watermark: number
+  analysis_as_of_time: number | null; execution_context_hash: string | null; actual_execution_included: boolean
+  active_booking_ids: string[]; travel_model_fingerprint: string
+  policy_version: string; policy_snapshot: Record<string, unknown>; code_version: string
+  algorithm_version: string; build_sha: string; input_hash: string
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; result: T | null
+  error: Record<string, unknown> | null; created_at: string; finished_at: string | null
 }

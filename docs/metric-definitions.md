@@ -39,4 +39,8 @@ Business score policy: `FIELD_SERVICE_SCORE_V2`
 - `baseline_unserved_orders`: work already unserved by the published plan.
 - `expected_total_unserved_orders`: baseline unserved work plus simulated additional loss.
 
-Decision figures are valid only for the recorded snapshot, schedule, travel, policy, code and input fingerprints. The current scope is `FULL_DAY_PLAN` with no execution facts.
+Decision figures are valid only for the recorded snapshot, complete schedule hash, travel model, policy, algorithm version, build SHA, execution watermark, and input fingerprint. The implemented scope is `EX_ANTE_FROZEN_PLAN`: it excludes actual execution and is not a remaining-work forecast.
+
+The risk field `monte_carlo_mean_ci_low/high` is an interval for simulation mean error, not a confidence interval for uncertain real-world parameters. `full_day_total_late_minutes_p50/p90/p95` is the percentile of total late minutes across a simulated service day, not the percentile of individual work-order lateness. Absence, customer no-show, time-window, overtime, and emergency-capacity disruption probabilities are reported separately.
+
+Capacity `option_applicable` says whether an input change can be constructed. `schedule_feasible` says whether the resulting complete schedule passes coverage, uniqueness, skill, time-window, travel-continuity, lock, fixed-assignment, real-depot-return, and overtime checks. The compatibility field `feasible` is true only when both are true. One-time investment, daily operating delta, analysis-horizon impact, and break-even days use the returned cost cadence and must not be added without a common horizon.

@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.5.1 — unreleased
+## 0.5.2 — unreleased
+
+- Replaced the ambiguous full-day decision scope with explicit ex-ante, actual, remaining-forecast, and combined scopes; only ex-ante frozen-plan analysis is currently enabled.
+- Bound every persisted analysis to the current execution watermark, as-of time, execution-context hash, algorithm version, and build SHA.
+- Added full capacity-counterfactual verification, including route continuity, fixed assignments, real-depot return, overtime limits, and explicit feasibility violations.
+- Added analysis horizons, cost cadences, labor-cost modes, conservative technician archetypes, targeted skill investment, and honest tail-append placement labels.
+- Split Monte Carlo mean intervals from full-day late-minute percentiles and reported absence, no-show, window, overtime, and emergency disruption separately.
+- Made manual reassignment resume the same persisted Run after lock commit or process restart without duplicating the lock, D, Run, or V.
+- Changed the operations-review page to read A records on entry and create them only after an explicit action; partial analysis success remains visible.
+- Persisted failed and interrupted A records, deprecated direct analysis endpoints, and expanded property, fault-injection, API, and component tests.
+
+## 0.5.1
 
 - Bound capacity analysis to the selected plan by default and added a same-policy controlled reoptimization mode.
 - Made risk simulation follow published starts and separated cash cost, service-failure loss, total economic impact, and additional disruption risk.

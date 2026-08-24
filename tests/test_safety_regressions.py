@@ -72,6 +72,41 @@ def _complete_first_assignment(client: TestClient) -> tuple[dict, dict, dict]:
     return baseline, first, completed.json()
 
 
+def _manual_reassignment_payload(client: TestClient, key: str) -> dict:
+    baseline = client.post("/api/scenarios/main/baseline").json()
+    scenario = client.get("/api/scenarios/main").json()
+    assignment = next(
+        item
+        for item in baseline["assignments"]
+        if len(
+            [
+                technician
+                for technician in scenario["technicians"]
+                if set(
+                    next(order for order in scenario["work_orders"] if order["id"] == item["work_order_id"])[
+                        "required_skills"
+                    ]
+                ).issubset(set(technician["skills"]))
+            ]
+        )
+        >= 2
+    )
+    order = next(item for item in scenario["work_orders"] if item["id"] == assignment["work_order_id"])
+    target = next(
+        technician
+        for technician in scenario["technicians"]
+        if technician["id"] != assignment["technician_id"]
+        and set(order["required_skills"]).issubset(set(technician["skills"]))
+    )
+    return {
+        "work_order_id": order["id"],
+        "technician_id": target["id"],
+        "planning_time": assignment["start_time"],
+        "expected_revision": scenario["revision"],
+        "idempotency_key": key,
+    }
+
+
 def _complete_first_and_start_second(client: TestClient) -> tuple[dict, dict, dict, dict]:
     baseline = client.post("/api/scenarios/main/baseline").json()
     first, second = _route_with_two_assignments(baseline)[:2]
@@ -1085,6 +1120,104 @@ def test_manual_reassignment_reports_durable_lock_when_replan_fails(monkeypatch,
         assert client.get("/api/scenarios/main").json()["revision"] == revision_after_failure
 
 
+@pytest.mark.parametrize("crash_status", ["LOCK_COMMITTED", "REPLAN_CREATED", "PLAN_PUBLISHED"])
+def test_manual_reassignment_recovers_each_persisted_phase_without_duplicates(
+    monkeypatch,
+    tmp_path,
+    crash_status,
+):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    database = tmp_path / f"manual-saga-{crash_status.lower()}.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    key = f"manual-saga-{crash_status.lower()}-001"
+    with TestClient(main_module.app) as client:
+        payload = _manual_reassignment_payload(client, key)
+        store = main_module.require_store()
+        original_update = store.update_command_record
+        crashed = False
+
+        def crash_at_phase(*args, **kwargs):
+            nonlocal crashed
+            if not crashed and args[0] == "main:manual-reassignment" and kwargs.get("status") == crash_status:
+                crashed = True
+                raise SimulatedProcessExit(crash_status)
+            return original_update(*args, **kwargs)
+
+        monkeypatch.setattr(store, "update_command_record", crash_at_phase)
+        with pytest.raises(SimulatedProcessExit, match=crash_status):
+            main_module.manual_reassignment(
+                "main",
+                main_module.ManualReassignmentRequest.model_validate(payload),
+            )
+        assert crashed
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        recovered = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["replan_status"] == "COMPLETED"
+        scenario = client.get("/api/scenarios/main").json()
+        assert scenario["revision"] == 1
+        matching_locks = [
+            item
+            for item in scenario["locked_assignments"]
+            if item["work_order_id"] == payload["work_order_id"] and item["technician_id"] == payload["technician_id"]
+        ]
+        assert len(matching_locks) == 1
+        runs = client.get("/api/scenarios/main/schedule-runs").json()
+        replan_runs = [item for item in runs if item["action"] == "replan"]
+        assert len(replan_runs) == 1
+        assert replan_runs[0]["id"].startswith("RUN-MR-")
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
+
+        replay = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        assert replay.status_code == 200
+        assert replay.json() == recovered.json()
+        assert len(client.get("/api/scenarios/main/schedule-runs").json()) == len(runs)
+        assert client.get("/api/scenarios/main").json()["revision"] == 1
+
+        conflict_payload = {**payload, "planning_time": payload["planning_time"] + 1}
+        conflict = client.post("/api/scenarios/main/manual-reassignment", json=conflict_payload)
+        assert conflict.status_code == 409
+        assert "相同幂等键" in conflict.text
+
+
+def test_concurrent_manual_reassignment_uses_one_lock_run_and_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "manual-saga-concurrent.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        payload = _manual_reassignment_payload(client, "manual-saga-concurrent-001")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(
+                executor.map(
+                    lambda _: client.post("/api/scenarios/main/manual-reassignment", json=payload),
+                    range(2),
+                )
+            )
+        assert {response.status_code for response in responses}.issubset({200, 409})
+        assert any(response.status_code == 200 for response in responses)
+        replay = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        assert replay.status_code == 200
+        scenario = client.get("/api/scenarios/main").json()
+        assert scenario["revision"] == 1
+        assert (
+            len([item for item in scenario["locked_assignments"] if item["work_order_id"] == payload["work_order_id"]])
+            == 1
+        )
+        assert (
+            len([item for item in client.get("/api/scenarios/main/schedule-runs").json() if item["action"] == "replan"])
+            == 1
+        )
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
+
+
 def test_plan_payload_is_not_rewritten_when_applicability_changes(monkeypatch, tmp_path):
     database = tmp_path / "plan-applicability.db"
     monkeypatch.setenv("FIELDFLOW_DB", str(database))
@@ -1206,7 +1339,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 

@@ -39,23 +39,28 @@ const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', descripti
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-function mockApi(activePlan: PlanVersion = plan) {
+function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
-    const analysisRequest = url.endsWith('/analysis-runs') && init?.body ? JSON.parse(String(init.body)) as { analysis_type: 'COST' | 'CAPACITY' | 'RISK' } : undefined
+    const analysisRequest = url.endsWith('/analysis-runs') && init?.body ? JSON.parse(String(init.body)) as { analysis_type: 'COST' | 'CAPACITY' | 'RISK'; analysis_scope: string; analysis_horizon: { days: number } } : undefined
+    if (analysisRequest?.analysis_type === 'RISK' && options.failRisk) return new Response(JSON.stringify({ detail: { message: '风险引擎暂不可用' } }), { status: 500, headers: { 'Content-Type': 'application/json' } })
     const effectiveUrl = analysisRequest ? analysisRequest.analysis_type === 'COST' ? '/cost-analysis' : analysisRequest.analysis_type === 'RISK' ? '/risk-simulation' : '/capacity-analysis' : url
+    const context = { analysis_scope: 'EX_ANTE_FROZEN_PLAN', current_execution_watermark: 2, analysis_as_of_time: 630, execution_context_hash: 'events', actual_execution_included: false, algorithm_version: 'FIELD_SERVICE_DECISION_V3', build_sha: 'test-sha' }
+    const breakdown = { labor_cost_cents: 100000, travel_cost_cents: 10000, overtime_cost_cents: 2000, sla_penalty_cents: 5000, unserved_revenue_cents: 6400, outsourcing_cost_cents: 0, cash_operating_cost_cents: 112000, service_failure_loss_cents: 11400, total_economic_impact_cents: 123400, total_cost_cents: 123400, technician_cost_cents: { 'TECH-01': 102000 } }
+    const days = analysisRequest?.analysis_horizon.days || 1
     let body: unknown = effectiveUrl.endsWith('/api/scenarios') ? [scenario]
       : effectiveUrl.endsWith('/api/strategy-profiles') ? profiles
       : effectiveUrl.endsWith('/api/scenarios/strategy-medium') ? mediumScenario
-      : effectiveUrl.endsWith('/cost-analysis') ? { scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', analysis_scope: 'FULL_DAY_PLAN', travel_model_fingerprint: 'travel', analysis_code_version: '0.5.1', analysis_input_hash: 'cost-input', policy: {}, policy_fingerprint: 'cost', assumptions: [], breakdown: { labor_cost_cents: 100000, travel_cost_cents: 10000, overtime_cost_cents: 2000, sla_penalty_cents: 5000, unserved_revenue_cents: 6400, outsourcing_cost_cents: 0, cash_operating_cost_cents: 112000, service_failure_loss_cents: 11400, total_economic_impact_cents: 123400, total_cost_cents: 123400, technician_cost_cents: { 'TECH-01': 102000 } } }
-      : effectiveUrl.endsWith('/risk-simulation') ? { scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', analysis_scope: 'FULL_DAY_PLAN', travel_model_fingerprint: 'travel', execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE', execution_policy_version: 'V2', simulation_policy_version: 'V2', analysis_code_version: '0.5.1', simulation_input_hash: 'risk', seed: 7, trials: 500, expected_sla_on_time_rate: .875, sla_rate_ci_low: .85, sla_rate_ci_high: .9, late_minutes_p50: 10, late_minutes_p90: 28, late_minutes_p95: 35, expected_overtime_minutes: 4.5, additional_disruption_probability: .125, baseline_unserved_orders: 0, expected_total_unserved_orders: .25, plan_failure_probability: .125, expected_unserved_orders: .25, assumptions: [] }
-      : effectiveUrl.endsWith('/capacity-analysis') ? { scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', analysis_scope: 'FULL_DAY_PLAN', analysis_code_version: '0.5.1', analysis_input_hash: 'capacity-input', evaluation_method: 'SELECTED_PLAN_ANCHORED_INCREMENTAL_GREEDY_V2', reference_mode: 'SELECTED_PLAN_DELTA', selected_plan_signature: 'selected', reference_schedule_signature: 'selected', reference_solver_policy_fingerprint: 'policy', reference_travel_model_fingerprint: 'travel', reference_kpis: schedule.kpis, cost_policy_fingerprint: 'cost', capacity_policy: {}, capacity_policy_fingerprint: 'capacity', base_schedule_signature: 'selected', base_cost: {}, options: [{ option_id: 'add_technician', name: '增加一名复合技能技师', assumption: '测算假设', feasible: true, completion_rate: 1, sla_on_time_rate: 1, unassigned_count: 0, travel_minutes: 8, overtime_minutes: 0, completion_improvement_percentage_points: 5, sla_improvement_percentage_points: 8, unassigned_delta: -1, travel_delta_minutes: -2, overtime_delta_minutes: 0, fixed_capacity_cost_cents: 60000, marginal_cost_cents: 50000, projected_total_cost_cents: 173400, schedule_signature: 'capacity' }] }
+      : effectiveUrl.endsWith('/cost-analysis') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', travel_model_fingerprint: 'travel', analysis_code_version: '0.5.2', analysis_input_hash: 'cost-input', analysis_horizon: { days, workdays_per_month: 22, currency: 'CNY' }, horizon_total_economic_impact_cents: breakdown.total_economic_impact_cents * days, policy: {}, policy_fingerprint: 'cost', assumptions: [], breakdown }
+      : effectiveUrl.endsWith('/risk-simulation') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', travel_model_fingerprint: 'travel', execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE', execution_policy_version: 'V2', simulation_policy_version: 'V2', analysis_code_version: '0.5.2', simulation_input_hash: 'risk', seed: 7, trials: 500, expected_sla_on_time_rate: .875, monte_carlo_mean_ci_low: .85, monte_carlo_mean_ci_high: .9, sla_rate_ci_low: .85, sla_rate_ci_high: .9, full_day_total_late_minutes_p50: 10, full_day_total_late_minutes_p90: 28, full_day_total_late_minutes_p95: 35, late_minutes_p50: 10, late_minutes_p90: 28, late_minutes_p95: 35, expected_overtime_minutes: 4.5, additional_disruption_probability: .125, absence_disruption_probability: .05, no_show_disruption_probability: .04, window_failure_probability: .03, overtime_failure_probability: .02, emergency_capacity_disruption_probability: .06, baseline_unserved_orders: 0, expected_total_unserved_orders: .25, plan_failure_probability: .125, expected_unserved_orders: .25, assumptions: [] }
+      : effectiveUrl.endsWith('/capacity-analysis') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', analysis_code_version: '0.5.2', analysis_input_hash: 'capacity-input', evaluation_method: 'SELECTED_PLAN_TAIL_APPEND_COUNTERFACTUAL_V3', reference_mode: 'SELECTED_PLAN_DELTA', selected_plan_signature: 'selected', reference_schedule_signature: 'selected', reference_solver_policy_fingerprint: 'policy', reference_travel_model_fingerprint: 'travel', reference_kpis: schedule.kpis, cost_policy_fingerprint: 'cost', capacity_policy: {}, capacity_policy_fingerprint: 'capacity', analysis_horizon: { days, workdays_per_month: 22, currency: 'CNY' }, placement_mode: 'TAIL_APPEND_ONLY', base_schedule_signature: 'selected', base_cost: breakdown, options: [{ option_id: 'add_technician', name: '增加一名候选技师', assumption: '测算假设', option_applicable: true, schedule_feasible: true, feasible: true, violations: [], changed_inputs: { skills: ['electrical'] }, placement_mode: 'TAIL_APPEND_ONLY', completion_rate: 1, sla_on_time_rate: 1, unassigned_count: 0, travel_minutes: 8, overtime_minutes: 0, completion_improvement_percentage_points: 5, sla_improvement_percentage_points: 8, unassigned_delta: -1, travel_delta_minutes: -2, overtime_delta_minutes: 0, fixed_capacity_cost_cents: 60000, fixed_cost_cadence: 'PER_DAY', one_time_investment_cents: 0, daily_operating_delta_cents: -10000, horizon_total_impact_cents: 50000 * days, break_even_days: null, marginal_cost_cents: 50000, projected_total_cost_cents: 173400, schedule_signature: 'capacity' }] }
+      : effectiveUrl.endsWith('/analysis-runs') ? []
       : effectiveUrl.endsWith('/plan-versions') ? [activePlan]
       : effectiveUrl.includes('/plan-versions/') ? activePlan
       : effectiveUrl.endsWith('/schedules') ? [schedule]
       : effectiveUrl.endsWith('/baseline') ? { ...schedule, id: 'SCH-BASE', kind: 'baseline', version: 1, strategy: 'baseline' }
       : scenario
-    if (analysisRequest) body = { id: `AN-${analysisRequest.analysis_type}`, scenario_id: 'main', number: { COST: 1, RISK: 2, CAPACITY: 3 }[analysisRequest.analysis_type], plan_version_id: activePlan.id, plan_number: activePlan.number, analysis_type: analysisRequest.analysis_type, scenario_snapshot_hash: 'test', schedule_hash: 'selected', execution_watermark: null, travel_model_fingerprint: 'travel', policy_version: 'V2', policy_snapshot: {}, code_version: '0.5.1', input_hash: `${analysisRequest.analysis_type}-input`, status: 'COMPLETED', result: body, created_at: '2026-08-24T00:00:00Z' }
+    if (analysisRequest) body = { id: `AN-${analysisRequest.analysis_type}`, scenario_id: 'main', number: { COST: 1, RISK: 2, CAPACITY: 3 }[analysisRequest.analysis_type], plan_version_id: activePlan.id, plan_number: activePlan.number, analysis_type: analysisRequest.analysis_type, ...context, active_booking_ids: [], scenario_snapshot_hash: 'test', schedule_hash: 'selected', travel_model_fingerprint: 'travel', policy_version: 'V3', policy_snapshot: {}, code_version: '0.5.2', input_hash: `${analysisRequest.analysis_type}-input`, status: 'COMPLETED', result: body, error: null, created_at: '2026-08-24T00:00:00Z', finished_at: '2026-08-24T00:00:01Z' }
     return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
   }))
 }
@@ -146,15 +151,33 @@ describe('FieldFlow navigation and render safety', () => {
     expect(screen.getByText('09:20，与重排时点相互独立')).toBeInTheDocument()
   })
 
-  it('loads frozen cost and risk analysis and runs capacity what-if', async () => {
+  it('reads analyses without writing and creates explicit frozen analyses on demand', async () => {
     mockApi(); render(<App />)
     await screen.findByRole('heading', { name: '今日调度测试' })
     fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
+    expect(await screen.findByText(/当前版本还没有经营分析/)).toBeInTheDocument()
+    expect(screen.getByText('事前冻结计划分析，不含实际执行')).toBeInTheDocument()
+    expect(vi.mocked(fetch).mock.calls.filter(([input, init]) => String(input).endsWith('/analysis-runs') && init?.method === 'POST')).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: '生成成本与风险分析' }))
     expect(await screen.findByText(/1,234\.00/)).toBeInTheDocument()
     expect(screen.getByText('88%')).toBeInTheDocument()
     expect(screen.getByText('35 分钟')).toBeInTheDocument()
+    const analysisBodies = vi.mocked(fetch).mock.calls.filter(([input, init]) => String(input).endsWith('/analysis-runs') && init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)) as { analysis_scope: string })
+    expect(analysisBodies).toHaveLength(2)
+    expect(analysisBodies.every(body => body.analysis_scope === 'EX_ANTE_FROZEN_PLAN')).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: '测算六种容量方案' }))
-    expect(await screen.findByText('增加一名复合技能技师')).toBeInTheDocument()
+    expect(await screen.findByText('增加一名候选技师')).toBeInTheDocument()
     expect(screen.getByText('+5pp')).toBeInTheDocument()
+  })
+
+  it('keeps the successful cost result when risk analysis fails', async () => {
+    mockApi(plan, { failRisk: true }); render(<App />)
+    await screen.findByRole('heading', { name: '今日调度测试' })
+    fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
+    await screen.findByText(/当前版本还没有经营分析/)
+    fireEvent.click(screen.getByRole('button', { name: '生成成本与风险分析' }))
+    expect(await screen.findByText(/1,234\.00/)).toBeInTheDocument()
+    expect(screen.getByText('风险引擎暂不可用')).toBeInTheDocument()
+    expect(screen.queryByText('88%')).not.toBeInTheDocument()
   })
 })

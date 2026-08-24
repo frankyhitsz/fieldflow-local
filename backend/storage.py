@@ -41,7 +41,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def _upgrade_technician_costs(payload: object) -> bool:
@@ -673,6 +673,21 @@ class Store:
                 con.execute(
                     "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
                     (run.status.value, run.model_dump_json(), run.id),
+                )
+            interrupted_analyses = con.execute("SELECT id, payload FROM decision_analysis_runs").fetchall()
+            for row in interrupted_analyses:
+                analysis = DecisionAnalysisRun.model_validate_json(row["payload"])
+                if analysis.status != "RUNNING":
+                    continue
+                analysis.status = "INTERRUPTED"
+                analysis.error = {
+                    "code": "APPLICATION_RESTARTED",
+                    "message": "应用在经营分析完成前重启",
+                }
+                analysis.finished_at = _now()
+                con.execute(
+                    "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
+                    (analysis.model_dump_json(), analysis.id),
                 )
             abandoned_commands = con.execute(
                 """
@@ -1928,6 +1943,31 @@ class Store:
             )
         return run
 
+    def resume_interrupted_schedule_run(self, run: ScheduleRun) -> ScheduleRun:
+        """Resume exactly the same run after startup marked it interrupted."""
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
+            if not row:
+                raise PublicationConflict("待恢复的求解记录不存在")
+            stored = ScheduleRun.model_validate_json(row["payload"])
+            if stored.status is not ScheduleRunStatus.failed or stored.termination_reason != "APPLICATION_RESTARTED":
+                raise PublicationConflict("只有因应用重启中断的求解记录可以恢复")
+            expected = stored.model_copy(
+                update={
+                    "status": ScheduleRunStatus.running,
+                    "termination_reason": None,
+                    "finished_at": None,
+                }
+            )
+            if expected.model_dump(mode="json") != run.model_dump(mode="json"):
+                raise PublicationConflict("恢复请求与原求解输入不一致")
+            con.execute(
+                "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
+                (run.status.value, run.model_dump_json(), run.id),
+            )
+        return run
+
     def complete_schedule_run(
         self, run: ScheduleRun, candidate: ScheduleCandidate
     ) -> tuple[ScheduleRun, ScheduleCandidate]:
@@ -2004,7 +2044,7 @@ class Store:
             row = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
         return ScheduleCandidate.model_validate_json(row["payload"]) if row else None
 
-    def save_decision_analysis_run(self, run: DecisionAnalysisRun) -> DecisionAnalysisRun:
+    def reserve_decision_analysis_run(self, run: DecisionAnalysisRun) -> tuple[DecisionAnalysisRun, bool]:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             existing = con.execute(
@@ -2015,7 +2055,7 @@ class Store:
                 (run.plan_version_id, run.analysis_type, run.input_hash),
             ).fetchone()
             if existing:
-                return DecisionAnalysisRun.model_validate_json(existing["payload"])
+                return DecisionAnalysisRun.model_validate_json(existing["payload"]), False
             plan = con.execute(
                 "SELECT 1 FROM plan_versions WHERE id=? AND scenario_id=?",
                 (run.plan_version_id, run.scenario_id),
@@ -2046,7 +2086,29 @@ class Store:
                     saved.created_at,
                 ),
             )
-            return saved
+            return saved, True
+
+    def finish_decision_analysis_run(self, run: DecisionAnalysisRun) -> DecisionAnalysisRun:
+        if run.status not in {"COMPLETED", "FAILED", "INTERRUPTED"}:
+            raise PublicationConflict("经营分析只能结束为完成、失败或中断")
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT payload FROM decision_analysis_runs WHERE id=? AND scenario_id=?",
+                (run.id, run.scenario_id),
+            ).fetchone()
+            if not row:
+                raise PublicationConflict("经营分析记录不存在")
+            stored = DecisionAnalysisRun.model_validate_json(row["payload"])
+            if stored.input_hash != run.input_hash or stored.plan_version_id != run.plan_version_id:
+                raise PublicationConflict("经营分析终态与预留输入不一致")
+            if stored.status != "RUNNING":
+                return stored
+            con.execute(
+                "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
+                (run.model_dump_json(), run.id),
+            )
+        return run
 
     def list_decision_analysis_runs(self, scenario_id: str, plan_version_id: str) -> list[DecisionAnalysisRun]:
         with self._connect() as con:
@@ -2086,6 +2148,22 @@ class Store:
                 raise PublicationConflict("幂等发布记录引用的方案不存在")
             plan = PlanVersion.model_validate_json(plan_row["payload"])
             return self._overlay_plan_applicability(con, plan)
+
+    def plan_for_publication_key(self, key: str) -> PlanVersion | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT plan_version_id FROM publication_keys WHERE key=?",
+                (key,),
+            ).fetchone()
+            if not row:
+                return None
+            plan_row = con.execute(
+                "SELECT payload FROM plan_versions WHERE id=?",
+                (row["plan_version_id"],),
+            ).fetchone()
+            if not plan_row:
+                raise PublicationConflict("幂等发布记录引用的方案不存在")
+            return self._overlay_plan_applicability(con, PlanVersion.model_validate_json(plan_row["payload"]))
 
     def list_plan_versions(self, scenario_id: str, include_snapshots: bool = False) -> list[PlanVersion]:
         with self._connect() as con:

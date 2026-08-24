@@ -15,13 +15,14 @@ from backend.hashing import content_hash
 from backend.models import (
     CapacityAnalysisRequest,
     CapacityReferenceMode,
+    DecisionAnalysisContext,
+    DecisionAnalysisScope,
     PlanVersion,
     RiskExecutionPolicy,
     RiskSimulationRequest,
     Skill,
-    WorkOrderStatus,
 )
-from backend.scheduler import baseline_schedule
+from backend.scheduler import baseline_schedule, calculate_kpis
 from backend.travel import EuclideanTravelTimeProvider
 from backend.verification import verify_schedule
 
@@ -111,7 +112,9 @@ assert capacity.reference_mode is CapacityReferenceMode.selected_plan_delta
 assert controlled_capacity.reference_mode is CapacityReferenceMode.controlled_reoptimization
 assert controlled_capacity.reference_solver_policy_fingerprint
 assert all(item.option_id != "add_service_depot" for item in capacity.options)
+assert all(not item.violations for item in capacity.options if item.feasible)
 assert risk.late_minutes_p50 <= risk.late_minutes_p90 <= risk.late_minutes_p95
+assert risk.full_day_total_late_minutes_p95 == risk.late_minutes_p95
 assert risk.execution_policy is RiskExecutionPolicy.follow_published_schedule
 assert risk.sla_rate_ci_low <= risk.expected_sla_on_time_rate <= risk.sla_rate_ci_high
 
@@ -123,6 +126,12 @@ delayed_order = next(
 )
 delayed_assignment.start_time = delayed_order.sla_deadline
 delayed_assignment.finish_time = delayed_assignment.start_time + delayed_order.service_duration
+delayed_assignment.sla_late_minutes = max(0, delayed_assignment.finish_time - delayed_order.sla_deadline)
+delayed_plan.selected.kpis = calculate_kpis(
+    delayed_plan.scenario_snapshot,
+    delayed_plan.selected.assignments,
+    delayed_plan.selected.unassigned,
+)
 zero_noise = {
     "seed": 7,
     "trials": 50,
@@ -134,11 +143,15 @@ zero_noise = {
 }
 follow = simulate_plan_risk(
     delayed_plan,
-    RiskSimulationRequest(**zero_noise, execution_policy=RiskExecutionPolicy.follow_published_schedule),
+    RiskSimulationRequest.model_validate(
+        {**zero_noise, "execution_policy": RiskExecutionPolicy.follow_published_schedule}
+    ),
 )
 earliest = simulate_plan_risk(
     delayed_plan,
-    RiskSimulationRequest(**zero_noise, execution_policy=RiskExecutionPolicy.earliest_feasible_execution),
+    RiskSimulationRequest.model_validate(
+        {**zero_noise, "execution_policy": RiskExecutionPolicy.earliest_feasible_execution}
+    ),
 )
 assert follow.late_minutes_p50 > earliest.late_minutes_p50
 
@@ -153,18 +166,15 @@ except DecisionAnalysisError as error:
 else:
     raise AssertionError("capacity analysis accepted a mismatched travel model")
 
-started_plan = plan.model_copy(deep=True)
-assert started_plan.scenario_snapshot is not None
-started_id = started_plan.selected.assignments[0].work_order_id
-next(
-    item for item in started_plan.scenario_snapshot.work_orders if item.id == started_id
-).status = WorkOrderStatus.started
 try:
-    cost_analysis(started_plan)
+    cost_analysis(
+        plan,
+        context=DecisionAnalysisContext(analysis_scope=DecisionAnalysisScope.remaining_forecast),
+    )
 except DecisionAnalysisError as error:
-    assert error.code == "EXECUTION_ANALYSIS_CONTEXT_REQUIRED"
+    assert error.code == "ANALYSIS_SCOPE_NOT_SUPPORTED"
 else:
-    raise AssertionError("decision analysis accepted started work without an execution context")
+    raise AssertionError("decision analysis accepted an unimplemented remaining forecast")
 
 rows.extend(
     [
