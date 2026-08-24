@@ -81,6 +81,8 @@ export type PlanVersion = {
 
 export type RollbackPreview = {
   scenario_id: string; source_version_id: string; expected_revision: number; confirmation_token: string
+  current_plan_version_id: string | null; current_plan_number: number | null
+  changed_plan_work_orders: string[]
   added_work_orders: string[]; removed_work_orders: string[]; modified_work_orders: string[]
   completed_work_orders_reopened: string[]; technician_changes: string[]; lock_changes: string[]
 }

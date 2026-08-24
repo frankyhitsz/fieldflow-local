@@ -470,6 +470,9 @@ class RollbackPreview(BaseModel):
     source_version_id: str
     expected_revision: int
     confirmation_token: str
+    current_plan_version_id: str | None = None
+    current_plan_number: int | None = None
+    changed_plan_work_orders: list[str] = Field(default_factory=list)
     added_work_orders: list[str] = Field(default_factory=list)
     removed_work_orders: list[str] = Field(default_factory=list)
     modified_work_orders: list[str] = Field(default_factory=list)

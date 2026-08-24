@@ -21,8 +21,10 @@ request
 - `D` changes when work orders, technicians, or locks change.
 - `V` changes only when a verified plan is published.
 - Each plan stores the scenario snapshot, hashes, strategy, solver status, KPI, and source plan.
+- `solver_config_hash` identifies the strategy config actually passed to the solver; the common business score is recomputed separately and never replaces that provenance.
 - Reactivating a plan requires an unchanged business snapshot and creates a new `V` without changing `D`.
 - Cloning creates an independent scenario from a historical snapshot.
+- Resetting a scenario restores its own first revision, so a clone returns to the snapshot it was created from rather than to a similarly named built-in fixture.
 - Business rollback is an explicit, previewed operation. It creates a new `D` and `V` and does not delete later history.
 
 An emergency intake commits its work order and `D` revision before replanning. If solving fails, the previous plan remains visible with `PARTIAL_NEW_DEMAND`; the work order is not rolled back.

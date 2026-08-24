@@ -40,6 +40,24 @@ test('critical navigation remains reachable at 200 percent zoom', async ({ page 
   await expect(page.getByRole('heading', { name: '方案版本' })).toBeVisible()
 })
 
+test('dispatch workspace keeps its primary regions visible at 1440 by 900', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: '工单队列' })).toBeVisible()
+  await expect(page.getByRole('img', { name: '工单位置与技师路线图' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '技师时间轴' })).toBeVisible()
+  const regions = await page.locator('.queue, .map-panel, .timeline').evaluateAll(items => items.map(item => {
+    const box = item.getBoundingClientRect()
+    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  }))
+  for (const box of regions) {
+    expect(box.left).toBeGreaterThanOrEqual(0)
+    expect(box.top).toBeGreaterThanOrEqual(0)
+    expect(box.right).toBeLessThanOrEqual(1440)
+    expect(box.bottom).toBeLessThanOrEqual(900)
+  }
+})
+
 test('changing a lock marks the displayed plan stale', async ({ page, request }) => {
   let versions = await request.get('/api/scenarios/main/plan-versions')
   let plans = await versions.json()

@@ -48,6 +48,7 @@ def normalize_schedule(
     result: ScheduleResult,
     source: ScheduleResult | None = None,
     provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
+    solver_config_hash: str | None = None,
 ) -> ScheduleResult:
     """Rebuild every assignment fact that is derived from business input or route order."""
     normalized = result.model_copy(deep=True)
@@ -148,7 +149,13 @@ def normalize_schedule(
     normalized.scenario_id = scenario.id
     normalized.scenario_revision = scenario.revision
     normalized.scenario_snapshot_hash = content_hash(scenario)
-    normalized.solver_config_hash = content_hash(scenario.solver_config)
+    # The business snapshot can use the common evaluation policy while the
+    # solver ran with a strategy-specific config. Preserve that provenance.
+    normalized.solver_config_hash = (
+        solver_config_hash
+        or normalized.solver_config_hash
+        or content_hash(scenario.solver_config)
+    )
     normalized.travel_model_version = provider.version
     normalized.metric_policy_version = METRIC_POLICY_VERSION
     normalized.business_score_policy_version = BUSINESS_SCORE_POLICY_VERSION

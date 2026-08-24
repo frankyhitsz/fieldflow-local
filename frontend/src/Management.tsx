@@ -39,15 +39,23 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, { error
 
 export function VersionsView({ scenario, plans, onOpen, onActivate, onClone, onRestore, onCompare, onRename, onReset }: { scenario: Scenario; plans: PlanVersion[]; onOpen: (plan: PlanVersion) => void; onActivate: (plan: PlanVersion) => void; onClone: (plan: PlanVersion) => void; onRestore: (plan: PlanVersion) => void; onCompare: (before: PlanVersion, after: PlanVersion) => void; onRename: (plan: PlanVersion, label: string) => void; onReset: () => void }) {
   const ordered = [...plans].reverse()
-  const [filter, setFilter] = useState('all')
+  const [actionFilter, setActionFilter] = useState('all')
+  const [strategyFilter, setStrategyFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState('all')
   const [beforeId, setBeforeId] = useState('')
   const [afterId, setAfterId] = useState('')
-  const visible = filter === 'all' ? ordered : ordered.filter(item => item.action === filter)
+  const strategies = [...new Set(plans.map(item => item.selected.strategy))]
+  const statuses = [...new Set(plans.map(item => item.selected.solver_status))]
+  const visible = ordered.filter(item =>
+    (actionFilter === 'all' || item.action === actionFilter)
+    && (strategyFilter === 'all' || item.selected.strategy === strategyFilter)
+    && (statusFilter === 'all' || item.selected.solver_status === statusFilter)
+  )
   const sourceById = new Map(plans.map(item => [item.id, item]))
   return <section className="page-view">
     <div className="page-title"><div><span className="eyebrow">PLAN HISTORY</span><h1>方案版本</h1><p>V 是方案版本，D 是该方案使用的数据修订号。</p></div><div className="page-title-actions"><span className="revision-badge">数据 D{String(scenario.revision).padStart(3, '0')}</span><button onClick={onReset}>恢复初始数据</button></div></div>
     <div className="version-tools">
-      <label>筛选<select value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部动作</option><option value="baseline">人工基线</option><option value="optimize">优化</option><option value="replan">局部重排</option><option value="activate">历史激活</option><option value="restore">业务回滚</option><option value="experiment_publish">实验发布</option></select></label>
+      <div className="version-filters"><label>动作<select aria-label="按动作筛选" value={actionFilter} onChange={event => setActionFilter(event.target.value)}><option value="all">全部动作</option><option value="baseline">人工基线</option><option value="optimize">优化</option><option value="replan">局部重排</option><option value="activate">历史激活</option><option value="restore">业务回滚</option><option value="experiment_publish">实验发布</option></select></label><label>策略<select aria-label="按策略筛选" value={strategyFilter} onChange={event => setStrategyFilter(event.target.value)}><option value="all">全部策略</option>{strategies.map(item => <option key={item} value={item}>{strategyLabel[item] || item}</option>)}</select></label><label>求解状态<select aria-label="按求解状态筛选" value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option value="all">全部状态</option>{statuses.map(item => <option key={item} value={item}>{item}</option>)}</select></label></div>
       <div className="version-compare"><span>跨版本比较</span><select aria-label="比较起点" value={beforeId} onChange={event => setBeforeId(event.target.value)}><option value="">起点版本</option>{plans.map(item => <option key={item.id} value={item.id}>V{String(item.number).padStart(3, '0')} · {item.label}</option>)}</select><span>→</span><select aria-label="比较终点" value={afterId} onChange={event => setAfterId(event.target.value)}><option value="">终点版本</option>{plans.map(item => <option key={item.id} value={item.id}>V{String(item.number).padStart(3, '0')} · {item.label}</option>)}</select><button disabled={!beforeId || !afterId || beforeId === afterId} onClick={() => { const before = plans.find(item => item.id === beforeId); const after = plans.find(item => item.id === afterId); if (before && after) onCompare(before, after) }}><BarChart3 size={15} />比较</button></div>
     </div>
     <div className="version-list">

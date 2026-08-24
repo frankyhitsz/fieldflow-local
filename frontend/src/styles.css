@@ -203,6 +203,7 @@ nav { display: grid; gap: 5px; }
 
 /* Public plan history: the V stamp is the single strong visual signature. */
 .version-tools { margin-bottom: 12px; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--line); background: rgba(251,251,247,.68); }
+.version-filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .version-tools label { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: var(--text-sm); }
 .version-tools select { min-width: 132px; border: 1px solid var(--line); background: var(--white); padding: 6px 28px 6px 9px; color: var(--ink); }
 .version-compare { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: var(--text-sm); }
@@ -273,6 +274,14 @@ nav { display: grid; gap: 5px; }
 .candidate-errors { margin: 0 0 12px; padding: 9px 12px; border-left: 2px solid var(--cinnabar); background: #f7e9e4; color: #713e33; }
 .candidate-errors p { margin: 3px 0; font-size: var(--text-sm); }
 
+@media (max-width: 1360px) {
+  .version-tools { align-items: flex-start; flex-direction: column; }
+  .version-compare { width: 100%; flex-wrap: wrap; }
+  .version-row { grid-template-columns: 86px minmax(160px,.8fr) minmax(280px,1.3fr); }
+  .version-state { grid-column: 2; }
+  .version-actions { grid-column: 3; grid-row: 2; }
+}
+
 @media (max-width: 1180px) {
   .app-shell { grid-template-columns: 185px minmax(0, 1fr); }
   .main-content { padding-inline: 18px; }
@@ -281,11 +290,6 @@ nav { display: grid; gap: 5px; }
   .timeline { grid-column: 2; }
   .map-panel { grid-column: 2; }
   .command-context { display: none; }
-  .version-tools { align-items: flex-start; flex-direction: column; }
-  .version-compare { width: 100%; flex-wrap: wrap; }
-  .version-row { grid-template-columns: 86px minmax(160px,.8fr) minmax(280px,1.3fr); }
-  .version-state { grid-column: 2; }
-  .version-actions { grid-column: 3; grid-row: 2; }
   .profile-grid { grid-template-columns: repeat(2,minmax(220px,1fr)); }
 }
 

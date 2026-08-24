@@ -53,7 +53,12 @@ export const api = {
     request<Scenario>(`/api/scenarios/${scenarioId}/lock`, {
       method: 'POST', body: JSON.stringify({ work_order_id: orderId, technician_id: technicianId, locked }),
     }),
-  comparison: (id: string, before?: string, after?: string) => request<Comparison>(`/api/scenarios/${id}/comparison${before && after ? `?before=${encodeURIComponent(before)}&after=${encodeURIComponent(after)}` : ''}`),
+  comparison: (id: string, before?: string, after?: string) => {
+    const query = new URLSearchParams()
+    if (before) query.set('before', before)
+    if (after) query.set('after', after)
+    return request<Comparison>(`/api/scenarios/${id}/comparison${query.size ? `?${query}` : ''}`)
+  },
   strategyProfiles: () => request<StrategyProfile[]>('/api/strategy-profiles'),
   createStrategyProfile: (profile: { name: string; description: string; weights: StrategyWeights; time_limit_seconds: number }) => request<StrategyProfile>('/api/strategy-profiles', { method: 'POST', body: JSON.stringify(profile) }),
   updateStrategyProfile: (id: string, profile: { name: string; description: string; weights: StrategyWeights; time_limit_seconds: number }) => request<StrategyProfile>(`/api/strategy-profiles/${id}`, { method: 'PUT', body: JSON.stringify(profile) }),

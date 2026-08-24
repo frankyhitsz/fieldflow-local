@@ -445,7 +445,7 @@ export default function App() {
         <label className="replan-time">重排时点<span>{hhmm(replanTime)}</span><input aria-label="重排时点（当日起分钟数）" type="number" min="0" max="1800" step="5" value={replanTime} onChange={event => setReplanTime(Number(event.target.value))} /></label>
         <button onClick={runReplan} disabled={!!working || !schedule}><TimerReset size={15} />局部重排</button>
         <span className="divider" />
-        <button onClick={async () => { setWorking('正在对比方案'); try { setComparison(await api.comparison(scenario.id)) } catch (e) { setToast(e instanceof Error ? e.message : '无法比较') } finally { setWorking(undefined) } }} disabled={!!working || !schedule || !baseline}><BarChart3 size={15} />方案比较</button>
+        <button onClick={async () => { const shownPlan = plans.find(item => item.selected.id === schedule?.id); setWorking('正在对比方案'); try { setComparison(await api.comparison(scenario.id, undefined, shownPlan?.id)) } catch (e) { setToast(e instanceof Error ? e.message : '无法比较') } finally { setWorking(undefined) } }} disabled={!!working || !schedule || !baseline || schedule.id === baseline.id}><BarChart3 size={15} />方案比较</button>
       </div>
       {working && <div className="working"><RefreshCw size={14} />{working}</div>}
     </section>
@@ -490,7 +490,8 @@ export default function App() {
           if (preview.removed_work_orders.length) throw new Error(`默认禁止删除历史版本之后新增的工单：${preview.removed_work_orders.join('、')}`)
           const reason = window.prompt('请填写业务回滚原因')?.trim()
           if (!reason) return
-          const message = `将业务数据回滚到 V${String(item.number).padStart(3, '0')} 的快照。\n\n新增 ${preview.added_work_orders.length} 个、删除 ${preview.removed_work_orders.length} 个、修改 ${preview.modified_work_orders.length} 个工单；技师变化 ${preview.technician_changes.length} 项，锁定变化 ${preview.lock_changes.length} 项。\n\n这不是普通的计划切换。操作会创建新的 D 和 V，现有历史不会删除。`
+          const currentPlan = preview.current_plan_number == null ? '当前没有可执行方案' : `当前 V${String(preview.current_plan_number).padStart(3, '0')}`
+          const message = `将业务数据回滚到 V${String(item.number).padStart(3, '0')} 的快照。\n\n工单：新增 ${preview.added_work_orders.length} 个、删除 ${preview.removed_work_orders.length} 个、修改 ${preview.modified_work_orders.length} 个；技师变化 ${preview.technician_changes.length} 项；锁定变化 ${preview.lock_changes.length} 项。\n${currentPlan} 切换后将有 ${preview.changed_plan_work_orders.length} 个工单的安排发生变化。\n\n这不是普通的计划切换。操作会创建新的 D 和 V，现有历史不会删除。`
           if (!window.confirm(message)) return
           const restored = await api.rollbackPlanVersion(scenario.id, item.id, scenario.revision, preview.confirmation_token, reason, commandKey('rollback'))
           if (activeScenarioId.current !== scenario.id) return

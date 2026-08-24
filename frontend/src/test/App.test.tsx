@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import App from '../App'
-import { WorkOrderEditor } from '../Management'
+import { VersionsView, WorkOrderEditor } from '../Management'
 import type { PlanVersion, Scenario, Schedule, StrategyProfile } from '../types'
 
 const scenario: Scenario = {
@@ -10,6 +10,7 @@ const scenario: Scenario = {
   technicians: [{ id: 'TECH-01', name: '林乔', skills: ['electrical'], shift_start: 480, shift_end: 1020, start_location: { x: 48, y: 52 }, overtime_limit: 60, cost_per_minute: 1, color: '#315c4b' }],
   work_orders: [{ id: 'WO-1', customer_name: '测试客户', title: '线路检修', required_skills: ['electrical'], location: { x: 55, y: 60 }, service_duration: 30, window_start: 540, window_end: 660, sla_deadline: 630, priority: 'normal', drop_penalty: 2500, status: 'pending', vip: false, is_emergency: false, reported_at: null, note: '' }],
 }
+const mediumScenario: Scenario = { ...scenario, id: 'strategy-medium', name: '策略中型数据' }
 
 const schedule: Schedule = {
   id: 'SCH-1', scenario_id: 'main', kind: 'optimized', version: 2, created_at: '2026-08-23T10:00:00Z', solver_status: 'FEASIBLE', runtime_ms: 72, objective: 100,
@@ -43,6 +44,7 @@ function mockApi() {
     const url = String(input)
     const body = url.endsWith('/api/scenarios') ? [scenario]
       : url.endsWith('/api/strategy-profiles') ? profiles
+      : url.endsWith('/api/scenarios/strategy-medium') ? mediumScenario
       : url.endsWith('/plan-versions') ? [plan]
       : url.includes('/plan-versions/') ? plan
       : url.endsWith('/schedules') ? [schedule]
@@ -62,6 +64,7 @@ describe('FieldFlow navigation and render safety', () => {
     expect(screen.getByRole('heading', { name: '技师与技能' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '策略实验室' }))
     expect(screen.getByRole('heading', { name: '策略实验室' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '策略中型数据' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
     expect(screen.getByRole('heading', { name: '运营复盘' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '今日调度' }))
@@ -89,5 +92,33 @@ describe('FieldFlow navigation and render safety', () => {
     expect(screen.getByRole('combobox', { name: '时间窗结束日期' })).toHaveValue('1')
     expect(screen.getByLabelText('时间窗结束', { selector: 'input' })).toHaveValue('01:00')
     expect(screen.getByLabelText('SLA 截止', { selector: 'input' })).toHaveValue('01:30')
+  })
+
+  it('filters plan history by action, strategy, and solver status', () => {
+    const baselinePlan: PlanVersion = {
+      ...plan, id: 'PV-BASE', number: 1, action: 'baseline', label: '人工基线', active: false,
+      selected: { ...schedule, id: 'SCH-BASE', kind: 'baseline', version: 1, strategy: 'baseline', solver_status: 'OPTIMAL' },
+    }
+    const optimizedPlan: PlanVersion = { ...plan, id: 'PV-OPT', number: 2 }
+    const callbacks = {
+      onOpen: () => undefined, onActivate: () => undefined, onClone: () => undefined,
+      onRestore: () => undefined, onCompare: () => undefined, onRename: () => undefined,
+      onReset: () => undefined,
+    }
+    render(<VersionsView scenario={scenario} plans={[baselinePlan, optimizedPlan]} {...callbacks} />)
+    expect(screen.getByRole('button', { name: '打开 V001' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开 V002' })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('按策略筛选'), { target: { value: 'baseline' } })
+    expect(screen.getByRole('button', { name: '打开 V001' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '打开 V002' })).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('按策略筛选'), { target: { value: 'all' } })
+    fireEvent.change(screen.getByLabelText('按求解状态筛选'), { target: { value: 'FEASIBLE' } })
+    expect(screen.queryByRole('button', { name: '打开 V001' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开 V002' })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('按动作筛选'), { target: { value: 'baseline' } })
+    expect(screen.getByText('当前筛选下没有方案。生成基线、优化或发布实验候选后会从 V001 开始记录。')).toBeInTheDocument()
   })
 })

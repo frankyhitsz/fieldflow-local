@@ -95,6 +95,24 @@ def test_strategy_fixture_exposes_visible_business_tradeoffs():
     assert results["fair_workload"].kpis.normalized_workload_range <= results["balanced"].kpis.normalized_workload_range
 
 
+def test_stress_fixture_returns_a_verified_solution_within_its_limit():
+    scenario = get_fixture("strategy-stress")
+    profile = next(item for item in BUILTIN_PROFILES if item.id == "balanced")
+    effective = scenario_for_profile(scenario, profile)
+    baseline = baseline_schedule(effective, 0, profile.id)
+    result = optimized_schedule(
+        effective,
+        0,
+        baseline,
+        time_limit_seconds=1,
+        strategy=profile.id,
+    )
+    assert result.solver_status.value in {"OPTIMAL", "FEASIBLE", "TIME_LIMIT_FEASIBLE"}
+    assert result.solution_found is True
+    assert result.requested_time_limit_ms == 1000
+    assert validate_schedule(effective, result) == []
+
+
 def test_optimizer_allows_waits_longer_than_six_hours_and_records_real_arrival():
     scenario = get_fixture("main")
     scenario.work_orders = [WorkOrder(

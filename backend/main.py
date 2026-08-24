@@ -233,6 +233,7 @@ def prepare_replan_run(
         source=source,
         requested_time_limit_seconds=profile.time_limit_seconds,
         planning_context=planning_context,
+        solver_config_hash=content_hash(effective.solver_config),
     )
     return (
         previous,
@@ -254,6 +255,7 @@ def start_schedule_run(
     requested_time_limit_seconds: float = 0,
     solver_name: str = "ortools-routing",
     planning_context: PlanningContext | None = None,
+    solver_config_hash: str | None = None,
 ) -> ScheduleRun:
     requested_ms = int(round(requested_time_limit_seconds * 1000))
     run = ScheduleRun(
@@ -266,7 +268,7 @@ def start_schedule_run(
         source_plan_snapshot_hash=source.scenario_snapshot_hash if source else None,
         solver_name=solver_name,
         solver_version="pending",
-        solver_config_hash=content_hash(scenario.solver_config),
+        solver_config_hash=solver_config_hash or content_hash(scenario.solver_config),
         requested_time_limit_ms=requested_ms,
         effective_time_limit_ms=requested_ms,
         status=ScheduleRunStatus.running,
@@ -438,11 +440,10 @@ def create_scenario(request: ScenarioCreate) -> ScheduleScenario:
 @router.post("/api/scenarios/{scenario_id}/reset", response_model=ScheduleScenario)
 def reset_scenario(scenario_id: str) -> ScheduleScenario:
     current = require_scenario(scenario_id)
-    fixture_id = current.source_scenario_id or scenario_id
-    try:
-        fresh = get_fixture(fixture_id)
-    except KeyError as error:
-        raise HTTPException(409, "该自定义场景没有可恢复的初始模板") from error
+    revisions = require_store().list_revisions(scenario_id)
+    if not revisions:
+        raise HTTPException(409, "该场景没有可恢复的初始业务数据")
+    fresh = revisions[0].scenario.model_copy(deep=True)
     fresh.id = current.id
     fresh.name = current.name
     fresh.source_scenario_id = current.source_scenario_id
@@ -649,21 +650,36 @@ def run_optimize(
     effective = scenario_for_profile(scenario, profile)
     strategy_key = profile.id if profile.builtin else "custom"
     source = require_store().active_plan_version(scenario_id) or require_store().latest_plan_version(scenario_id)
-    run = start_schedule_run(scenario, "optimize", source=source, requested_time_limit_seconds=profile.time_limit_seconds)
+    run = start_schedule_run(
+        scenario,
+        "optimize",
+        source=source,
+        requested_time_limit_seconds=profile.time_limit_seconds,
+        solver_config_hash=content_hash(effective.solver_config),
+    )
     try:
-        baseline = baseline_schedule(
+        solver_baseline = baseline_schedule(
             effective, 0, strategy_key, provider=require_store().travel_provider
         )
         result = optimized_schedule(
             effective,
             0,
-            previous=baseline,
+            previous=solver_baseline,
             time_limit_seconds=profile.time_limit_seconds,
             strategy=strategy_key,
             provider=require_store().travel_provider,
         )
+        baseline = normalize_schedule(
+            scenario,
+            solver_baseline,
+            provider=require_store().travel_provider,
+            solver_config_hash=content_hash(effective.solver_config),
+        )
         result = normalize_schedule(
-            scenario, result, provider=require_store().travel_provider
+            scenario,
+            result,
+            provider=require_store().travel_provider,
+            solver_config_hash=content_hash(effective.solver_config),
         )
     except Exception as error:
         fail_schedule_run(run, f"{type(error).__name__}: {error}")
@@ -805,6 +821,7 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
             result,
             previous,
             provider=require_store().travel_provider,
+            solver_config_hash=content_hash(effective.solver_config),
         )
     except Exception as error:
         fail_schedule_run(run, f"{type(error).__name__}: {error}")
@@ -902,9 +919,38 @@ def rename_plan_version(scenario_id: str, version_id: str, request: PlanVersionP
     return plan
 
 
+def schedule_change_rows(
+    before: ScheduleResult,
+    after: ScheduleResult,
+) -> list[dict[str, str | int | None]]:
+    before_by_id = {item.work_order_id: item for item in before.assignments}
+    after_by_id = {item.work_order_id: item for item in after.assignments}
+    changed: list[dict[str, str | int | None]] = []
+    for order_id in sorted(set(before_by_id) | set(after_by_id)):
+        old = before_by_id.get(order_id)
+        new = after_by_id.get(order_id)
+        if (
+            not old
+            or not new
+            or old.technician_id != new.technician_id
+            or old.sequence != new.sequence
+            or old.start_time != new.start_time
+        ):
+            changed.append({
+                "work_order_id": order_id,
+                "before_technician": old.technician_id if old else None,
+                "after_technician": new.technician_id if new else None,
+                "before_start": old.start_time if old else None,
+                "after_start": new.start_time if new else None,
+                "reason": "技师、顺序或到场时间发生变化" if old and new else "工单进入或离开可执行计划",
+            })
+    return changed
+
+
 def build_rollback_preview(
     current: ScheduleScenario,
     source: PlanVersion,
+    current_plan: PlanVersion | None = None,
 ) -> RollbackPreview:
     assert source.scenario_snapshot is not None
     target = source.scenario_snapshot
@@ -943,12 +989,19 @@ def build_rollback_preview(
         "current_hash": content_hash(current),
         "source_version_id": source.id,
         "source_hash": source.scenario_snapshot_hash or content_hash(target),
+        "current_plan_version_id": current_plan.id if current_plan else None,
     })
     return RollbackPreview(
         scenario_id=current.id,
         source_version_id=source.id,
         expected_revision=current.revision,
         confirmation_token=token,
+        current_plan_version_id=current_plan.id if current_plan else None,
+        current_plan_number=current_plan.number if current_plan else None,
+        changed_plan_work_orders=[
+            str(item["work_order_id"])
+            for item in schedule_change_rows(current_plan.selected, source.selected)
+        ] if current_plan else [],
         added_work_orders=added,
         removed_work_orders=removed,
         modified_work_orders=modified,
@@ -973,7 +1026,9 @@ def activate_plan_version(
     current_fingerprint = content_hash(current.model_dump(exclude={"revision"}))
     source_fingerprint = content_hash(source.scenario_snapshot.model_dump(exclude={"revision"}))
     if current_fingerprint != source_fingerprint:
-        preview = build_rollback_preview(current, source)
+        store = require_store()
+        current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
+        preview = build_rollback_preview(current, source, current_plan)
         raise HTTPException(409, detail={
             "message": "历史计划使用的业务数据与当前场景不同，不能直接激活",
             "added_work_orders": preview.added_work_orders,
@@ -1046,10 +1101,12 @@ def clone_plan_scenario(
 @router.get("/api/scenarios/{scenario_id}/plan-versions/{version_id}/rollback-preview", response_model=RollbackPreview)
 def rollback_plan_preview(scenario_id: str, version_id: str) -> RollbackPreview:
     current = require_scenario(scenario_id)
-    source = require_store().get_plan_version(scenario_id, version_id)
+    store = require_store()
+    source = store.get_plan_version(scenario_id, version_id)
     if not source or not source.scenario_snapshot:
         raise HTTPException(404, "方案版本或业务快照不存在")
-    return build_rollback_preview(current, source)
+    current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
+    return build_rollback_preview(current, source, current_plan)
 
 
 @router.post("/api/scenarios/{scenario_id}/plan-versions/{version_id}/restore", response_model=PlanVersion)
@@ -1073,7 +1130,9 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         return existing
     if current.revision != request.expected_revision:
         raise HTTPException(409, detail={"message": "业务数据已变化，请刷新后重新确认恢复", "expected_revision": request.expected_revision, "current_revision": current.revision})
-    preview = build_rollback_preview(current, source)
+    store = require_store()
+    current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
+    preview = build_rollback_preview(current, source, current_plan)
     if request.confirmation_token != preview.confirmation_token:
         raise HTTPException(409, "回滚确认已过期，请重新查看差异")
     if preview.completed_work_orders_reopened and not request.allow_reopen_completed:
@@ -1146,14 +1205,7 @@ def build_comparison(
     before_snapshot: ScheduleScenario | None = None,
     after_snapshot: ScheduleScenario | None = None,
 ) -> Comparison:
-    before_by_id = {item.work_order_id: item for item in before.assignments}
-    after_by_id = {item.work_order_id: item for item in after.assignments}
-    changed = []
-    for order_id in sorted(set(before_by_id) | set(after_by_id)):
-        old = before_by_id.get(order_id)
-        new = after_by_id.get(order_id)
-        if not old or not new or old.technician_id != new.technician_id or old.sequence != new.sequence or old.start_time != new.start_time:
-            changed.append({"work_order_id": order_id, "before_technician": old.technician_id if old else None, "after_technician": new.technician_id if new else None, "before_start": old.start_time if old else None, "after_start": new.start_time if new else None, "reason": "技师、顺序或到场时间发生变化" if old and new else "工单进入或离开可执行计划"})
+    changed = schedule_change_rows(before, after)
     before_orders = {item.id: item for item in before_snapshot.work_orders} if before_snapshot else {}
     after_orders = {item.id: item for item in after_snapshot.work_orders} if after_snapshot else {}
     added = sorted(set(after_orders) - set(before_orders))
@@ -1200,22 +1252,55 @@ def build_comparison(
 @router.get("/api/scenarios/{scenario_id}/comparison", response_model=Comparison)
 def comparison(scenario_id: str, before: str | None = None, after: str | None = None) -> Comparison:
     require_scenario(scenario_id)
-    if before and after:
-        before_plan = require_store().get_plan_version(scenario_id, before)
-        after_plan = require_store().get_plan_version(scenario_id, after)
-        if not before_plan or not after_plan:
-            raise HTTPException(404, "用于比较的方案版本不存在")
+    store = require_store()
+    if before and not after:
+        raise HTTPException(422, "指定比较起点时也必须指定终点")
+    if after:
+        after_plan = store.get_plan_version(scenario_id, after)
+        before_plan = store.get_plan_version(scenario_id, before) if before else None
+        if before and not before_plan:
+            raise HTTPException(404, "用于比较的起点方案版本不存在")
+        if not after_plan:
+            raise HTTPException(404, "用于比较的终点方案版本不存在")
+        if before_plan:
+            return build_comparison(
+                scenario_id,
+                before_plan.selected,
+                after_plan.selected,
+                before_plan.scenario_snapshot,
+                after_plan.scenario_snapshot,
+            )
+        internal_baseline = next(
+            (item.schedule for item in after_plan.artifacts if item.role == "baseline"),
+            None,
+        )
+        baseline_plan = next(
+            (
+                item
+                for item in reversed(store.list_plan_versions(scenario_id, include_snapshots=True))
+                if item.action == "baseline"
+                and item.number < after_plan.number
+                and item.data_revision == after_plan.data_revision
+            ),
+            None,
+        )
+        before_result = internal_baseline or (baseline_plan.selected if baseline_plan else None)
+        if not before_result:
+            raise HTTPException(409, "指定方案没有可比较的基线")
         return build_comparison(
             scenario_id,
-            before_plan.selected,
+            before_result,
             after_plan.selected,
-            before_plan.scenario_snapshot,
+            after_plan.scenario_snapshot,
             after_plan.scenario_snapshot,
         )
-    plans = require_store().list_plan_versions(scenario_id, include_snapshots=True)
+    plans = store.list_plan_versions(scenario_id, include_snapshots=True)
     if not plans:
         raise HTTPException(409, "请先生成至少一个方案")
-    after_plan = next((item for item in reversed(plans) if item.action != "baseline"), plans[-1])
+    after_plan = store.active_plan_version(scenario_id) or next(
+        (item for item in reversed(plans) if item.action != "baseline"),
+        plans[-1],
+    )
     internal_baseline = next((item.schedule for item in after_plan.artifacts if item.role == "baseline"), None)
     before_result = internal_baseline or next((item.selected for item in reversed(plans) if item.action == "baseline" and item.number < after_plan.number), None)
     if not before_result:
@@ -1338,7 +1423,12 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                 profile.time_limit_seconds = override_limit
             effective = scenario_for_profile(scenario, profile)
             strategy_key = profile.id if profile.builtin else "custom"
-            run = start_schedule_run(scenario, "experiment", requested_time_limit_seconds=profile.time_limit_seconds)
+            run = start_schedule_run(
+                scenario,
+                "experiment",
+                requested_time_limit_seconds=profile.time_limit_seconds,
+                solver_config_hash=content_hash(effective.solver_config),
+            )
             try:
                 baseline = baseline_schedule(
                     effective,
@@ -1355,7 +1445,10 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                     provider=require_store().travel_provider,
                 )
                 result = normalize_schedule(
-                    scenario, result, provider=require_store().travel_provider
+                    scenario,
+                    result,
+                    provider=require_store().travel_provider,
+                    solver_config_hash=content_hash(effective.solver_config),
                 )
                 verification = verify_schedule(
                     scenario, result, provider=require_store().travel_provider

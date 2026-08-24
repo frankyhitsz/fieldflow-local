@@ -63,6 +63,23 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         baseline = client.post("/api/scenarios/main/baseline").json()
         optimized = client.post("/api/scenarios/main/optimize", json={"strategy": "low_travel", "time_limit_seconds": 1}).json()
         assert (baseline["version"], optimized["version"]) == (1, 2)
+        low_travel_profile = next(
+            item for item in main_module.require_store().list_profiles() if item.id == "low_travel"
+        )
+        low_travel_profile.time_limit_seconds = 1
+        expected_solver_hash = content_hash(
+            main_module.scenario_for_profile(get_fixture("main"), low_travel_profile).solver_config
+        )
+        assert optimized["solver_config_hash"] == expected_solver_hash
+        assert optimized["solver_config_hash"] != content_hash(get_fixture("main").solver_config)
+        optimized_plan = client.get(
+            "/api/scenarios/main/plan-versions/V002"
+        ).json()
+        internal_baseline = next(
+            item["schedule"] for item in optimized_plan["artifacts"] if item["role"] == "baseline"
+        )
+        assert internal_baseline["solver_config_hash"] == expected_solver_hash
+        assert internal_baseline["scenario_snapshot_hash"] == optimized["scenario_snapshot_hash"]
 
         edited = client.put("/api/scenarios/main/work-orders/WO-1021", json={"title": "临时修改"}).json()
         assert edited["revision"] == 1
@@ -71,6 +88,9 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         preview = client.get(
             f"/api/scenarios/main/plan-versions/{plans[0]['id']}/rollback-preview"
         ).json()
+        assert preview["current_plan_version_id"] == plans[1]["id"]
+        assert preview["current_plan_number"] == 2
+        assert isinstance(preview["changed_plan_work_orders"], list)
         restored_response = client.post(
             f"/api/scenarios/main/plan-versions/{plans[0]['id']}/restore",
             json={
@@ -85,6 +105,9 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         assert restored["number"] == 3
         assert restored["action"] == "restore"
         assert restored["source_version_id"] == plans[0]["id"]
+        assert restored["selected"]["assignments"] == baseline["assignments"]
+        assert restored["selected"]["unassigned"] == baseline["unassigned"]
+        assert restored["selected"]["kpis"] == baseline["kpis"]
         scenario = client.get("/api/scenarios/main").json()
         assert scenario["revision"] == 2
         assert next(item for item in scenario["work_orders"] if item["id"] == "WO-1021")["title"] != "临时修改"
@@ -107,6 +130,11 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         assert renamed.status_code == 200
         assert renamed.json()["label"] == "午前恢复方案"
         assert client.get(f"/api/scenarios/main/comparison?before={plans[0]['id']}&after={plans[1]['id']}").status_code == 200
+        selected_comparison = client.get(
+            f"/api/scenarios/main/comparison?after={plans[1]['id']}"
+        )
+        assert selected_comparison.status_code == 200
+        assert selected_comparison.json()["after"]["id"] == optimized["id"]
         assert client.get(f"/api/scenarios/main/plan-versions/{restored['id']}/report").status_code == 200
 
         profiles = client.get("/api/strategy-profiles").json()
@@ -344,6 +372,9 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
         client.post("/api/scenarios/main/optimize", json={"time_limit_seconds": 1})
         plans = client.get("/api/scenarios/main/plan-versions").json()
         source = plans[0]
+        stale_preview = client.get(
+            f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview"
+        ).json()
         activated = client.post(
             f"/api/scenarios/main/plan-versions/{source['id']}/activate",
             json={"expected_revision": 0, "idempotency_key": "activate-history-001"},
@@ -359,6 +390,20 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
         assert repeated.status_code == 200
         assert repeated.json()["id"] == activated.json()["id"]
         assert client.get("/api/scenarios/main").json()["revision"] == 0
+        expired_rollback = client.post(
+            f"/api/scenarios/main/plan-versions/{source['id']}/restore",
+            json={
+                "expected_revision": 0,
+                "confirmation_token": stale_preview["confirmation_token"],
+                "reason": "使用已过期预览",
+                "idempotency_key": "expired-preview-001",
+            },
+        )
+        assert expired_rollback.status_code == 409
+        assert "重新查看差异" in str(expired_rollback.json()["detail"])
+        assert [
+            item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()
+        ] == [1, 2, 3]
 
         clone_request = {"name": "V001 独立副本", "idempotency_key": "clone-history-001"}
         clone = client.post(
@@ -384,6 +429,43 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
         assert next(
             item for item in client.get("/api/scenarios/main").json()["work_orders"] if item["id"] == "WO-1021"
         )["note"] == "实时变更"
+
+
+def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "clone-reset.db"))
+    import backend.main as main_module
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        source_note = "克隆时保留的业务输入"
+        assert client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            json={"note": source_note},
+        ).status_code == 200
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        source = client.get("/api/scenarios/main/plan-versions").json()[0]
+        clone = client.post(
+            f"/api/scenarios/main/plan-versions/{source['id']}/clone-scenario",
+            json={
+                "name": "历史快照副本",
+                "idempotency_key": "clone-reset-source-001",
+            },
+        ).json()
+        clone_id = clone["id"]
+        assert next(
+            item for item in clone["work_orders"] if item["id"] == "WO-1021"
+        )["note"] == source_note
+
+        edited = client.put(
+            f"/api/scenarios/{clone_id}/work-orders/WO-1021",
+            json={"note": "副本中的临时修改"},
+        )
+        assert edited.status_code == 200
+        reset = client.post(f"/api/scenarios/{clone_id}/reset")
+        assert reset.status_code == 200
+        assert reset.json()["revision"] == 2
+        assert next(
+            item for item in reset.json()["work_orders"] if item["id"] == "WO-1021"
+        )["note"] == source_note
 
 
 def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(monkeypatch, tmp_path):
