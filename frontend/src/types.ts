@@ -12,7 +12,7 @@ export type WorkOrder = {
 }
 export type ExecutionEvent = {
   id: string; scenario_id: string; work_order_id: string; technician_id: string
-  action: 'start' | 'complete'; occurred_at: number; scenario_revision: number
+  action: 'start' | 'complete'; sequence: number; occurred_at: number; scenario_revision: number
   plan_version_id: string; idempotency_key: string; created_at: string
 }
 export type ExecutionResult = { scenario: Scenario; event: ExecutionEvent }
@@ -61,6 +61,7 @@ export type Schedule = {
   solver_status_code: number | null; termination_reason: string | null; solution_found: boolean
   solver_objective_value: number | null; business_score: number | null
   business_score_policy_version: string; scenario_snapshot_hash: string; solver_config_hash: string
+  solver_policy: { policy_version: string; profile_id: string | null; profile_name: string; profile_snapshot: Record<string, unknown>; solver_config: Record<string, unknown>; unassigned_penalty_scale: number | null; effective_drop_penalties: Record<string, number>; time_limit_ms: number; solution_limit: number | null; first_solution_strategy: string | null; local_search_metaheuristic: string | null; fingerprint: string } | null
   travel_model_version: string; travel_model_fingerprint: string; metric_policy_version: string; solver_name: string; solver_version: string
 }
 export type Comparison = {

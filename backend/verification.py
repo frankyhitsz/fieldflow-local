@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from .hashing import content_hash
 from .models import (
     CoverageSummary,
+    ExecutionSourceContext,
     PlanningContext,
     ScheduleAssignment,
     ScheduleResult,
@@ -35,12 +36,15 @@ def verify_schedule(
     source: ScheduleResult | None = None,
     planning_context: PlanningContext | None = None,
     provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
+    execution_context: ExecutionSourceContext | None = None,
 ) -> ScheduleVerificationReport:
     errors: list[VerificationIssue] = []
     warnings: list[VerificationIssue] = []
 
     def error(code: str, message: str, work_order_id: str | None = None, technician_id: str | None = None) -> None:
-        errors.append(VerificationIssue(code=code, message=message, work_order_id=work_order_id, technician_id=technician_id))
+        errors.append(
+            VerificationIssue(code=code, message=message, work_order_id=work_order_id, technician_id=technician_id)
+        )
 
     orders = {item.id: item for item in scenario.work_orders}
     technicians = {item.id: item for item in scenario.technicians}
@@ -84,28 +88,237 @@ def verify_schedule(
     if result.scenario_id != scenario.id:
         error("SCENARIO_ID_MISMATCH", f"candidate scenario {result.scenario_id} does not match {scenario.id}")
     if result.scenario_revision != scenario.revision:
-        error("SCENARIO_REVISION_MISMATCH", f"candidate D{result.scenario_revision:03d} does not match current D{scenario.revision:03d}")
+        error(
+            "SCENARIO_REVISION_MISMATCH",
+            f"candidate D{result.scenario_revision:03d} does not match current D{scenario.revision:03d}",
+        )
     expected_snapshot_hash = content_hash(scenario)
     if result.scenario_snapshot_hash != expected_snapshot_hash:
         error("SCENARIO_HASH_MISMATCH", "candidate scenario snapshot hash does not match current data")
     if result.solver_status not in PUBLISHABLE_STATUSES or not result.solution_found:
         error("SOLVER_STATUS_NOT_PUBLISHABLE", f"solver status {result.solver_status.value} cannot be published")
     if result.travel_model_version != provider.version:
-        error("TRAVEL_MODEL_MISMATCH", f"candidate travel model {result.travel_model_version} does not match {provider.version}")
+        error(
+            "TRAVEL_MODEL_MISMATCH",
+            f"candidate travel model {result.travel_model_version} does not match {provider.version}",
+        )
     if result.travel_model_fingerprint != provider.fingerprint:
-        error("TRAVEL_MODEL_FINGERPRINT_MISMATCH", "candidate travel model fingerprint does not match current configuration")
+        error(
+            "TRAVEL_MODEL_FINGERPRINT_MISMATCH",
+            "candidate travel model fingerprint does not match current configuration",
+        )
+    if result.solver_policy is None:
+        error("SOLVER_POLICY_MISSING", "candidate does not include the effective solver policy")
+    elif result.solver_policy.fingerprint != content_hash(
+        result.solver_policy.model_dump(exclude={"fingerprint"}, mode="json")
+    ):
+        error("SOLVER_POLICY_FINGERPRINT_MISMATCH", "candidate solver policy fingerprint is invalid")
 
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     for work_order_id, technician_id in locked.items():
         if work_order_id not in orders:
-            error("LOCKED_WORK_ORDER_MISSING", f"{work_order_id}: locked work order does not exist", work_order_id, technician_id)
+            error(
+                "LOCKED_WORK_ORDER_MISSING",
+                f"{work_order_id}: locked work order does not exist",
+                work_order_id,
+                technician_id,
+            )
         elif work_order_id in unassigned_ids:
-            error("LOCKED_WORK_ORDER_UNASSIGNED", f"{work_order_id}: locked work order cannot be unassigned", work_order_id, technician_id)
+            error(
+                "LOCKED_WORK_ORDER_UNASSIGNED",
+                f"{work_order_id}: locked work order cannot be unassigned",
+                work_order_id,
+                technician_id,
+            )
         elif orders[work_order_id].status.value != "completed" and work_order_id not in assignment_ids:
-            error("LOCKED_WORK_ORDER_MISSING", f"{work_order_id}: locked work order is missing from assignments", work_order_id, technician_id)
+            error(
+                "LOCKED_WORK_ORDER_MISSING",
+                f"{work_order_id}: locked work order is missing from assignments",
+                work_order_id,
+                technician_id,
+            )
     for order in scenario.work_orders:
         if order.status.value == "started" and order.id not in assignment_ids:
             error("STARTED_WORK_ORDER_UNASSIGNED", f"{order.id}: started work order must remain assigned", order.id)
+
+    started_ids = {order.id for order in scenario.work_orders if order.status.value == "started"}
+    provided_execution = planning_context.execution_source_context if planning_context else None
+    if planning_context is not None:
+        frozen_ids_all = {item.work_order_id for item in planning_context.frozen_assignments}
+        extra_frozen = sorted(frozen_ids_all - started_ids)
+        for work_order_id in extra_frozen:
+            error(
+                "FROZEN_CONTEXT_EXTRA_ITEM",
+                f"{work_order_id}: only started work may be frozen in a future plan",
+                work_order_id,
+            )
+        for assignment in result.assignments:
+            order = orders.get(assignment.work_order_id)
+            if (
+                order is not None
+                and order.status.value == "pending"
+                and assignment.start_time < planning_context.planning_time
+            ):
+                error(
+                    "BEFORE_REPLAN_CUTOFF",
+                    f"{assignment.work_order_id}: pending work starts before replan cutoff",
+                    assignment.work_order_id,
+                    assignment.technician_id,
+                )
+        if execution_context is not None:
+            if provided_execution is None and execution_context.execution_event_sequence > 0:
+                error("EXECUTION_CONTEXT_REQUIRED", "replan after execution events requires execution source context")
+            elif provided_execution is not None and (
+                provided_execution.execution_event_sequence != execution_context.execution_event_sequence
+            ):
+                error(
+                    "EXECUTION_WATERMARK_MISMATCH", "execution events changed after the candidate context was created"
+                )
+    if started_ids:
+        if execution_context is None or not execution_context.active_plan_version_id:
+            error("ACTIVE_EXECUTION_PLAN_MISSING", "started work requires an active execution plan")
+        if provided_execution is None:
+            error(
+                "EXECUTION_CONTEXT_REQUIRED",
+                "publishable candidate with started work requires execution source context",
+            )
+        if execution_context is not None and provided_execution is not None:
+            if (
+                provided_execution.active_plan_version_id != execution_context.active_plan_version_id
+                or provided_execution.active_plan_snapshot_hash != execution_context.active_plan_snapshot_hash
+                or provided_execution.active_schedule_id != execution_context.active_schedule_id
+            ):
+                error(
+                    "ACTIVE_PLAN_SOURCE_MISMATCH", "candidate execution source is not the current active execution plan"
+                )
+        if execution_context is not None and source is not None and execution_context.active_schedule_id != source.id:
+            error("ACTIVE_PLAN_SOURCE_MISMATCH", "candidate source schedule is not the active execution schedule")
+        if source is None:
+            error("STARTED_ASSIGNMENT_SOURCE_MISSING", "started work requires the active source schedule")
+
+        authoritative_started = (
+            {item.work_order_id: item for item in execution_context.started_assignments} if execution_context else {}
+        )
+        provided_started = (
+            {item.work_order_id: item for item in provided_execution.started_assignments} if provided_execution else {}
+        )
+        frozen_ids = (
+            {item.work_order_id for item in planning_context.frozen_assignments if item.reason.value == "STARTED"}
+            if planning_context
+            else set()
+        )
+        result_by_id = {item.work_order_id: item for item in result.assignments}
+        for work_order_id in sorted(started_ids):
+            expected = authoritative_started.get(work_order_id)
+            provided = provided_started.get(work_order_id)
+            assignment = result_by_id.get(work_order_id)
+            if expected is None:
+                error(
+                    "STARTED_ASSIGNMENT_SOURCE_MISSING",
+                    f"{work_order_id}: active execution plan has no source assignment",
+                    work_order_id,
+                )
+                continue
+            if provided is None or work_order_id not in frozen_ids:
+                error(
+                    "FROZEN_CONTEXT_INCOMPLETE",
+                    f"{work_order_id}: started work is missing from candidate frozen context",
+                    work_order_id,
+                    expected.technician_id,
+                )
+            elif provided.model_dump(mode="json") != expected.model_dump(mode="json"):
+                error(
+                    "PLANNING_CONTEXT_SOURCE_MISMATCH",
+                    f"{work_order_id}: execution source assignment does not match current facts",
+                    work_order_id,
+                    expected.technician_id,
+                )
+            if assignment is None:
+                continue
+            if assignment.technician_id != expected.technician_id:
+                error(
+                    "STARTED_TECHNICIAN_CHANGED",
+                    f"{work_order_id}: started technician changed",
+                    work_order_id,
+                    assignment.technician_id,
+                )
+            if (
+                assignment.technician_id,
+                assignment.sequence,
+                assignment.start_time,
+                assignment.finish_time,
+            ) != (
+                expected.technician_id,
+                expected.sequence,
+                expected.planned_start_at,
+                expected.planned_finish_at,
+            ):
+                error(
+                    "IMMUTABLE_ASSIGNMENT_CHANGED",
+                    f"{work_order_id}: started assignment changed",
+                    work_order_id,
+                    assignment.technician_id,
+                )
+            following = sorted(
+                [
+                    item
+                    for item in result.assignments
+                    if item.technician_id == expected.technician_id and item.sequence > expected.sequence
+                ],
+                key=lambda item: item.sequence,
+            )
+            if following:
+                next_assignment = following[0]
+                next_order = orders.get(next_assignment.work_order_id)
+                started_order = orders.get(work_order_id)
+                if next_order and started_order:
+                    required_arrival = expected.projected_available_at + provider.minutes(
+                        started_order.location,
+                        next_order.location,
+                    )
+                    if next_assignment.arrival_time < required_arrival:
+                        error(
+                            "BEFORE_PROJECTED_AVAILABILITY",
+                            f"{next_assignment.work_order_id}: follows active service before projected availability",
+                            next_assignment.work_order_id,
+                            expected.technician_id,
+                        )
+
+    if execution_context is not None and planning_context is not None:
+        provided_execution = planning_context.execution_source_context
+        if provided_execution is not None:
+            authoritative_projections = {item.technician_id: item for item in execution_context.technician_projections}
+            provided_projections = {item.technician_id: item for item in provided_execution.technician_projections}
+            if provided_projections != authoritative_projections:
+                error(
+                    "EXECUTION_WATERMARK_MISMATCH", "technician execution projection changed after candidate creation"
+                )
+            for technician_id, projection in authoritative_projections.items():
+                future = sorted(
+                    [
+                        item
+                        for item in result.assignments
+                        if item.technician_id == technician_id and item.work_order_id != projection.source_work_order_id
+                    ],
+                    key=lambda item: item.sequence,
+                )
+                if not future:
+                    continue
+                first_future = future[0]
+                next_order = orders.get(first_future.work_order_id)
+                if not next_order:
+                    continue
+                required_arrival = projection.available_at + provider.minutes(
+                    projection.effective_location,
+                    next_order.location,
+                )
+                if first_future.arrival_time < required_arrival:
+                    error(
+                        "BEFORE_PROJECTED_AVAILABILITY",
+                        f"{first_future.work_order_id}: scheduled before technician execution availability",
+                        first_future.work_order_id,
+                        technician_id,
+                    )
     grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
     for assignment in result.assignments:
         order = orders.get(assignment.work_order_id)
@@ -113,18 +326,33 @@ def verify_schedule(
         if order is None:
             continue
         if technician is None:
-            error("UNKNOWN_TECHNICIAN", f"{assignment.work_order_id}: technician {assignment.technician_id} does not exist", assignment.work_order_id, assignment.technician_id)
+            error(
+                "UNKNOWN_TECHNICIAN",
+                f"{assignment.work_order_id}: technician {assignment.technician_id} does not exist",
+                assignment.work_order_id,
+                assignment.technician_id,
+            )
             continue
         if not set(order.required_skills).issubset(set(technician.skills)):
             error("SKILL_MISMATCH", f"{order.id}: technician lacks required skill", order.id, technician.id)
         if not order.window_start <= assignment.start_time <= order.window_end:
             error("TIME_WINDOW_VIOLATION", f"{order.id}: start outside time window", order.id, technician.id)
         if assignment.start_time < service_ready_at(order):
-            error("BEFORE_DEMAND_REPORTED", f"{order.id}: service starts before demand was reported", order.id, technician.id)
+            error(
+                "BEFORE_DEMAND_REPORTED",
+                f"{order.id}: service starts before demand was reported",
+                order.id,
+                technician.id,
+            )
         if assignment.arrival_time > assignment.start_time:
             error("ARRIVAL_AFTER_START", f"{order.id}: arrival occurs after service start", order.id, technician.id)
         if assignment.finish_time != assignment.start_time + order.service_duration:
-            error("SERVICE_DURATION_MISMATCH", f"{order.id}: finish time does not match service duration", order.id, technician.id)
+            error(
+                "SERVICE_DURATION_MISMATCH",
+                f"{order.id}: finish time does not match service duration",
+                order.id,
+                technician.id,
+            )
         if assignment.sla_late_minutes != max(0, assignment.finish_time - order.sla_deadline):
             error("SLA_LATENESS_MISMATCH", f"{order.id}: SLA lateness is inconsistent", order.id, technician.id)
         if assignment.start_time < technician.shift_start:
@@ -138,27 +366,75 @@ def verify_schedule(
     for technician_id, route in grouped.items():
         ordered = sorted(route, key=lambda item: item.sequence)
         if [item.sequence for item in ordered] != list(range(1, len(ordered) + 1)):
-            error("NONCONTIGUOUS_SEQUENCE", f"{technician_id}: route sequence is not contiguous", technician_id=technician_id)
+            error(
+                "NONCONTIGUOUS_SEQUENCE",
+                f"{technician_id}: route sequence is not contiguous",
+                technician_id=technician_id,
+            )
         for before, after in zip(ordered, ordered[1:], strict=False):
             travel = provider.minutes(orders[before.work_order_id].location, orders[after.work_order_id].location)
             if after.travel_minutes != travel:
-                error("TRAVEL_TIME_MISMATCH", f"{after.work_order_id}: travel minutes do not match route", after.work_order_id, technician_id)
+                error(
+                    "TRAVEL_TIME_MISMATCH",
+                    f"{after.work_order_id}: travel minutes do not match route",
+                    after.work_order_id,
+                    technician_id,
+                )
             if after.arrival_time < before.finish_time + travel:
-                error("IMPOSSIBLE_ARRIVAL", f"{after.work_order_id}: arrival precedes prior service and travel", after.work_order_id, technician_id)
+                error(
+                    "IMPOSSIBLE_ARRIVAL",
+                    f"{after.work_order_id}: arrival precedes prior service and travel",
+                    after.work_order_id,
+                    technician_id,
+                )
             if before.finish_time + travel > after.start_time:
-                error("ROUTE_OVERLAP", f"{technician_id}: {before.work_order_id} overlaps travel to {after.work_order_id}", technician_id=technician_id)
+                error(
+                    "ROUTE_OVERLAP",
+                    f"{technician_id}: {before.work_order_id} overlaps travel to {after.work_order_id}",
+                    technician_id=technician_id,
+                )
         if ordered:
             technician = technicians[technician_id]
             first = ordered[0]
-            first_travel = provider.minutes(technician.start_location, orders[first.work_order_id].location)
+            frozen_started_ids = (
+                {item.work_order_id for item in planning_context.frozen_assignments if item.reason.value == "STARTED"}
+                if planning_context
+                else set()
+            )
+            projection = (
+                next(
+                    (item for item in execution_context.technician_projections if item.technician_id == technician_id),
+                    None,
+                )
+                if execution_context
+                else None
+            )
+            execution_origin = projection is not None and first.work_order_id not in frozen_started_ids
+            first_origin = projection.effective_location if execution_origin else technician.start_location
+            first_available = projection.available_at if execution_origin else technician.shift_start
+            first_travel = provider.minutes(first_origin, orders[first.work_order_id].location)
             if first.travel_minutes != first_travel:
-                error("FIRST_LEG_TRAVEL_MISMATCH", f"{first.work_order_id}: first-leg travel minutes do not match depot", first.work_order_id, technician_id)
-            if first.arrival_time < technician.shift_start + first_travel:
-                error("IMPOSSIBLE_DEPOT_DEPARTURE", f"{first.work_order_id}: arrival precedes possible depot departure", first.work_order_id, technician_id)
+                error(
+                    "FIRST_LEG_TRAVEL_MISMATCH",
+                    f"{first.work_order_id}: first-leg travel minutes do not match effective origin",
+                    first.work_order_id,
+                    technician_id,
+                )
+            if first.arrival_time < first_available + first_travel:
+                error(
+                    "IMPOSSIBLE_DEPOT_DEPARTURE",
+                    f"{first.work_order_id}: arrival precedes effective availability and travel",
+                    first.work_order_id,
+                    technician_id,
+                )
             last = ordered[-1]
             return_travel = provider.minutes(orders[last.work_order_id].location, technician.start_location)
             if last.finish_time + return_travel > technician.shift_end + technician.overtime_limit:
-                error("RETURN_EXCEEDS_OVERTIME", f"{technician_id}: route return exceeds overtime limit", technician_id=technician_id)
+                error(
+                    "RETURN_EXCEEDS_OVERTIME",
+                    f"{technician_id}: route return exceeds overtime limit",
+                    technician_id=technician_id,
+                )
 
     if source is not None:
         source_by_id = {item.work_order_id: item for item in source.assignments}
@@ -168,17 +444,17 @@ def verify_schedule(
         frozen = (
             {item.work_order_id: item for item in planning_context.frozen_assignments}
             if planning_context
-            else {
-                order.id: None
-                for order in scenario.work_orders
-                if order.status.value in {"started", "completed"}
-            }
+            else {order.id: None for order in scenario.work_orders if order.status.value == "started"}
         )
         for work_order_id, frozen_item in frozen.items():
             old = source_by_id.get(work_order_id)
             new = result_by_id.get(work_order_id)
             if old is None:
-                error("IMMUTABLE_SOURCE_MISSING", f"{work_order_id}: source plan has no immutable assignment", work_order_id)
+                error(
+                    "IMMUTABLE_SOURCE_MISSING",
+                    f"{work_order_id}: source plan has no immutable assignment",
+                    work_order_id,
+                )
             elif frozen_item is not None and (
                 old.technician_id,
                 old.sequence,
@@ -190,50 +466,98 @@ def verify_schedule(
                 frozen_item.start_time,
                 frozen_item.finish_time,
             ):
-                error("PLANNING_CONTEXT_SOURCE_MISMATCH", f"{work_order_id}: frozen assignment does not match source plan", work_order_id)
+                error(
+                    "PLANNING_CONTEXT_SOURCE_MISMATCH",
+                    f"{work_order_id}: frozen assignment does not match source plan",
+                    work_order_id,
+                )
             elif frozen_item is not None and frozen_item.reason.value == "COMPLETED":
                 # Completed work remains traceable to the source plan but is no
                 # longer part of the future schedule candidate.
                 continue
-            elif new is None or (new.technician_id, new.sequence, new.start_time, new.finish_time) != (old.technician_id, old.sequence, old.start_time, old.finish_time):
+            elif new is None or (new.technician_id, new.sequence, new.start_time, new.finish_time) != (
+                old.technician_id,
+                old.sequence,
+                old.start_time,
+                old.finish_time,
+            ):
                 error("IMMUTABLE_ASSIGNMENT_CHANGED", f"{work_order_id}: frozen assignment changed", work_order_id)
         if planning_context:
             for work_order_id in planning_context.inferred_departure_warnings:
-                warnings.append(VerificationIssue(
-                    code="PLANNED_DEPARTURE_NOT_EXECUTION_FACT",
-                    message=f"{work_order_id}: planned time suggests departure, but the assignment was not frozen without an execution fact",
-                    work_order_id=work_order_id,
-                ))
+                warnings.append(
+                    VerificationIssue(
+                        code="PLANNED_DEPARTURE_NOT_EXECUTION_FACT",
+                        message=f"{work_order_id}: planned time suggests departure, but the assignment was not frozen without an execution fact",
+                        work_order_id=work_order_id,
+                    )
+                )
 
     recomputed_kpis = None
     if not any(issue.code in {"UNKNOWN_WORK_ORDER", "UNKNOWN_TECHNICIAN", "DUPLICATE_ASSIGNMENT"} for issue in errors):
-        normalized = normalize_schedule(scenario, result, source, provider)
+        normalized = normalize_schedule(
+            scenario,
+            result,
+            source,
+            provider,
+            planning_context=planning_context,
+        )
         expected_by_id = {item.work_order_id: item for item in normalized.assignments}
         for assignment in result.assignments:
             expected = expected_by_id[assignment.work_order_id]
             if assignment.travel_minutes != expected.travel_minutes:
-                error("TRAVEL_TIME_MISMATCH", f"{assignment.work_order_id}: derived travel time was not normalized", assignment.work_order_id, assignment.technician_id)
+                error(
+                    "TRAVEL_TIME_MISMATCH",
+                    f"{assignment.work_order_id}: derived travel time was not normalized",
+                    assignment.work_order_id,
+                    assignment.technician_id,
+                )
             if assignment.sla_late_minutes != expected.sla_late_minutes:
-                error("SLA_LATENESS_MISMATCH", f"{assignment.work_order_id}: derived SLA lateness was not normalized", assignment.work_order_id, assignment.technician_id)
+                error(
+                    "SLA_LATENESS_MISMATCH",
+                    f"{assignment.work_order_id}: derived SLA lateness was not normalized",
+                    assignment.work_order_id,
+                    assignment.technician_id,
+                )
             if assignment.changed != expected.changed:
-                error("CHANGED_FLAG_MISMATCH", f"{assignment.work_order_id}: changed flag does not match source plan", assignment.work_order_id, assignment.technician_id)
+                error(
+                    "CHANGED_FLAG_MISMATCH",
+                    f"{assignment.work_order_id}: changed flag does not match source plan",
+                    assignment.work_order_id,
+                    assignment.technician_id,
+                )
             if assignment.locked != expected.locked:
-                error("LOCKED_FLAG_MISMATCH", f"{assignment.work_order_id}: locked flag does not match scenario locks", assignment.work_order_id, assignment.technician_id)
+                error(
+                    "LOCKED_FLAG_MISMATCH",
+                    f"{assignment.work_order_id}: locked flag does not match scenario locks",
+                    assignment.work_order_id,
+                    assignment.technician_id,
+                )
             if assignment.explanation != expected.explanation:
-                warnings.append(VerificationIssue(
-                    code="EXPLANATION_TEMPLATE_OUTDATED",
-                    message=f"{assignment.work_order_id}: explanation text uses an older template",
-                    work_order_id=assignment.work_order_id,
-                    technician_id=assignment.technician_id,
-                ))
+                warnings.append(
+                    VerificationIssue(
+                        code="EXPLANATION_TEMPLATE_OUTDATED",
+                        message=f"{assignment.work_order_id}: explanation text uses an older template",
+                        work_order_id=assignment.work_order_id,
+                        technician_id=assignment.technician_id,
+                    )
+                )
             if assignment.evidence != expected.evidence:
-                error("EVIDENCE_MISMATCH", f"{assignment.work_order_id}: evidence was not regenerated", assignment.work_order_id, assignment.technician_id)
+                error(
+                    "EVIDENCE_MISMATCH",
+                    f"{assignment.work_order_id}: evidence was not regenerated",
+                    assignment.work_order_id,
+                    assignment.technician_id,
+                )
         recomputed_kpis = normalized.kpis
         if recomputed_kpis.model_dump() != result.kpis.model_dump():
             error("KPI_MISMATCH", "candidate KPI values do not match recomputed metrics")
         recomputed_breakdown = normalized.objective_breakdown
         recomputed_score = normalized.business_score
-        if recomputed_breakdown != result.objective_breakdown or result.objective != recomputed_score or result.business_score != recomputed_score:
+        if (
+            recomputed_breakdown != result.objective_breakdown
+            or result.objective != recomputed_score
+            or result.business_score != recomputed_score
+        ):
             error("BUSINESS_SCORE_MISMATCH", "candidate business score does not match recomputed metrics")
 
     valid = not errors

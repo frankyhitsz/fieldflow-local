@@ -12,6 +12,7 @@ setup:
 
 lint:
 	$(PYTHON) -m ruff check backend tests scripts
+	$(PYTHON) -m ruff format --check backend tests scripts
 	cd frontend && npm run typecheck
 
 test:

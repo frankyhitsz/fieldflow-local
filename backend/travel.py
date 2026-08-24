@@ -16,11 +16,9 @@ class TravelTimeProvider(Protocol):
     version: str
 
     @property
-    def fingerprint(self) -> str:
-        ...
+    def fingerprint(self) -> str: ...
 
-    def minutes(self, origin: Point, destination: Point, departure_minute: int | None = None) -> int:
-        ...
+    def minutes(self, origin: Point, destination: Point, departure_minute: int | None = None) -> int: ...
 
 
 @dataclass(frozen=True)

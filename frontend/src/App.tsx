@@ -62,8 +62,8 @@ function SolverBadge({ schedule }: { schedule?: Schedule }) {
 function KpiStrip({ schedule, baseline }: { schedule?: Schedule; baseline?: Schedule }) {
   const k = schedule?.kpis
   const metrics = [
-    { label: '工单完成率', value: k ? pct(k.completion_rate) : '—', sub: k ? `${schedule!.assignments.length} / ${schedule!.assignments.length + k.unassigned_count} 单` : '尚未排程', icon: Check },
-    { label: 'SLA 履约率', value: k ? pct(k.committed_on_time_rate) : '—', sub: k ? `已排工单按时率 ${pct(k.assigned_on_time_rate)}` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count || !!k?.unassigned_count },
+    { label: '计划覆盖率', value: k ? pct(k.completion_rate) : '—', sub: k ? `${schedule!.assignments.length} / ${schedule!.assignments.length + k.unassigned_count} 单已排入计划` : '尚未排程', icon: Check },
+    { label: '计划 SLA 达成率', value: k ? pct(k.committed_on_time_rate) : '—', sub: k ? `已排工单计划按时率 ${pct(k.assigned_on_time_rate)}` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count || !!k?.unassigned_count },
     { label: '总行程', value: k ? `${k.total_travel_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_travel_minutes - baseline.kpis.total_travel_minutes : null, icon: Route },
     { label: '总加班', value: k ? `${k.total_overtime_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_overtime_minutes - baseline.kpis.total_overtime_minutes : null, icon: Clock3 },
     { label: '未分配', value: k ? `${k.unassigned_count}` : '—', unit: '工单', sub: k ? `${k.high_priority_missed} 单高优先级` : '尚未计算', icon: AlertTriangle, warn: !!k?.unassigned_count },
@@ -312,9 +312,9 @@ export default function App() {
     try {
       const result = await call()
       if (activeScenarioId.current !== result.scenario_id) return
-      setSchedule(result)
       const planItems = await api.planVersions(result.scenario_id)
       if (activeScenarioId.current !== result.scenario_id) return
+      setSchedule(planItems.find(item => item.active)?.selected || result)
       setPlans(planItems); setHistoricalScenario(undefined)
       if (result.kind === 'baseline') setBaseline(result)
       setToast(success)
@@ -328,6 +328,13 @@ export default function App() {
 
   if (!scenario) return <main className="boot-screen"><InkMark /><h1>FieldFlow</h1><p>{loadError || working || '正在打开调度台…'}</p>{loadError && <button onClick={() => window.location.reload()}>重新连接</button>}</main>
   const shownScenario = historicalScenario || scenario
+  const serviceWindow = shownScenario.technicians.length
+    ? `${hhmm(Math.min(...shownScenario.technicians.map(item => item.shift_start)))}–${hhmm(Math.max(...shownScenario.technicians.map(item => item.shift_end)))}`
+    : '未配置班次'
+  const skillCount = new Set([
+    ...shownScenario.technicians.flatMap(item => item.skills),
+    ...shownScenario.work_orders.flatMap(item => item.required_skills),
+  ]).size
   const activePlan = plans.find(item => item.active)
   const partialCoverage = !historicalScenario && activePlan?.coverage_status === 'PARTIAL_NEW_DEMAND'
   const executionProgress = !historicalScenario && !!schedule && activePlan?.selected.id === schedule.id
@@ -338,6 +345,19 @@ export default function App() {
     setScenario(next); setSchedule(undefined); setBaseline(undefined); setHistoricalScenario(undefined); setSelectedId(undefined)
     setScenarios(current => current.map(item => item.id === next.id ? next : item))
     setToast(`${message}，请重新生成方案`)
+  }
+
+  const applyScenarioEdit = async (next: Scenario, message: string) => {
+    if (!next.work_orders.some(order => order.status !== 'pending')) {
+      invalidatePlan(next, message)
+      return
+    }
+    const planItems = await api.planVersions(next.id)
+    if (activeScenarioId.current !== next.id) return
+    const active = planItems.find(item => item.active)
+    setScenario(next); setPlans(planItems); setSchedule(active?.selected); setHistoricalScenario(undefined)
+    setScenarios(current => current.map(item => item.id === next.id ? next : item))
+    setToast(`${message}；当前执行方案已保留，请完成服务或局部重排`)
   }
 
   const saveWorkOrder = async (order: WorkOrder, replan: boolean) => {
@@ -374,7 +394,7 @@ export default function App() {
         setScenario(fresh); setSchedule(result); setPlans(planItems); setHistoricalScenario(undefined); setView('dispatch')
         setScenarios(current => current.map(item => item.id === fresh.id ? fresh : item))
         setToast('突发工单已保存，局部重排完成')
-      } else invalidatePlan(next, '工单已保存')
+      } else await applyScenarioEdit(next, '工单已保存')
     } catch (error) {
       if (replan && order.is_emergency && !workEditor?.initial) {
         try {
@@ -394,7 +414,7 @@ export default function App() {
   const deleteWorkOrder = async (order: WorkOrder) => {
     if (!window.confirm(`确认删除待处理工单 ${order.id}？`)) return
     setWorking('正在删除工单')
-    try { const next = await api.deleteWorkOrder(scenario.id, order.id); if (activeScenarioId.current !== next.id) return; setWorkEditor(undefined); invalidatePlan(next, '工单已删除') }
+    try { const next = await api.deleteWorkOrder(scenario.id, order.id); if (activeScenarioId.current !== next.id) return; setWorkEditor(undefined); await applyScenarioEdit(next, '工单已删除') }
     catch (error) { setToast(error instanceof Error ? error.message : '工单删除失败') }
     finally { setWorking(undefined) }
   }
@@ -404,7 +424,7 @@ export default function App() {
     try {
       const next = techEditor?.initial ? await api.updateTechnician(scenario.id, tech.id, tech) : await api.createTechnician(scenario.id, tech)
       if (activeScenarioId.current !== next.id) return
-      setTechEditor(undefined); invalidatePlan(next, '技师资料已保存')
+      setTechEditor(undefined); await applyScenarioEdit(next, '技师资料已保存')
     } catch (error) { setToast(error instanceof Error ? error.message : '技师保存失败') }
     finally { setWorking(undefined) }
   }
@@ -419,7 +439,7 @@ export default function App() {
       const active = planItems.find(item => item.active)
       const detail = active ? await api.planVersion(scenario.id, active.id) : undefined
       if (activeScenarioId.current !== scenario.id) return
-      setPlans(planItems); setSchedule(result); setHistoricalScenario(undefined)
+      setPlans(planItems); setSchedule(active?.selected || result); setHistoricalScenario(undefined)
       setBaseline(detail?.artifacts.find(item => item.role === 'baseline')?.schedule)
       setToast('推荐方案已生成')
     } catch (error) { setToast(error instanceof Error ? error.message : '优化失败') }
@@ -433,7 +453,7 @@ export default function App() {
       if (activeScenarioId.current !== scenario.id) return
       const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
       if (activeScenarioId.current !== scenario.id) return
-      setScenario(fresh); setPlans(planItems); setSchedule(result); setHistoricalScenario(undefined); setToast('局部重排完成')
+      setScenario(fresh); setPlans(planItems); setSchedule(planItems.find(item => item.active)?.selected || result); setHistoricalScenario(undefined); setToast('局部重排完成')
     } catch (error) { setToast(error instanceof Error ? error.message : '局部重排失败') }
     finally { setWorking(undefined) }
   }
@@ -443,7 +463,7 @@ export default function App() {
       <div className="command-context"><GripVertical size={17} /><div><small>{partialCoverage ? '最后发布方案' : '当前方案'}</small><strong>{schedule ? `${kindLabel[schedule.kind]} · V${String(schedule.version).padStart(3, '0')}${partialCoverage ? ' · 新需求未覆盖' : ''}` : `业务数据已更新 · D${String(scenario.revision).padStart(3, '0')}`}</strong></div></div>
       <div className="command-actions">
         <button onClick={() => act('正在生成基线', () => api.baseline(scenario.id, commandKey('baseline')), '人工基线已生成')} disabled={!!working}><RefreshCw size={15} />生成基线</button>
-        <div className="strategy-select"><select aria-label="优化策略" value={strategy} onChange={e => setStrategy(e.target.value as Strategy)}><option value="balanced">均衡策略</option><option value="completion">完成率优先</option><option value="punctuality">准时优先</option><option value="low_travel">低行程</option><option value="low_overtime">低加班</option><option value="fair_workload">工作量公平</option></select><ChevronDown size={13} /></div>
+        <div className="strategy-select"><select aria-label="优化策略" value={strategy} onChange={e => setStrategy(e.target.value as Strategy)}><option value="balanced">均衡策略</option><option value="completion">覆盖率优先</option><option value="punctuality">准时优先</option><option value="low_travel">低行程</option><option value="low_overtime">低加班</option><option value="fair_workload">工作量公平</option></select><ChevronDown size={13} /></div>
         <button className="primary" onClick={runOptimize} disabled={!!working}><WandSparkles size={16} />生成推荐方案</button>
         <button className="emergency" onClick={() => setWorkEditor({ emergencyPreset: true })} disabled={!!working}><Zap size={15} />新增突发单</button>
         <label className="replan-time">重排时点<span>{hhmm(replanTime)}</span><input aria-label="重排时点（当日起分钟数）" type="number" min="0" max="1800" step="5" value={replanTime} onChange={event => setReplanTime(Number(event.target.value))} /></label>
@@ -459,13 +479,13 @@ export default function App() {
     {!partialCoverage && !executionProgress && schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
     <KpiStrip schedule={schedule} baseline={baseline} />
     <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
-    <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / 3 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
+    <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / {skillCount} 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
   </>
 
   return <div className="app-shell">
     <Sidebar scenarios={scenarios} current={scenario} active={view} busy={!!working || !!loadingScenarioId} onSelect={loadScenario} onNavigate={nextView => { setView(nextView); if (nextView === 'lab' && !scenario.id.startsWith('strategy-')) void loadScenario('strategy-medium') }} />
     <main className="main-content">
-      <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务日 08:00–18:00</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}`, '_blank')}><FileText size={16} />导出报告</button></div></header>
+      <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务时段 {serviceWindow}</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}`, '_blank')}><FileText size={16} />导出报告</button></div></header>
       {view === 'dispatch' && dispatch}
       {view === 'versions' && <VersionsView scenario={scenario} plans={plans} onOpen={async item => { setWorking('正在读取版本快照'); try { const detail = await api.planVersion(scenario.id, item.id); setSchedule(detail.selected); setHistoricalScenario(detail.active && detail.data_revision === scenario.revision ? undefined : detail.scenario_snapshot || undefined); setBaseline(detail.artifacts.find(artifactItem => artifactItem.role === 'baseline')?.schedule); setView('dispatch'); setToast(`已打开历史方案 V${String(item.number).padStart(3, '0')}`) } catch (error) { setToast(error instanceof Error ? error.message : '版本读取失败') } finally { setWorking(undefined) } }} onActivate={async item => {
         setWorking('正在核对并激活历史计划')
@@ -545,8 +565,14 @@ export default function App() {
         if (activeScenarioId.current !== next.id) return
         const planItems = await api.planVersions(next.id)
         if (activeScenarioId.current !== next.id) return
-        setScenario(next); setPlans(planItems); setSchedule(undefined); setBaseline(undefined); setHistoricalScenario(undefined)
-        setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}，请重新生成或局部重排方案`)
+        if (next.work_orders.some(order => order.status === 'started')) {
+          const active = planItems.find(item => item.active)
+          setScenario(next); setPlans(planItems); setSchedule(active?.selected); setHistoricalScenario(undefined)
+          setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}；当前执行方案已保留，请局部重排`)
+        } else {
+          setScenario(next); setPlans(planItems); setSchedule(undefined); setBaseline(undefined); setHistoricalScenario(undefined)
+          setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}，请重新生成或局部重排方案`)
+        }
       } catch (e) { setToast(e instanceof Error ? e.message : '锁定失败') } finally { setWorking(undefined) }
     }} />}
     {comparison && <CompareDrawer data={comparison} onClose={() => setComparison(undefined)} />}

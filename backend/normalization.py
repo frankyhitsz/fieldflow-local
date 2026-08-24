@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from .hashing import content_hash
-from .models import ScheduleAssignment, ScheduleResult, ScheduleScenario
+from .models import PlanningContext, ScheduleAssignment, ScheduleResult, ScheduleScenario
 from .scheduler import BUSINESS_SCORE_POLICY_VERSION, METRIC_POLICY_VERSION, calculate_kpis, objective_breakdown
 from .timeutils import hhmm, service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
@@ -39,7 +39,11 @@ def _change_flags(
     return {
         item.work_order_id: bool(
             (old := source_by_id.get(item.work_order_id))
-            and (old.technician_id != item.technician_id or before.get(item.work_order_id) != after.get(item.work_order_id))
+            and (
+                old.technician_id != item.technician_id
+                or before.get(item.work_order_id) != after.get(item.work_order_id)
+                or abs(old.start_time - item.start_time) > 15
+            )
         )
         for item in assignments
     }
@@ -51,6 +55,7 @@ def normalize_schedule(
     source: ScheduleResult | None = None,
     provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
     solver_config_hash: str | None = None,
+    planning_context: PlanningContext | None = None,
 ) -> ScheduleResult:
     """Rebuild every assignment fact that is derived from business input or route order."""
     normalized = result.model_copy(deep=True)
@@ -62,6 +67,16 @@ def normalize_schedule(
         grouped[assignment.technician_id].append(assignment)
     for route in grouped.values():
         route.sort(key=lambda item: item.sequence)
+    frozen_started_ids = (
+        {item.work_order_id for item in planning_context.frozen_assignments if item.reason.value == "STARTED"}
+        if planning_context
+        else set()
+    )
+    execution_projections = (
+        {item.technician_id: item for item in planning_context.execution_source_context.technician_projections}
+        if planning_context and planning_context.execution_source_context
+        else {}
+    )
 
     changes = _change_flags(normalized.assignments, source if normalized.kind == "replan" else None)
 
@@ -89,15 +104,27 @@ def normalize_schedule(
         route_overtime = max(0, route_return_at - technician.shift_end)
         for index, assignment in enumerate(route):
             order = orders[assignment.work_order_id]
-            previous_point = technician.start_location if index == 0 else orders[route[index - 1].work_order_id].location
-            next_point = technician.start_location if index == len(route) - 1 else orders[route[index + 1].work_order_id].location
+            projection = execution_projections.get(technician_id)
+            first_uses_execution_origin = (
+                index == 0 and projection is not None and assignment.work_order_id not in frozen_started_ids
+            )
+            previous_point = (
+                projection.effective_location
+                if first_uses_execution_origin
+                else technician.start_location
+                if index == 0
+                else orders[route[index - 1].work_order_id].location
+            )
+            next_point = (
+                technician.start_location
+                if index == len(route) - 1
+                else orders[route[index + 1].work_order_id].location
+            )
             travel = provider.minutes(previous_point, order.location)
             locked = locks.get(order.id) == technician_id
             changed = changes.get(order.id, False)
             eligible = [
-                item.id
-                for item in scenario.technicians
-                if set(order.required_skills).issubset(set(item.skills))
+                item.id for item in scenario.technicians if set(order.required_skills).issubset(set(item.skills))
             ]
             alternatives = {
                 item.id: cheapest_delta(item.id, order.id)
@@ -117,9 +144,7 @@ def normalize_schedule(
             if len(eligible) > 1:
                 explanation.append(f"共有 {len(eligible)} 名技师满足技能要求；路线计算选择 {technician.id}")
             explanation.append(
-                "不会产生加班"
-                if route_overtime == 0
-                else f"含返程预计产生 {route_overtime} 分钟加班，未超过上限"
+                "不会产生加班" if route_overtime == 0 else f"含返程预计产生 {route_overtime} 分钟加班，未超过上限"
             )
             if locked:
                 explanation.append("人工锁定已生效，本次求解保持指定技师")
@@ -129,7 +154,9 @@ def normalize_schedule(
                 explanation.append("VIP 工单的未分配代价较高")
             explanation.append(f"在当前路线的前后工单之间插入此单，行程净增 {insertion_delta} 分钟")
             if alternatives:
-                explanation.append(f"其他技能匹配路线的最低行程增量估算为 {min(alternatives.values())} 分钟（未重新排时）")
+                explanation.append(
+                    f"其他技能匹配路线的最低行程增量估算为 {min(alternatives.values())} 分钟（未重新排时）"
+                )
 
             assignment.travel_minutes = travel
             assignment.sla_late_minutes = max(0, assignment.finish_time - order.sla_deadline)
@@ -162,9 +189,7 @@ def normalize_schedule(
     # The business snapshot can use the common evaluation policy while the
     # solver ran with a strategy-specific config. Preserve that provenance.
     normalized.solver_config_hash = (
-        solver_config_hash
-        or normalized.solver_config_hash
-        or content_hash(scenario.solver_config)
+        solver_config_hash or normalized.solver_config_hash or content_hash(scenario.solver_config)
     )
     normalized.travel_model_version = provider.version
     normalized.travel_model_fingerprint = provider.fingerprint

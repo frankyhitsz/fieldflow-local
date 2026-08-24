@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 def test_full_demo_flow(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "test.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
 
     with TestClient(main_module.app) as client:
@@ -25,9 +26,14 @@ def test_full_demo_flow(monkeypatch, tmp_path):
 
         vip_ids = {order["id"] for order in main_scenario["work_orders"] if order["vip"]}
         vip = next(a for a in optimized["assignments"] if a["work_order_id"] in vip_ids)
-        lock = client.post("/api/scenarios/main/lock", json={
-            "work_order_id": vip["work_order_id"], "technician_id": vip["technician_id"], "locked": True,
-        })
+        lock = client.post(
+            "/api/scenarios/main/lock",
+            json={
+                "work_order_id": vip["work_order_id"],
+                "technician_id": vip["technician_id"],
+                "locked": True,
+            },
+        )
         assert lock.status_code == 200
 
         replan = client.post("/api/scenarios/main/replan", json={"current_time": 600, "time_limit_seconds": 1})
@@ -49,9 +55,14 @@ def test_full_demo_flow(monkeypatch, tmp_path):
         client.post("/api/scenarios/main/replan", json={"current_time": 600, "time_limit_seconds": 1})
         assert len(client.get("/api/scenarios/main").json()["work_orders"]) == before_replan_count
 
-        edited = client.put("/api/scenarios/main/work-orders/WO-1021", json={
-            "title": "人工修改后的线路检修", "is_emergency": True, "reported_at": 615,
-        })
+        edited = client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            json={
+                "title": "人工修改后的线路检修",
+                "is_emergency": True,
+                "reported_at": 615,
+            },
+        )
         assert edited.status_code == 200
         edited_scenario = edited.json()
         assert edited_scenario["revision"] == 2
@@ -59,38 +70,63 @@ def test_full_demo_flow(monkeypatch, tmp_path):
         assert edited_order["is_emergency"] is True
         assert edited_order["drop_penalty"] >= 8000
 
-        revised_plan = client.post("/api/scenarios/main/optimize", json={"strategy": "punctuality", "time_limit_seconds": 1})
+        revised_plan = client.post(
+            "/api/scenarios/main/optimize", json={"strategy": "punctuality", "time_limit_seconds": 1}
+        )
         assert revised_plan.status_code == 200
         assert revised_plan.json()["scenario_revision"] == 2
         assert revised_plan.json()["strategy"] == "punctuality"
         revised_version = client.get("/api/scenarios/main/plan-versions").json()[-1]
         assert revised_version["relation"] == "fresh_after_data_change"
         assert set(revised_plan.json()["objective_breakdown"]) == {
-            "travel", "sla_late", "overtime", "unassigned", "imbalance", "replan_changes"
+            "travel",
+            "sla_late",
+            "overtime",
+            "unassigned",
+            "imbalance",
+            "replan_changes",
         }
         latest_comparison = client.get("/api/scenarios/main/comparison")
         assert latest_comparison.status_code == 200
         assert latest_comparison.json()["after"]["id"] == revised_plan.json()["id"]
 
-        updated_tech = client.put("/api/scenarios/main/technicians/TECH-01", json={"name": "林乔（早班）", "overtime_limit": 75})
+        updated_tech = client.put(
+            "/api/scenarios/main/technicians/TECH-01", json={"name": "林乔（早班）", "overtime_limit": 75}
+        )
         assert updated_tech.status_code == 200
         assert updated_tech.json()["revision"] == 3
 
         new_emergency = {
-            "id": "WO-EMG-TEST", "customer_name": "应急客户", "title": "突发供电中断",
-            "required_skills": ["electrical"], "location": {"x": 55, "y": 45},
-            "service_duration": 30, "window_start": 630, "window_end": 750,
-            "sla_deadline": 690, "priority": "urgent", "drop_penalty": 10000,
-            "status": "pending", "vip": True, "is_emergency": True, "reported_at": 620, "note": "",
+            "id": "WO-EMG-TEST",
+            "customer_name": "应急客户",
+            "title": "突发供电中断",
+            "required_skills": ["electrical"],
+            "location": {"x": 55, "y": 45},
+            "service_duration": 30,
+            "window_start": 630,
+            "window_end": 750,
+            "sla_deadline": 690,
+            "priority": "urgent",
+            "drop_penalty": 10000,
+            "status": "pending",
+            "vip": True,
+            "is_emergency": True,
+            "reported_at": 620,
+            "note": "",
         }
         created = client.post("/api/scenarios/main/work-orders", json=new_emergency)
         assert created.status_code == 200
         assert created.json()["revision"] == 4
         assert any(item["id"] == "WO-EMG-TEST" and item["is_emergency"] for item in created.json()["work_orders"])
 
-        incompatible_lock = client.post("/api/scenarios/main/lock", json={
-            "work_order_id": "WO-1021", "technician_id": "TECH-03", "locked": True,
-        })
+        incompatible_lock = client.post(
+            "/api/scenarios/main/lock",
+            json={
+                "work_order_id": "WO-1021",
+                "technician_id": "TECH-03",
+                "locked": True,
+            },
+        )
         assert incompatible_lock.status_code == 422
 
         reset = client.post("/api/scenarios/main/reset")
@@ -103,6 +139,7 @@ def test_full_demo_flow(monkeypatch, tmp_path):
 def test_started_work_requires_local_replan_and_keeps_committed_assignment(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "started.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
 
     with TestClient(main_module.app) as client:
@@ -111,15 +148,26 @@ def test_started_work_requires_local_replan_and_keeps_committed_assignment(monke
         scenario = client.get("/api/scenarios/main").json()
         started_response = client.post(
             f"/api/scenarios/main/work-orders/{started['work_order_id']}/start",
-            json={"technician_id": started["technician_id"], "occurred_at": started["start_time"], "expected_revision": scenario["revision"], "idempotency_key": "start-work-order-001"},
+            json={
+                "technician_id": started["technician_id"],
+                "occurred_at": started["start_time"],
+                "expected_revision": scenario["revision"],
+                "idempotency_key": "start-work-order-001",
+            },
         )
         assert started_response.status_code == 200
         assert started_response.json()["event"]["action"] == "start"
         assert client.post("/api/scenarios/main/baseline").status_code == 409
         assert client.post("/api/scenarios/main/optimize").status_code == 409
-        replanned = client.post("/api/scenarios/main/replan", json={"current_time": started["start_time"] + 1, "time_limit_seconds": 1})
+        replanned = client.post(
+            "/api/scenarios/main/replan", json={"current_time": started["start_time"] + 1, "time_limit_seconds": 1}
+        )
         assert replanned.status_code == 200
-        preserved = next(item for item in replanned.json()["assignments"] if item["work_order_id"] == started["work_order_id"])
+        preserved = next(
+            item for item in replanned.json()["assignments"] if item["work_order_id"] == started["work_order_id"]
+        )
         assert (preserved["technician_id"], preserved["start_time"], preserved["finish_time"]) == (
-            started["technician_id"], started["start_time"], started["finish_time"],
+            started["technician_id"],
+            started["start_time"],
+            started["finish_time"],
         )

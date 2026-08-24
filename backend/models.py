@@ -155,9 +155,31 @@ class SolverConfig(BaseModel):
     replan_change_weight: int = 80
 
 
+class SolverPolicySnapshot(BaseModel):
+    policy_version: str = "FIELD_SERVICE_SOLVER_POLICY_V1"
+    profile_id: str | None = None
+    profile_name: str
+    profile_snapshot: dict[str, Any] = Field(default_factory=dict)
+    solver_config: SolverConfig
+    unassigned_penalty_scale: float | None = None
+    effective_drop_penalties: dict[str, int] = Field(default_factory=dict)
+    time_limit_ms: int
+    solution_limit: int | None = None
+    first_solution_strategy: str | None = None
+    local_search_metaheuristic: str | None = None
+    fingerprint: str
+
+
 StrategyKey = Literal[
-    "baseline", "balanced", "completion", "punctuality", "low_travel",
-    "low_overtime", "fair_workload", "stable", "custom",
+    "baseline",
+    "balanced",
+    "completion",
+    "punctuality",
+    "low_travel",
+    "low_overtime",
+    "fair_workload",
+    "stable",
+    "custom",
 ]
 
 
@@ -302,6 +324,7 @@ class ScheduleResult(BaseModel):
     business_score_policy_version: str = "FIELD_SERVICE_SCORE_V2"
     scenario_snapshot_hash: str = ""
     solver_config_hash: str = ""
+    solver_policy: SolverPolicySnapshot | None = None
     travel_model_version: str = "EUCLIDEAN_GRID_V2"
     travel_model_fingerprint: str = "EUCLIDEAN_GRID_V2"
     metric_policy_version: str = "FIELD_SERVICE_METRICS_V2"
@@ -322,7 +345,9 @@ class LockRequest(BaseModel):
 
 class OptimizeRequest(BaseModel):
     time_limit_seconds: float | None = Field(default=None, ge=1, le=30)
-    strategy: Literal["balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload"] = "balanced"
+    strategy: Literal["balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload"] = (
+        "balanced"
+    )
     profile_id: Identifier | None = None
 
 
@@ -331,7 +356,9 @@ class ReplanRequest(BaseModel):
     current_time: int | None = Field(default=None, ge=0, le=1800)
     planning_time: int | None = Field(default=None, ge=0, le=1800)
     time_limit_seconds: float | None = Field(default=None, ge=1, le=30)
-    strategy: Literal["balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload", "stable"] = "stable"
+    strategy: Literal[
+        "balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload", "stable"
+    ] = "stable"
     profile_id: str | None = None
     idempotency_key: IdempotencyKey | None = None
     intake_idempotency_key: IdempotencyKey | None = None
@@ -370,11 +397,7 @@ class WorkOrderUpdate(BaseModel):
         if not self.model_fields_set:
             raise ValueError("工单更新至少需要一个字段")
         clearable = {"reported_at", "note"}
-        invalid_nulls = [
-            field
-            for field in self.model_fields_set - clearable
-            if getattr(self, field) is None
-        ]
+        invalid_nulls = [field for field in self.model_fields_set - clearable if getattr(self, field) is None]
         if invalid_nulls:
             raise ValueError(f"字段不能为 null: {', '.join(sorted(invalid_nulls))}")
         return self
@@ -393,6 +416,7 @@ class WorkOrderExecutionEvent(BaseModel):
     work_order_id: str
     technician_id: str
     action: Literal["start", "complete"]
+    sequence: int = Field(default=0, ge=0)
     occurred_at: int
     scenario_revision: int
     plan_version_id: str
@@ -419,9 +443,7 @@ class TechnicianUpdate(BaseModel):
     def validate_patch(self) -> TechnicianUpdate:
         if not self.model_fields_set:
             raise ValueError("技师更新至少需要一个字段")
-        invalid_nulls = [
-            field for field in self.model_fields_set if getattr(self, field) is None
-        ]
+        invalid_nulls = [field for field in self.model_fields_set if getattr(self, field) is None]
         if invalid_nulls:
             raise ValueError(f"字段不能为 null: {', '.join(sorted(invalid_nulls))}")
         return self
@@ -466,7 +488,15 @@ class PlanVersion(BaseModel):
     label: ShortLabel
     data_revision: int
     source_version_id: str | None = None
-    relation: Literal["new", "optimized_from", "replanned_from", "reactivated_from", "restored_from", "published_from_experiment", "fresh_after_data_change"] = "new"
+    relation: Literal[
+        "new",
+        "optimized_from",
+        "replanned_from",
+        "reactivated_from",
+        "restored_from",
+        "published_from_experiment",
+        "fresh_after_data_change",
+    ] = "new"
     active: bool = False
     created_at: str
     scenario_snapshot: ScheduleScenario | None = None
@@ -504,6 +534,9 @@ class RollbackPreview(BaseModel):
     removed_work_orders: list[str] = Field(default_factory=list)
     modified_work_orders: list[str] = Field(default_factory=list)
     completed_work_orders_reopened: list[str] = Field(default_factory=list)
+    started_work_orders_reopened: list[str] = Field(default_factory=list)
+    executed_work_orders_deleted: list[str] = Field(default_factory=list)
+    affected_execution_event_ids: list[str] = Field(default_factory=list)
     technician_changes: list[str] = Field(default_factory=list)
     lock_changes: list[str] = Field(default_factory=list)
 
@@ -512,7 +545,10 @@ class RestoreRequest(BaseModel):
     expected_revision: int = Field(ge=0)
     confirmation_token: str = Field(min_length=16, max_length=128)
     reason: ShortLabel
-    allow_reopen_completed: bool = False
+    allow_reopen_completed: bool = Field(
+        default=False,
+        description="兼容旧客户端；执行事件不可变，服务端始终拒绝重新打开已完成工单",
+    )
     allow_delete_new_orders: bool = False
     idempotency_key: IdempotencyKey
 
@@ -527,7 +563,15 @@ class StrategyWeights(BaseModel):
 
     @model_validator(mode="after")
     def validate_objective(self) -> StrategyWeights:
-        if not any((self.travel_weight, self.sla_late_weight, self.overtime_weight, self.imbalance_weight, self.replan_change_weight)):
+        if not any(
+            (
+                self.travel_weight,
+                self.sla_late_weight,
+                self.overtime_weight,
+                self.imbalance_weight,
+                self.replan_change_weight,
+            )
+        ):
             raise ValueError("至少保留一个非零目标权重")
         return self
 
@@ -643,11 +687,42 @@ class FrozenAssignment(BaseModel):
     reason: FreezeReason
 
 
+class ExecutionSourceAssignment(BaseModel):
+    work_order_id: Identifier
+    technician_id: Identifier
+    source_schedule_id: str
+    source_assignment_hash: str
+    sequence: int = Field(ge=1)
+    planned_start_at: int = Field(ge=0, le=1800)
+    planned_finish_at: int = Field(ge=0, le=2280)
+    actual_start_at: int | None = Field(default=None, ge=0, le=2280)
+    projected_available_at: int = Field(ge=0, le=2760)
+
+
+class TechnicianExecutionProjection(BaseModel):
+    technician_id: Identifier
+    source_work_order_id: Identifier
+    state: Literal["started", "completed"]
+    effective_location: Point
+    available_at: int = Field(ge=0, le=2760)
+    execution_event_sequence: int = Field(ge=1)
+
+
+class ExecutionSourceContext(BaseModel):
+    active_plan_version_id: str | None = None
+    active_plan_snapshot_hash: str | None = None
+    active_schedule_id: str | None = None
+    execution_event_sequence: int = Field(ge=0)
+    started_assignments: list[ExecutionSourceAssignment] = Field(default_factory=list)
+    technician_projections: list[TechnicianExecutionProjection] = Field(default_factory=list)
+
+
 class PlanningContext(BaseModel):
     planning_time: int = Field(ge=0, le=1800)
     source_plan_version_id: str | None = None
     source_plan_snapshot_hash: str | None = None
     scenario_revision: int = Field(ge=0)
+    execution_source_context: ExecutionSourceContext | None = None
     frozen_assignments: list[FrozenAssignment] = Field(default_factory=list)
     inferred_departure_warnings: list[Identifier] = Field(default_factory=list)
 
@@ -673,6 +748,7 @@ class ScheduleRun(BaseModel):
     solver_name: str
     solver_version: str
     solver_config_hash: str
+    solver_policy_fingerprint: str = ""
     requested_time_limit_ms: int
     effective_time_limit_ms: int
     status: ScheduleRunStatus
@@ -693,6 +769,7 @@ class ScheduleCandidate(BaseModel):
     scenario_snapshot_hash: str
     source_plan_version_id: str | None = None
     solver_config_hash: str
+    solver_policy_fingerprint: str = ""
     schedule: ScheduleResult
     verification_report: ScheduleVerificationReport
     publishable: bool

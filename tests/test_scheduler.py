@@ -70,7 +70,10 @@ def test_started_work_is_stable_during_replan():
     after = replan_schedule(scenario, 2, before, current_time=fixed.start_time + 1, time_limit_seconds=1)
     preserved = next(a for a in after.assignments if a.work_order_id == fixed.work_order_id)
     assert (preserved.technician_id, preserved.sequence, preserved.start_time, preserved.finish_time) == (
-        fixed.technician_id, fixed.sequence, fixed.start_time, fixed.finish_time
+        fixed.technician_id,
+        fixed.sequence,
+        fixed.start_time,
+        fixed.finish_time,
     )
 
 
@@ -115,11 +118,19 @@ def test_stress_fixture_returns_a_verified_solution_within_its_limit():
 
 def test_optimizer_allows_waits_longer_than_six_hours_and_records_real_arrival():
     scenario = get_fixture("main")
-    scenario.work_orders = [WorkOrder(
-        id="WO-LATE", customer_name="夜间客户", title="晚间维护",
-        required_skills=[scenario.technicians[0].skills[0]], location=Point(x=50, y=52),
-        service_duration=30, window_start=1200, window_end=1260, sla_deadline=1260,
-    )]
+    scenario.work_orders = [
+        WorkOrder(
+            id="WO-LATE",
+            customer_name="夜间客户",
+            title="晚间维护",
+            required_skills=[scenario.technicians[0].skills[0]],
+            location=Point(x=50, y=52),
+            service_duration=30,
+            window_start=1200,
+            window_end=1260,
+            sla_deadline=1260,
+        )
+    ]
     scenario.technicians = [scenario.technicians[0].model_copy(update={"shift_end": 1320})]
     result = optimized_schedule(scenario, 1, time_limit_seconds=1)
     assert validate_schedule(scenario, result) == []
@@ -154,22 +165,32 @@ def test_assignment_explanation_uses_route_local_insertion_evidence():
     assert not any("至少减少" in line or "全局最优" in line for line in assignment.explanation)
 
 
-def test_completed_prefix_does_not_push_completion_rate_above_one():
+def test_completed_work_is_excluded_from_future_replan_and_rate_stays_bounded():
     scenario = get_fixture("emergency")
     before = optimized_schedule(scenario, 1, time_limit_seconds=1)
     completed = min(before.assignments, key=lambda item: item.start_time)
-    next(order for order in scenario.work_orders if order.id == completed.work_order_id).status = WorkOrderStatus.completed
+    next(
+        order for order in scenario.work_orders if order.id == completed.work_order_id
+    ).status = WorkOrderStatus.completed
     after = replan_schedule(scenario, 2, before, current_time=completed.start_time - 1, time_limit_seconds=1)
     assert after.kpis.completion_rate <= 1
-    assert next(item for item in after.assignments if item.work_order_id == completed.work_order_id).start_time == completed.start_time
+    assert all(item.work_order_id != completed.work_order_id for item in after.assignments)
 
 
 def test_validator_reports_unknown_references_instead_of_crashing():
     scenario = get_fixture("main")
     result = baseline_schedule(scenario, 1)
-    result.assignments.append(ScheduleAssignment(
-        work_order_id="WO-UNKNOWN", technician_id="TECH-UNKNOWN", sequence=99,
-        arrival_time=600, start_time=600, finish_time=630, travel_minutes=0,
-        sla_late_minutes=0, explanation=[],
-    ))
+    result.assignments.append(
+        ScheduleAssignment(
+            work_order_id="WO-UNKNOWN",
+            technician_id="TECH-UNKNOWN",
+            sequence=99,
+            arrival_time=600,
+            start_time=600,
+            finish_time=630,
+            travel_minutes=0,
+            sla_late_minutes=0,
+            explanation=[],
+        )
+    )
     assert "work order does not exist" in " ".join(validate_schedule(scenario, result))

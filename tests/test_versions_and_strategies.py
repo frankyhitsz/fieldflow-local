@@ -22,20 +22,35 @@ def _verified_candidate(store: Store, scenario, result) -> str:
     now = datetime.now(UTC).isoformat()
     suffix = uuid.uuid4().hex[:10]
     run = ScheduleRun(
-        id=f"RUN-{suffix}", scenario_id=scenario.id, action="baseline",
-        scenario_revision=scenario.revision, scenario_snapshot_hash=content_hash(scenario),
-        solver_name=result.solver_name, solver_version=result.solver_version,
-        solver_config_hash=result.solver_config_hash, requested_time_limit_ms=0,
-        effective_time_limit_ms=0, status=ScheduleRunStatus.running,
-        solution_found=False, started_at=now,
+        id=f"RUN-{suffix}",
+        scenario_id=scenario.id,
+        action="baseline",
+        scenario_revision=scenario.revision,
+        scenario_snapshot_hash=content_hash(scenario),
+        solver_name=result.solver_name,
+        solver_version=result.solver_version,
+        solver_config_hash=result.solver_config_hash,
+        solver_policy_fingerprint=result.solver_policy.fingerprint,
+        requested_time_limit_ms=0,
+        effective_time_limit_ms=0,
+        status=ScheduleRunStatus.running,
+        solution_found=False,
+        started_at=now,
     )
     store.save_schedule_run(run)
     report = verify_schedule(scenario, result)
     candidate = ScheduleCandidate(
-        id=f"CAND-{suffix}", run_id=run.id, scenario_id=scenario.id,
-        scenario_revision=scenario.revision, scenario_snapshot_hash=content_hash(scenario),
-        solver_config_hash=result.solver_config_hash, schedule=result,
-        verification_report=report, publishable=report.publishable, created_at=now,
+        id=f"CAND-{suffix}",
+        run_id=run.id,
+        scenario_id=scenario.id,
+        scenario_revision=scenario.revision,
+        scenario_snapshot_hash=content_hash(scenario),
+        solver_config_hash=result.solver_config_hash,
+        solver_policy_fingerprint=result.solver_policy.fingerprint,
+        schedule=result,
+        verification_report=report,
+        publishable=report.publishable,
+        created_at=now,
     )
     run.status = ScheduleRunStatus.feasible
     run.solution_found = True
@@ -50,18 +65,21 @@ def _wait_for_experiment(client: TestClient, scenario_id: str, experiment_id: st
         payload = client.get(f"/api/scenarios/{scenario_id}/strategy-experiments/{experiment_id}").json()
         if payload["status"] not in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
             return payload
-        time.sleep(.05)
+        time.sleep(0.05)
     raise AssertionError("strategy experiment did not finish")
 
 
 def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_versions(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "versions.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
 
     with TestClient(main_module.app) as client:
         baseline = client.post("/api/scenarios/main/baseline").json()
-        optimized = client.post("/api/scenarios/main/optimize", json={"strategy": "low_travel", "time_limit_seconds": 1}).json()
+        optimized = client.post(
+            "/api/scenarios/main/optimize", json={"strategy": "low_travel", "time_limit_seconds": 1}
+        ).json()
         assert (baseline["version"], optimized["version"]) == (1, 2)
         low_travel_profile = next(
             item for item in main_module.require_store().list_profiles() if item.id == "low_travel"
@@ -72,12 +90,8 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         )
         assert optimized["solver_config_hash"] == expected_solver_hash
         assert optimized["solver_config_hash"] != content_hash(get_fixture("main").solver_config)
-        optimized_plan = client.get(
-            "/api/scenarios/main/plan-versions/V002"
-        ).json()
-        internal_baseline = next(
-            item["schedule"] for item in optimized_plan["artifacts"] if item["role"] == "baseline"
-        )
+        optimized_plan = client.get("/api/scenarios/main/plan-versions/V002").json()
+        internal_baseline = next(item["schedule"] for item in optimized_plan["artifacts"] if item["role"] == "baseline")
         assert internal_baseline["solver_config_hash"] == expected_solver_hash
         assert internal_baseline["scenario_snapshot_hash"] == optimized["scenario_snapshot_hash"]
 
@@ -85,9 +99,7 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         assert edited["revision"] == 1
 
         plans = client.get("/api/scenarios/main/plan-versions").json()
-        preview = client.get(
-            f"/api/scenarios/main/plan-versions/{plans[0]['id']}/rollback-preview"
-        ).json()
+        preview = client.get(f"/api/scenarios/main/plan-versions/{plans[0]['id']}/rollback-preview").json()
         assert preview["current_plan_version_id"] == plans[1]["id"]
         assert preview["current_plan_number"] == 2
         assert isinstance(preview["changed_plan_work_orders"], list)
@@ -129,54 +141,86 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         renamed = client.patch(f"/api/scenarios/main/plan-versions/{restored['id']}", json={"label": "午前恢复方案"})
         assert renamed.status_code == 200
         assert renamed.json()["label"] == "午前恢复方案"
-        assert client.get(f"/api/scenarios/main/comparison?before={plans[0]['id']}&after={plans[1]['id']}").status_code == 200
-        selected_comparison = client.get(
-            f"/api/scenarios/main/comparison?after={plans[1]['id']}"
+        assert (
+            client.get(f"/api/scenarios/main/comparison?before={plans[0]['id']}&after={plans[1]['id']}").status_code
+            == 200
         )
+        selected_comparison = client.get(f"/api/scenarios/main/comparison?after={plans[1]['id']}")
         assert selected_comparison.status_code == 200
         assert selected_comparison.json()["after"]["id"] == optimized["id"]
         assert client.get(f"/api/scenarios/main/plan-versions/{restored['id']}/report").status_code == 200
 
         profiles = client.get("/api/strategy-profiles").json()
         assert {"low_overtime", "fair_workload", "stable"}.issubset({item["id"] for item in profiles})
-        experiment_response = client.post("/api/scenarios/main/strategy-experiments", json={
-            "dataset": "current", "profile_ids": ["balanced", "low_travel", "low_overtime"], "time_limit_seconds": 1,
-        })
+        experiment_response = client.post(
+            "/api/scenarios/main/strategy-experiments",
+            json={
+                "dataset": "current",
+                "profile_ids": ["balanced", "low_travel", "low_overtime"],
+                "time_limit_seconds": 1,
+            },
+        )
         assert experiment_response.status_code == 202
-        duplicate_response = client.post("/api/scenarios/main/strategy-experiments", json={
-            "dataset": "current", "profile_ids": ["balanced", "low_travel", "low_overtime"], "time_limit_seconds": 1,
-        })
+        duplicate_response = client.post(
+            "/api/scenarios/main/strategy-experiments",
+            json={
+                "dataset": "current",
+                "profile_ids": ["balanced", "low_travel", "low_overtime"],
+                "time_limit_seconds": 1,
+            },
+        )
         assert duplicate_response.status_code == 202
         assert duplicate_response.json()["id"] == experiment_response.json()["id"]
         experiment = _wait_for_experiment(client, "main", experiment_response.json()["id"])
         assert experiment["status"] == "COMPLETED"
         assert len(experiment["candidates"]) == 3
-        assert len({tuple((item["work_order_id"], item["technician_id"], item["sequence"]) for item in candidate["schedule"]["assignments"]) for candidate in experiment["candidates"]}) >= 2
+        assert (
+            len(
+                {
+                    tuple(
+                        (item["work_order_id"], item["technician_id"], item["sequence"])
+                        for item in candidate["schedule"]["assignments"]
+                    )
+                    for candidate in experiment["candidates"]
+                }
+            )
+            >= 2
+        )
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2, 3]
 
         candidate = next(item for item in experiment["candidates"] if item["publishable"])
-        published = client.post(f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish", json={"candidate_id": candidate["id"], "expected_revision": 2})
+        published = client.post(
+            f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish",
+            json={"candidate_id": candidate["id"], "expected_revision": 2},
+        )
         assert published.status_code == 200
         assert published.json()["number"] == 4
-        retried = client.post(f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish", json={"candidate_id": candidate["id"], "expected_revision": 2})
+        retried = client.post(
+            f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish",
+            json={"candidate_id": candidate["id"], "expected_revision": 2},
+        )
         assert retried.status_code == 200
         assert retried.json()["id"] == published.json()["id"]
-        published_experiment = client.get(
-            f"/api/scenarios/main/strategy-experiments/{experiment['id']}"
-        ).json()
+        published_experiment = client.get(f"/api/scenarios/main/strategy-experiments/{experiment['id']}").json()
         assert published_experiment["winner_candidate_id"] == candidate["id"]
         assert published_experiment["winner_plan_version_id"] == published.json()["id"]
         assert published_experiment["published_at"]
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2, 3, 4]
-        another = next((item for item in experiment["candidates"] if item["id"] != candidate["id"] and item["publishable"]), None)
+        another = next(
+            (item for item in experiment["candidates"] if item["id"] != candidate["id"] and item["publishable"]), None
+        )
         if another:
-            rejected_second_choice = client.post(f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish", json={"candidate_id": another["id"], "expected_revision": 2})
+            rejected_second_choice = client.post(
+                f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish",
+                json={"candidate_id": another["id"], "expected_revision": 2},
+            )
             assert rejected_second_choice.status_code == 409
 
 
 def test_experiment_can_be_cancelled_cooperatively(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "experiment-cancel.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     started = threading.Event()
     release = threading.Event()
@@ -195,24 +239,26 @@ def test_experiment_can_be_cancelled_cooperatively(monkeypatch, tmp_path):
         )
         assert created.status_code == 202
         assert started.wait(2)
-        cancelled = client.post(
-            f"/api/scenarios/main/strategy-experiments/{created.json()['id']}/cancel"
-        )
+        cancelled = client.post(f"/api/scenarios/main/strategy-experiments/{created.json()['id']}/cancel")
         assert cancelled.status_code == 202
         assert cancelled.json()["status"] == "CANCEL_REQUESTED"
         release.set()
         terminal = _wait_for_experiment(client, "main", created.json()["id"])
         assert terminal["status"] == "CANCELLED"
         assert terminal["finished_at"]
-        assert client.post(
-            f"/api/scenarios/main/strategy-experiments/{created.json()['id']}/publish",
-            json={"candidate_id": "none", "expected_revision": 0},
-        ).status_code == 409
+        assert (
+            client.post(
+                f"/api/scenarios/main/strategy-experiments/{created.json()['id']}/publish",
+                json={"candidate_id": "none", "expected_revision": 0},
+            ).status_code
+            == 409
+        )
 
 
 def test_experiment_partial_failure_and_queue_capacity_are_explicit(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "experiment-governance.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     original = main_module.optimized_schedule
 
@@ -267,10 +313,19 @@ def test_experiment_partial_failure_and_queue_capacity_are_explicit(monkeypatch,
 def test_custom_profile_crud_and_stale_experiment_guard(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "profiles.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     payload = {
-        "name": "城郊节油", "description": "长距离区域减少往返",
-        "weights": {"travel_weight": 20, "sla_late_weight": 8, "overtime_weight": 6, "imbalance_weight": 2, "replan_change_weight": 80, "unassigned_penalty_scale": .8},
+        "name": "城郊节油",
+        "description": "长距离区域减少往返",
+        "weights": {
+            "travel_weight": 20,
+            "sla_late_weight": 8,
+            "overtime_weight": 6,
+            "imbalance_weight": 2,
+            "replan_change_weight": 80,
+            "unassigned_penalty_scale": 0.8,
+        },
         "time_limit_seconds": 1,
     }
     with TestClient(main_module.app) as client:
@@ -281,8 +336,12 @@ def test_custom_profile_crud_and_stale_experiment_guard(monkeypatch, tmp_path):
         assert client.put(f"/api/strategy-profiles/{profile_id}", json=payload).json()["name"] == "城郊低行程"
         assert client.delete("/api/strategy-profiles/balanced").status_code == 409
 
-        blocker = client.post("/api/scenarios/main/strategy-experiments", json={"profile_ids": ["fair_workload"], "time_limit_seconds": 1})
-        response = client.post("/api/scenarios/main/strategy-experiments", json={"profile_ids": [profile_id], "time_limit_seconds": 1})
+        blocker = client.post(
+            "/api/scenarios/main/strategy-experiments", json={"profile_ids": ["fair_workload"], "time_limit_seconds": 1}
+        )
+        response = client.post(
+            "/api/scenarios/main/strategy-experiments", json={"profile_ids": [profile_id], "time_limit_seconds": 1}
+        )
         assert response.json()["scenario_id"] == "main"
         assert response.json()["status"] in {"QUEUED", "RUNNING"}
         payload["weights"]["travel_weight"] = 21
@@ -301,29 +360,37 @@ def test_custom_profile_crud_and_stale_experiment_guard(monkeypatch, tmp_path):
         assert experiment["status"] == "COMPLETED"
         edited = client.put("/api/scenarios/main/work-orders/WO-1021", json={"note": "实验后更新"})
         assert edited.status_code == 200
-        rejected = client.post(f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish", json={"candidate_id": experiment["candidates"][0]["id"], "expected_revision": 1})
+        rejected = client.post(
+            f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish",
+            json={"candidate_id": experiment["candidates"][0]["id"], "expected_revision": 1},
+        )
         assert rejected.status_code == 409
 
 
 def test_comparison_marks_different_business_snapshots_as_non_comparable(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "comparison-snapshots.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
         client.post("/api/scenarios/main/baseline")
         before = client.get("/api/scenarios/main/plan-versions").json()[0]
-        assert client.put(
-            "/api/scenarios/main/work-orders/WO-1021",
-            json={"note": "客户改约后重新计算"},
-        ).status_code == 200
-        assert client.post(
-            "/api/scenarios/main/optimize",
-            json={"strategy": "balanced", "time_limit_seconds": 1},
-        ).status_code == 200
+        assert (
+            client.put(
+                "/api/scenarios/main/work-orders/WO-1021",
+                json={"note": "客户改约后重新计算"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/scenarios/main/optimize",
+                json={"strategy": "balanced", "time_limit_seconds": 1},
+            ).status_code
+            == 200
+        )
         after = client.get("/api/scenarios/main/plan-versions").json()[-1]
-        comparison = client.get(
-            f"/api/scenarios/main/comparison?before={before['id']}&after={after['id']}"
-        ).json()
+        comparison = client.get(f"/api/scenarios/main/comparison?before={before['id']}&after={after['id']}").json()
         assert comparison["comparable"] is False
         assert comparison["same_scenario_snapshot"] is False
         assert comparison["modified_work_orders"] == ["WO-1021"]
@@ -335,6 +402,7 @@ def test_comparison_marks_different_business_snapshots_as_non_comparable(monkeyp
 def test_plan_commands_are_idempotent_in_scenario_and_action_namespaces(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "plan-command-idempotency.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     headers = {"Idempotency-Key": "same-visible-key-001"}
     with TestClient(main_module.app) as client:
@@ -366,15 +434,14 @@ def test_plan_commands_are_idempotent_in_scenario_and_action_namespaces(monkeypa
 def test_historical_activation_and_clone_do_not_modify_current_business_data(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "activation-clone.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
         client.post("/api/scenarios/main/baseline")
         client.post("/api/scenarios/main/optimize", json={"time_limit_seconds": 1})
         plans = client.get("/api/scenarios/main/plan-versions").json()
         source = plans[0]
-        stale_preview = client.get(
-            f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview"
-        ).json()
+        stale_preview = client.get(f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview").json()
         activated = client.post(
             f"/api/scenarios/main/plan-versions/{source['id']}/activate",
             json={"expected_revision": 0, "idempotency_key": "activate-history-001"},
@@ -401,9 +468,7 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
         )
         assert expired_rollback.status_code == 409
         assert "重新查看差异" in str(expired_rollback.json()["detail"])
-        assert [
-            item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()
-        ] == [1, 2, 3]
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2, 3]
 
         clone_request = {"name": "V001 独立副本", "idempotency_key": "clone-history-001"}
         clone = client.post(
@@ -426,21 +491,28 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
             json={"expected_revision": 1, "idempotency_key": "activate-history-002"},
         )
         assert rejected.status_code == 409
-        assert next(
-            item for item in client.get("/api/scenarios/main").json()["work_orders"] if item["id"] == "WO-1021"
-        )["note"] == "实时变更"
+        assert (
+            next(item for item in client.get("/api/scenarios/main").json()["work_orders"] if item["id"] == "WO-1021")[
+                "note"
+            ]
+            == "实时变更"
+        )
 
 
 def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "clone-reset.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
         source_note = "克隆时保留的业务输入"
-        assert client.put(
-            "/api/scenarios/main/work-orders/WO-1021",
-            json={"note": source_note},
-        ).status_code == 200
+        assert (
+            client.put(
+                "/api/scenarios/main/work-orders/WO-1021",
+                json={"note": source_note},
+            ).status_code
+            == 200
+        )
         assert client.post("/api/scenarios/main/baseline").status_code == 200
         source = client.get("/api/scenarios/main/plan-versions").json()[0]
         clone = client.post(
@@ -451,9 +523,7 @@ def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
             },
         ).json()
         clone_id = clone["id"]
-        assert next(
-            item for item in clone["work_orders"] if item["id"] == "WO-1021"
-        )["note"] == source_note
+        assert next(item for item in clone["work_orders"] if item["id"] == "WO-1021")["note"] == source_note
 
         edited = client.put(
             f"/api/scenarios/{clone_id}/work-orders/WO-1021",
@@ -463,34 +533,44 @@ def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
         reset = client.post(f"/api/scenarios/{clone_id}/reset")
         assert reset.status_code == 200
         assert reset.json()["revision"] == 2
-        assert next(
-            item for item in reset.json()["work_orders"] if item["id"] == "WO-1021"
-        )["note"] == source_note
+        assert next(item for item in reset.json()["work_orders"] if item["id"] == "WO-1021")["note"] == source_note
 
 
 def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "rollback-guards.db"))
     import backend.main as main_module
+
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
         client.post("/api/scenarios/main/baseline")
         source = client.get("/api/scenarios/main/plan-versions").json()[0]
-        assignment = next(item for item in source["selected"]["assignments"] if item["work_order_id"] == "WO-1021")
+        assignment = next(item for item in source["selected"]["assignments"] if item["sequence"] == 1)
+        work_order_id = assignment["work_order_id"]
         revision = client.get("/api/scenarios/main").json()["revision"]
         started = client.post(
-            "/api/scenarios/main/work-orders/WO-1021/start",
-            json={"technician_id": assignment["technician_id"], "occurred_at": assignment["start_time"], "expected_revision": revision, "idempotency_key": "rollback-start-001"},
+            f"/api/scenarios/main/work-orders/{work_order_id}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": revision,
+                "idempotency_key": "rollback-start-001",
+            },
         )
         assert started.status_code == 200
         completed = client.post(
-            "/api/scenarios/main/work-orders/WO-1021/complete",
-            json={"technician_id": assignment["technician_id"], "occurred_at": assignment["finish_time"], "expected_revision": started.json()["scenario"]["revision"], "idempotency_key": "rollback-complete-001"},
+            f"/api/scenarios/main/work-orders/{work_order_id}/complete",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["finish_time"],
+                "expected_revision": started.json()["scenario"]["revision"],
+                "idempotency_key": "rollback-complete-001",
+            },
         )
         assert completed.status_code == 200
-        preview = client.get(
-            f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview"
-        ).json()
-        assert preview["completed_work_orders_reopened"] == ["WO-1021"]
+        preview = client.get(f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview").json()
+        assert preview["completed_work_orders_reopened"] == [work_order_id]
+        assert preview["executed_work_orders_deleted"] == []
+        assert len(preview["affected_execution_event_ids"]) == 2
         blocked = client.post(
             f"/api/scenarios/main/plan-versions/{source['id']}/restore",
             json={
@@ -506,9 +586,7 @@ def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(mo
         extra = dict(current["work_orders"][0])
         extra.update({"id": "WO-NEW-AFTER-PLAN", "status": "pending", "is_emergency": False, "reported_at": None})
         assert client.post("/api/scenarios/main/work-orders", json=extra).status_code == 200
-        preview = client.get(
-            f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview"
-        ).json()
+        preview = client.get(f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview").json()
         assert preview["removed_work_orders"] == ["WO-NEW-AFTER-PLAN"]
         blocked = client.post(
             f"/api/scenarios/main/plan-versions/{source['id']}/restore",
@@ -522,8 +600,7 @@ def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(mo
         )
         assert blocked.status_code == 409
         assert any(
-            item["id"] == "WO-NEW-AFTER-PLAN"
-            for item in client.get("/api/scenarios/main").json()["work_orders"]
+            item["id"] == "WO-NEW-AFTER-PLAN" for item in client.get("/api/scenarios/main").json()["work_orders"]
         )
 
 
@@ -533,7 +610,12 @@ def test_atomic_public_version_allocation(tmp_path):
     results = [baseline_schedule(scenario, 0) for _ in range(4)]
     candidate_ids = [_verified_candidate(store, scenario, result) for result in results]
     with ThreadPoolExecutor(max_workers=4) as executor:
-        plans = list(executor.map(lambda pair: store.publish_plan(scenario, pair[0], "baseline", candidate_id=pair[1]), zip(results, candidate_ids, strict=False)))
+        plans = list(
+            executor.map(
+                lambda pair: store.publish_plan(scenario, pair[0], "baseline", candidate_id=pair[1]),
+                zip(results, candidate_ids, strict=False),
+            )
+        )
     assert sorted(plan.number for plan in plans) == [1, 2, 3, 4]
     assert [plan.number for plan in store.list_plan_versions("main")] == [1, 2, 3, 4]
 
@@ -546,20 +628,34 @@ def test_run_and_candidate_completion_rolls_back_as_one_transaction(tmp_path):
     result = baseline_schedule(scenario, 0)
     now = datetime.now(UTC).isoformat()
     run = ScheduleRun(
-        id="RUN-ATOMIC", scenario_id=scenario.id, action="baseline",
-        scenario_revision=scenario.revision, scenario_snapshot_hash=content_hash(scenario),
-        solver_name=result.solver_name, solver_version=result.solver_version,
-        solver_config_hash=result.solver_config_hash, requested_time_limit_ms=0,
-        effective_time_limit_ms=0, status=ScheduleRunStatus.running,
+        id="RUN-ATOMIC",
+        scenario_id=scenario.id,
+        action="baseline",
+        scenario_revision=scenario.revision,
+        scenario_snapshot_hash=content_hash(scenario),
+        solver_name=result.solver_name,
+        solver_version=result.solver_version,
+        solver_config_hash=result.solver_config_hash,
+        solver_policy_fingerprint=result.solver_policy.fingerprint,
+        requested_time_limit_ms=0,
+        effective_time_limit_ms=0,
+        status=ScheduleRunStatus.running,
         started_at=now,
     )
     store.save_schedule_run(run)
     report = verify_schedule(scenario, result)
     candidate = ScheduleCandidate(
-        id="CAND-ATOMIC", run_id=run.id, scenario_id=scenario.id,
-        scenario_revision=scenario.revision, scenario_snapshot_hash=content_hash(scenario),
-        solver_config_hash=result.solver_config_hash, schedule=result,
-        verification_report=report, publishable=report.publishable, created_at=now,
+        id="CAND-ATOMIC",
+        run_id=run.id,
+        scenario_id=scenario.id,
+        scenario_revision=scenario.revision,
+        scenario_snapshot_hash=content_hash(scenario),
+        solver_config_hash=result.solver_config_hash,
+        solver_policy_fingerprint=result.solver_policy.fingerprint,
+        schedule=result,
+        verification_report=report,
+        publishable=report.publishable,
+        created_at=now,
     )
     run.status = ScheduleRunStatus.feasible
     run.solution_found = True
@@ -615,6 +711,7 @@ def test_concurrent_business_edits_are_cas_protected_and_expire_current_plan(tmp
         variants.append(variant)
 
     outcomes: list[str] = []
+
     def save(variant):
         try:
             store.save_scenario(variant, "并发编辑", expected_revision=original.revision)
@@ -654,8 +751,12 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
             PRAGMA user_version = 1;
             """
         )
-        connection.execute("INSERT INTO scenarios(id, payload) VALUES (?, ?)", (legacy_scenario.id, legacy_scenario.model_dump_json()))
-        connection.execute("INSERT INTO schedules(id, scenario_id, kind, version, payload) VALUES ('OLD-1', 'main', 'optimized', 17, '{}')")
+        connection.execute(
+            "INSERT INTO scenarios(id, payload) VALUES (?, ?)", (legacy_scenario.id, legacy_scenario.model_dump_json())
+        )
+        connection.execute(
+            "INSERT INTO schedules(id, scenario_id, kind, version, payload) VALUES ('OLD-1', 'main', 'optimized', 17, '{}')"
+        )
 
     store = Store(database)
     backups = list(tmp_path.glob("fieldflow.legacy-*.db"))
@@ -666,7 +767,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -681,9 +782,7 @@ def test_relational_schema_enforces_foreign_keys_and_artifact_parent(tmp_path):
         assert connection.execute("PRAGMA foreign_key_list(plan_versions)").fetchall()
         assert connection.execute("PRAGMA foreign_key_list(schedule_artifacts)").fetchall()
         with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                "INSERT INTO publication_keys VALUES ('orphan', 'x', 'missing-plan', 'now')"
-            )
+            connection.execute("INSERT INTO publication_keys VALUES ('orphan', 'x', 'missing-plan', 'now')")
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO schedule_artifacts VALUES ('bad-parent', NULL, NULL, 'candidate', '{}', 'now')"
@@ -715,7 +814,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"

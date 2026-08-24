@@ -8,8 +8,12 @@ def test_fixtures_are_deterministic_and_complete():
     assert len(first.technicians) == 4
     assert len(first.work_orders) == 24
     assert set(all_fixtures()) == {
-        "main", "skill-shortage", "window-conflict", "emergency",
-        "strategy-medium", "strategy-stress",
+        "main",
+        "skill-shortage",
+        "window-conflict",
+        "emergency",
+        "strategy-medium",
+        "strategy-stress",
     }
     assert len(get_fixture("strategy-medium").technicians) == 8
     assert len(get_fixture("strategy-medium").work_orders) == 60

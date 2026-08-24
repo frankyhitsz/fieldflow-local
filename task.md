@@ -2,68 +2,62 @@
 
 更新时间：2026-08-24
 
-## 本轮结论
+## 本轮目标
 
-- [x] 完整读取并复核 `pro-plan.md`。该文件锁定旧提交 `ea47edc`，且审查者没有运行测试。
-- [x] 修改前基线：后端 56 项、React 5 项测试通过，Ruff、TypeScript 和生产构建通过。
-- [x] 第一轮：修复硬锁定发布缺口和工单执行状态绕过。
-- [x] 第二轮：统一接报时间、终止状态、返程加班、行程指纹和候选谱系。
-- [x] 第三轮：修复实验取消覆盖竞态、解释模板耦合、重排插单变化口径和前端严格检查。
-- [x] 完整执行构建、Demo 和 Playwright；请求级流程通过，4 个页面用例因本机 Chrome 启动 `SIGABRT` 未进入断言，交由 Linux CI 补足。
-- [x] 提交 `6d1d365` 并推送到 `origin/main`。
-- [ ] 等待 GitHub Actions 完成 Linux Chromium 门禁。
+复核 `pro-plan.md` 锁定的 `f3e0a58`，优先修正计划与执行事实混用的问题，并在不引入占位 worker、库存或移动端模块的前提下收紧发布与历史操作边界。
 
-## 已完成改动
+## 已完成
 
-### 第一轮
+### 执行事实与重排
 
-- Schema v6 增加 `work_order_execution_events`。
-- 新增显式开始/完成服务接口；请求包含技师、发生时间、预期 D 和幂等键。
-- 执行事件、工单状态、D 修订和幂等结果在同一 SQLite 事务中提交。
-- 通用工单 PUT 不再接受状态变化；前端编辑器改为只读状态，工单详情提供执行按钮。
-- Verifier 新增锁定工单缺失/未分配和服务中工单未分配检查。
-- 重排上下文遇到服务中或已完成工单缺少来源分配时返回 409，不再静默跳过。
+- [x] 为执行事件增加场景内单调序号，并在 PlanningContext 中保存当前事件水位。
+- [x] Candidate 发布时由 Verifier 重新读取权威执行上下文，核对来源 V、事件水位和全部服务中工单。
+- [x] 重排从实际开始/完成时间和现场位置继续计算，不再只使用计划完成时间。
+- [x] 禁止跳过路线前序开始服务；禁止同一技师同时服务两张工单。
+- [x] 已完成工单退出未来排程，但继续保留执行事件与来源关系。
+- [x] 有执行状态时，备注、技师或锁定编辑保留当前执行 V；策略实验和普通优化不能绕过执行上下文。
 
-### 第二轮
+### 历史操作与迁移
 
-- `reported_at` 成为基线、优化器、诊断器和 Verifier 共享的最早服务时间。
-- OR-Tools 状态 2 改为 `FEASIBLE`；只有明确超时才使用 `TIME_LIMIT_*`。
-- 加班解释和证据包含末单返程，与 KPI 口径一致。
-- 行程模型增加配置/矩阵 SHA-256 指纹，并纳入实验和发布复核。
-- Candidate 改为写入后不可变；发布事务校验 Run、Candidate、来源方案、场景和求解配置血缘。
-- 突发工单接收键与重排尝试键分离，崩溃后可基于已保存工单重新发起求解。
+- [x] 有执行事件的场景不能 Reset。
+- [x] Rollback 预览列出 started/completed 重开、执行工单删除和受影响事件；正式恢复阻止这些冲突。
+- [x] Clone 定义为独立规划副本，不复制执行事件，并把执行状态归一为 `pending`。
+- [x] Schema v8 删除读取时数据修补；旧默认值在启动迁移中一次性持久化，并新增正式 D 修订。
 
-### 第三轮
+### 求解血缘、幂等与事务
 
-- 实验保存使用状态优先级，陈旧 worker 不能覆盖 `CANCEL_REQUESTED` 或终态。
-- 解释模板变化降为警告；结构化证据和业务约束仍是发布阻断条件。
-- 新工单插入旧路线时，后续旧工单会标记为 changed，与求解变化惩罚和通知口径一致。
-- “工作量公平”说明改为准确描述 min-max 代理目标，不再声称精确优化方差。
-- TypeScript 开启未使用符号和 switch 穿透检查，并清理遗留未使用导入。
-- 现场执行后，调度台明确说明当前 V 仍是执行依据，不再误报为只读历史。
+- [x] 新增 SolverPolicySnapshot，记录 Profile、完整权重、未分配倍率、实际 drop penalty、时限和 OR-Tools 搜索参数。
+- [x] Run、Candidate、Schedule 和发布事务核对同一个政策指纹。
+- [x] baseline、optimize 和普通 replan 在计算前抢占幂等命令；并发重复请求不再重复求解。
+- [x] Run 终态不可覆盖；实验 winner 与 PlanVersion 在同一个 SQLite 事务提交。
+- [x] 执行动作幂等重放返回当前聚合和原事件，不再返回旧 Scenario 快照。
+
+### 界面、指标和 CI
+
+- [x] 用户界面与报告统一使用“计划覆盖率”“计划 SLA 达成率”和“计划占用利用率”。
+- [x] 页头服务时段和技能种类从当前场景计算，移除硬编码。
+- [x] Ruff 格式检查加入 `make lint`；GitHub Actions 在浏览器失败时保留 Playwright trace 和报告。
+- [x] 第四轮逐项判断记录在 `docs/pro-plan-fourth-assessment.md`。
 
 ## 当前验证
 
 ```text
-make lint          通过
-make test-frontend 5 passed
-make test          60 passed，coverage 88.25%
-make build         通过
-make demo-check    通过
-git diff --check   通过
-CSS 显式业务字号   未发现低于 11px
+make lint                         通过（Ruff check + format、TypeScript）
+make test                         67 passed，coverage 87.56%
+make test-frontend               5 passed
+make build                       通过
+make demo-check                  通过
+Playwright API 主流程             1 passed
+git diff --check                 通过
 ```
 
-仅有 OR-Tools SWIG 类型缺少 `__module__` 的 3 条上游弃用提示。
+本机页面级 Playwright 仍受 Codex macOS 沙箱限制：Google Chrome 在创建页面前以 `SIGABRT` 退出，四项测试均未进入应用断言。这与此前复现一致；Linux CI 使用 Playwright Chromium 运行完整五项，并会在失败时上传诊断产物。
 
-`make test-e2e` 中，请求级“编辑 → 优化 → 实验 → 发布 → 回滚 → 比较 → 报告”通过。当前 macOS 沙箱内的 Google Chrome 在页面用例启动时以 `SIGABRT` 退出，4 项均未进入页面断言；对应用例由 GitHub Actions 的 Ubuntu Chromium 环境执行。
+仅有 OR-Tools SWIG 类型缺少 `__module__` 的三条上游弃用提示。
 
-## 尚未纳入当前产品范围
+## 明确延期
 
-- 普通排程请求仍为同步 HTTP；Run 可追踪，但没有独立进程 worker 的恢复队列。
-- OR-Tools 公平策略使用标准化服务负荷的 min-max 代理，不等同于精确最小化前端展示的所有公平指标。
-- 历史 replan 重新激活时的稳定性参照语义仍需独立模型支持。
-- 场景哈希继续采用完整业务快照。按已确认规则，备注、技师资料等业务编辑也会使实验和正式方案过期。
-- LICENSE 由仓库所有者选择。
-
-逐项判断见 `docs/pro-plan-third-assessment.md`。
+- 持久 Outbox、独立 worker、断线恢复和进程级硬取消需要一次完整的异步执行架构改造。
+- D 为兼容现有 API 继续表示聚合修订；新增执行事件序号已把验证水位独立出来，但没有破坏性拆分公开修订模型。
+- 历史 replan 的“血缘来源”和“下一次稳定性比较基准”仍需拆成两个持久字段。
+- Mypy、属性测试、LICENSE、Booking、资产、库存、成本和技师移动端均不以占位实现计入完成。

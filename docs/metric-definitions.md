@@ -5,9 +5,9 @@ Business score policy: `FIELD_SERVICE_SCORE_V2`
 
 ## Service
 
-- `completion_rate`: assigned active work orders divided by all active work orders.
+- `completion_rate`: planning coverage — assigned active work orders divided by all active work orders. It is not an execution completion rate.
 - `assigned_on_time_rate`: on-time assigned work orders divided by assigned work orders.
-- `committed_on_time_rate`: on-time assigned work orders divided by all active work orders. Unassigned work remains in the denominator.
+- `committed_on_time_rate`: planned SLA coverage — on-time planned work divided by all active work orders. Unassigned work remains in the denominator; actual completion events are not used.
 - `total_late_minutes` and `p90_late_minutes`: lateness across assigned active work.
 
 ## Capacity
@@ -29,4 +29,3 @@ Business score policy: `FIELD_SERVICE_SCORE_V2`
 ## Two objective values
 
 `solver_objective_value` is returned by OR-Tools and only has meaning for that solver configuration. `business_score` is recomputed from common business metrics and carries a policy version. Strategy experiments compare the latter and show the raw KPI beside it.
-

@@ -32,10 +32,13 @@ def build_report(scenario: ScheduleScenario, result: ScheduleResult) -> str:
             f"<tbody>{''.join(rows)}</tbody></table></section>"
         )
 
-    unassigned = "".join(
-        f"<li><b>{html.escape(item.work_order_id)}</b> · {html.escape(item.reason.value)}<br><span>{html.escape(item.detail)}</span></li>"
-        for item in result.unassigned
-    ) or "<li>无未分配工单</li>"
+    unassigned = (
+        "".join(
+            f"<li><b>{html.escape(item.work_order_id)}</b> · {html.escape(item.reason.value)}<br><span>{html.escape(item.detail)}</span></li>"
+            for item in result.unassigned
+        )
+        or "<li>无未分配工单</li>"
+    )
     k = result.kpis
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -49,10 +52,10 @@ table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:10px 
 </style></head><body><main>
 <div class="eyebrow">FIELDFLOW / 调度报告</div><h1>{html.escape(scenario.name)}</h1>
 <p class="meta">V{result.version:03d} · {html.escape(kind_label)} · <span class="status">{result.solver_status.value}</span> · 计算 {result.runtime_ms} ms</p>
-<div class="kpis"><div class="kpi"><span>完成率</span><b>{k.completion_rate:.0%}</b></div><div class="kpi"><span>SLA 履约率</span><b>{k.committed_on_time_rate:.0%}</b></div><div class="kpi"><span>总行程</span><b>{k.total_travel_minutes}<small> 分钟</small></b></div><div class="kpi"><span>加班</span><b>{k.total_overtime_minutes}<small> 分钟</small></b></div><div class="kpi"><span>未分配</span><b>{k.unassigned_count}<small> 单</small></b></div></div>
+<div class="kpis"><div class="kpi"><span>计划覆盖率</span><b>{k.completion_rate:.0%}</b></div><div class="kpi"><span>计划 SLA 达成率</span><b>{k.committed_on_time_rate:.0%}</b></div><div class="kpi"><span>计划总行程</span><b>{k.total_travel_minutes}<small> 分钟</small></b></div><div class="kpi"><span>计划加班</span><b>{k.total_overtime_minutes}<small> 分钟</small></b></div><div class="kpi"><span>未分配</span><b>{k.unassigned_count}<small> 单</small></b></div></div>
 <p>{html.escape(result.solver_note)}</p><p class="provenance">业务评分 {result.business_score if result.business_score is not None else result.objective:g} · {html.escape(result.business_score_policy_version)}<br>
-求解器原始目标 {result.solver_objective_value if result.solver_objective_value is not None else '—'} · {html.escape(result.solver_name)} {html.escape(result.solver_version)}<br>
-数据 D{result.scenario_revision:03d} · 行程模型 {html.escape(result.travel_model_version)} · 指标口径 {html.escape(result.metric_policy_version)}</p>{''.join(route_sections)}
+求解器原始目标 {result.solver_objective_value if result.solver_objective_value is not None else "—"} · {html.escape(result.solver_name)} {html.escape(result.solver_version)}<br>
+数据 D{result.scenario_revision:03d} · 行程模型 {html.escape(result.travel_model_version)} · 指标口径 {html.escape(result.metric_policy_version)}</p>{"".join(route_sections)}
 <section><h2>未分配诊断</h2><ul>{unassigned}</ul></section>
 <footer class="muted">FieldFlow 调度台 · 生成于 {html.escape(result.created_at)}</footer>
 </main></body></html>"""

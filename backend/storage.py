@@ -12,6 +12,8 @@ from pathlib import Path
 from .fixtures import all_fixtures
 from .hashing import content_hash
 from .models import (
+    ExecutionSourceAssignment,
+    ExecutionSourceContext,
     PlanCoverageStatus,
     PlanVersion,
     ScenarioRevision,
@@ -25,6 +27,7 @@ from .models import (
     StrategyProfile,
     StrategyProfileCreate,
     StrategyWeights,
+    TechnicianExecutionProjection,
     WorkOrder,
     WorkOrderExecutionEvent,
     WorkOrderExecutionRequest,
@@ -34,7 +37,7 @@ from .models import (
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 class ScenarioRevisionConflict(RuntimeError):
@@ -53,13 +56,111 @@ def _now() -> str:
 
 
 BUILTIN_PROFILES: tuple[StrategyProfile, ...] = (
-    StrategyProfile(id="balanced", name="均衡", description="兼顾完成率、准时、行程和加班", builtin=True, weights=StrategyWeights(overtime_weight=30), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
-    StrategyProfile(id="completion", name="完成率优先", description="优先多排工单，必要时增加行程和加班", builtin=True, weights=StrategyWeights(travel_weight=1, sla_late_weight=1, overtime_weight=1, imbalance_weight=0, replan_change_weight=60, unassigned_penalty_scale=5), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
-    StrategyProfile(id="punctuality", name="准时优先", description="优先按时完成，必要时少排部分工单", builtin=True, weights=StrategyWeights(travel_weight=2, sla_late_weight=200, overtime_weight=30, imbalance_weight=2, replan_change_weight=100, unassigned_penalty_scale=1), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
-    StrategyProfile(id="low_travel", name="低行程", description="减少跨区往返，可能少排部分工单", builtin=True, weights=StrategyWeights(travel_weight=30, sla_late_weight=8, overtime_weight=8, imbalance_weight=1, replan_change_weight=80, unassigned_penalty_scale=.8), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
-    StrategyProfile(id="low_overtime", name="低加班", description="尽量在正常班次内收工", builtin=True, weights=StrategyWeights(travel_weight=2, sla_late_weight=5, overtime_weight=500, imbalance_weight=1, replan_change_weight=90, unassigned_penalty_scale=.5), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
-    StrategyProfile(id="fair_workload", name="工作量公平", description="压低最忙技师的标准化服务负荷，通常让分配更均衡", builtin=True, weights=StrategyWeights(travel_weight=3, sla_late_weight=10, overtime_weight=8, imbalance_weight=10, replan_change_weight=90, unassigned_penalty_scale=1.3), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
-    StrategyProfile(id="stable", name="稳定优先", description="局部重排时尽量保留技师和顺序", builtin=True, weights=StrategyWeights(travel_weight=4, sla_late_weight=16, overtime_weight=10, imbalance_weight=2, replan_change_weight=260, unassigned_penalty_scale=1), time_limit_seconds=2, created_at="2026-08-23T00:00:00+00:00"),
+    StrategyProfile(
+        id="balanced",
+        name="均衡",
+        description="兼顾计划覆盖、准时、行程和加班",
+        builtin=True,
+        weights=StrategyWeights(overtime_weight=30),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
+    StrategyProfile(
+        id="completion",
+        name="覆盖率优先",
+        description="优先把更多工单排入计划，必要时增加行程和计划加班",
+        builtin=True,
+        weights=StrategyWeights(
+            travel_weight=1,
+            sla_late_weight=1,
+            overtime_weight=1,
+            imbalance_weight=0,
+            replan_change_weight=60,
+            unassigned_penalty_scale=5,
+        ),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
+    StrategyProfile(
+        id="punctuality",
+        name="准时优先",
+        description="优先按时完成，必要时少排部分工单",
+        builtin=True,
+        weights=StrategyWeights(
+            travel_weight=2,
+            sla_late_weight=200,
+            overtime_weight=30,
+            imbalance_weight=2,
+            replan_change_weight=100,
+            unassigned_penalty_scale=1,
+        ),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
+    StrategyProfile(
+        id="low_travel",
+        name="低行程",
+        description="减少跨区往返，可能少排部分工单",
+        builtin=True,
+        weights=StrategyWeights(
+            travel_weight=30,
+            sla_late_weight=8,
+            overtime_weight=8,
+            imbalance_weight=1,
+            replan_change_weight=80,
+            unassigned_penalty_scale=0.8,
+        ),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
+    StrategyProfile(
+        id="low_overtime",
+        name="低加班",
+        description="尽量在正常班次内收工",
+        builtin=True,
+        weights=StrategyWeights(
+            travel_weight=2,
+            sla_late_weight=5,
+            overtime_weight=500,
+            imbalance_weight=1,
+            replan_change_weight=90,
+            unassigned_penalty_scale=0.5,
+        ),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
+    StrategyProfile(
+        id="fair_workload",
+        name="工作量公平",
+        description="压低最忙技师的标准化服务负荷，通常让分配更均衡",
+        builtin=True,
+        weights=StrategyWeights(
+            travel_weight=3,
+            sla_late_weight=10,
+            overtime_weight=8,
+            imbalance_weight=10,
+            replan_change_weight=90,
+            unassigned_penalty_scale=1.3,
+        ),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
+    StrategyProfile(
+        id="stable",
+        name="稳定优先",
+        description="局部重排时尽量保留技师和顺序",
+        builtin=True,
+        weights=StrategyWeights(
+            travel_weight=4,
+            sla_late_weight=16,
+            overtime_weight=10,
+            imbalance_weight=2,
+            replan_change_weight=260,
+            unassigned_penalty_scale=1,
+        ),
+        time_limit_seconds=2,
+        created_at="2026-08-23T00:00:00+00:00",
+    ),
 )
 
 
@@ -345,6 +446,7 @@ class Store:
                     scenario_id TEXT NOT NULL,
                     work_order_id TEXT NOT NULL,
                     action TEXT NOT NULL CHECK(action IN ('start', 'complete')),
+                    sequence INTEGER NOT NULL,
                     occurred_at INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -357,12 +459,31 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_candidates_run ON schedule_candidates(run_id);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
-                CREATE INDEX IF NOT EXISTS idx_execution_events_order ON work_order_execution_events(scenario_id, work_order_id, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_execution_events_order ON work_order_execution_events(scenario_id, work_order_id, sequence);
                 """
             )
             columns = {row[1] for row in con.execute("PRAGMA table_info(scenarios)")}
             if "active_plan_version_id" not in columns:
                 con.execute("ALTER TABLE scenarios ADD COLUMN active_plan_version_id TEXT")
+            event_columns = {row[1] for row in con.execute("PRAGMA table_info(work_order_execution_events)")}
+            if "sequence" not in event_columns:
+                con.execute("ALTER TABLE work_order_execution_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
+            if version < 7:
+                scenario_rows = con.execute(
+                    "SELECT DISTINCT scenario_id FROM work_order_execution_events ORDER BY scenario_id"
+                ).fetchall()
+                for scenario_row in scenario_rows:
+                    event_rows = con.execute(
+                        "SELECT id, payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY created_at, id",
+                        (scenario_row["scenario_id"],),
+                    ).fetchall()
+                    for sequence, event_row in enumerate(event_rows, start=1):
+                        event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"])
+                        event.sequence = sequence
+                        con.execute(
+                            "UPDATE work_order_execution_events SET sequence=?, payload=? WHERE id=?",
+                            (sequence, event.model_dump_json(), event.id),
+                        )
             if version < 2:
                 # Legacy schedules lack a restorable business snapshot. The user chose a clean restart.
                 con.execute("DELETE FROM schedules")
@@ -373,6 +494,54 @@ class Store:
                 con.execute("UPDATE scenarios SET active_plan_version_id=NULL")
             if version < 4:
                 self._migrate_relational_schema(con)
+            if version < 8:
+                # Older releases repaired a few legacy defaults only after a
+                # scenario was read.  That made GET responses differ from the
+                # persisted snapshot and bypassed revision/history semantics.
+                # Apply the repair once, transactionally, as an explicit data
+                # migration instead.
+                scenario_rows = con.execute(
+                    "SELECT id, payload, active_plan_version_id FROM scenarios ORDER BY id"
+                ).fetchall()
+                for scenario_row in scenario_rows:
+                    scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+                    before = scenario.model_dump_json()
+                    scenario = self._legacy_upgrade_scenario(scenario)
+                    if scenario.model_dump_json() == before:
+                        continue
+                    latest_revision = con.execute(
+                        "SELECT COALESCE(MAX(number), -1) FROM scenario_revisions WHERE scenario_id=?",
+                        (scenario.id,),
+                    ).fetchone()[0]
+                    scenario.revision = max(scenario.revision, int(latest_revision)) + 1
+                    active_plan_id = scenario_row["active_plan_version_id"]
+                    has_execution = bool(
+                        con.execute(
+                            "SELECT 1 FROM work_order_execution_events WHERE scenario_id=? LIMIT 1",
+                            (scenario.id,),
+                        ).fetchone()
+                    )
+                    if active_plan_id:
+                        plan_row = con.execute(
+                            "SELECT payload FROM plan_versions WHERE id=?",
+                            (active_plan_id,),
+                        ).fetchone()
+                        if plan_row:
+                            plan = PlanVersion.model_validate_json(plan_row["payload"])
+                            plan.coverage_status = PlanCoverageStatus.stale_data_changed
+                            con.execute(
+                                "UPDATE plan_versions SET payload=? WHERE id=?",
+                                (plan.model_dump_json(), plan.id),
+                            )
+                    con.execute(
+                        "UPDATE scenarios SET payload=?, active_plan_version_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (
+                            scenario.model_dump_json(),
+                            active_plan_id if has_execution else None,
+                            scenario.id,
+                        ),
+                    )
+                    self._insert_revision(con, scenario, "v8 旧数据语义升级")
             if version < SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             duplicate_run = con.execute(
@@ -392,24 +561,35 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_candidates_run ON schedule_candidates(run_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_run_unique ON schedule_candidates(run_id);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_execution_events_sequence ON work_order_execution_events(scenario_id, sequence);
                 """
             )
             con.execute("PRAGMA journal_mode = WAL")
-            con.execute("UPDATE strategy_experiments SET payload=json_set(payload, '$.status', 'INTERRUPTED', '$.error', '应用重启，实验已中断') WHERE json_extract(payload, '$.status') IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')")
-            interrupted = con.execute("SELECT payload FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')").fetchall()
+            con.execute(
+                "UPDATE strategy_experiments SET payload=json_set(payload, '$.status', 'INTERRUPTED', '$.error', '应用重启，实验已中断') WHERE json_extract(payload, '$.status') IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')"
+            )
+            interrupted = con.execute(
+                "SELECT payload FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')"
+            ).fetchall()
             for row in interrupted:
                 run = ScheduleRun.model_validate_json(row["payload"])
                 run.status = ScheduleRunStatus.failed
                 run.termination_reason = "APPLICATION_RESTARTED"
                 run.finished_at = _now()
-                con.execute("UPDATE schedule_runs SET status=?, payload=? WHERE id=?", (run.status.value, run.model_dump_json(), run.id))
+                con.execute(
+                    "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
+                    (run.status.value, run.model_dump_json(), run.id),
+                )
         self.seed_fixtures()
         self.seed_profiles()
 
     def seed_fixtures(self) -> None:
         with self._lock, self._connect() as con:
             for scenario in all_fixtures().values():
-                con.execute("INSERT OR IGNORE INTO scenarios(id, payload) VALUES (?, ?)", (scenario.id, scenario.model_dump_json()))
+                con.execute(
+                    "INSERT OR IGNORE INTO scenarios(id, payload) VALUES (?, ?)",
+                    (scenario.id, scenario.model_dump_json()),
+                )
                 self._insert_revision(con, scenario, "内置场景初始化", ignore=True)
 
     def seed_profiles(self) -> None:
@@ -421,27 +601,55 @@ class Store:
                 )
 
     @staticmethod
-    def _insert_revision(con: sqlite3.Connection, scenario: ScheduleScenario, reason: str, ignore: bool = False) -> ScenarioRevision:
-        revision = ScenarioRevision(id=f"REV-{scenario.id}-{scenario.revision}-{uuid.uuid4().hex[:6]}", scenario_id=scenario.id, number=scenario.revision, reason=reason, scenario=scenario.model_copy(deep=True), created_at=_now())
+    def _insert_revision(
+        con: sqlite3.Connection, scenario: ScheduleScenario, reason: str, ignore: bool = False
+    ) -> ScenarioRevision:
+        revision = ScenarioRevision(
+            id=f"REV-{scenario.id}-{scenario.revision}-{uuid.uuid4().hex[:6]}",
+            scenario_id=scenario.id,
+            number=scenario.revision,
+            reason=reason,
+            scenario=scenario.model_copy(deep=True),
+            created_at=_now(),
+        )
         verb = "INSERT OR IGNORE" if ignore else "INSERT"
-        con.execute(f"{verb} INTO scenario_revisions(id, scenario_id, number, reason, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)", (revision.id, revision.scenario_id, revision.number, reason, revision.model_dump_json(), revision.created_at))
+        con.execute(
+            f"{verb} INTO scenario_revisions(id, scenario_id, number, reason, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                revision.id,
+                revision.scenario_id,
+                revision.number,
+                reason,
+                revision.model_dump_json(),
+                revision.created_at,
+            ),
+        )
         return revision
 
     def list_scenarios(self) -> list[ScheduleScenario]:
         with self._connect() as con:
             rows = con.execute("SELECT payload FROM scenarios ORDER BY id").fetchall()
-        return [self._upgrade_scenario(ScheduleScenario.model_validate_json(row["payload"])) for row in rows]
+        return [ScheduleScenario.model_validate_json(row["payload"]) for row in rows]
 
     def get_scenario(self, scenario_id: str) -> ScheduleScenario | None:
         with self._connect() as con:
             row = con.execute("SELECT payload FROM scenarios WHERE id = ?", (scenario_id,)).fetchone()
-        return self._upgrade_scenario(ScheduleScenario.model_validate_json(row["payload"])) if row else None
+        return ScheduleScenario.model_validate_json(row["payload"]) if row else None
 
     @staticmethod
-    def _upgrade_scenario(scenario: ScheduleScenario) -> ScheduleScenario:
+    def _legacy_upgrade_scenario(scenario: ScheduleScenario) -> ScheduleScenario:
         config = scenario.solver_config
-        if (config.travel_weight, config.sla_late_weight, config.overtime_weight, config.imbalance_weight) in {(1, 8, 4, 2), (4, 12, 8, 1), (4, 12, 12, 1)}:
-            config.travel_weight, config.sla_late_weight, config.overtime_weight, config.imbalance_weight = (4, 12, 30, 1)
+        if (config.travel_weight, config.sla_late_weight, config.overtime_weight, config.imbalance_weight) in {
+            (1, 8, 4, 2),
+            (4, 12, 8, 1),
+            (4, 12, 12, 1),
+        }:
+            config.travel_weight, config.sla_late_weight, config.overtime_weight, config.imbalance_weight = (
+                4,
+                12,
+                30,
+                1,
+            )
         for order in scenario.work_orders:
             if order.id.startswith("WO-EMG-") and not order.is_emergency:
                 order.is_emergency = True
@@ -464,23 +672,54 @@ class Store:
             if expected_revision is None:
                 if row:
                     raise ScenarioRevisionConflict(-1, current_revision)
-                con.execute("INSERT INTO scenarios(id, payload, active_plan_version_id, updated_at) VALUES (?, ?, NULL, CURRENT_TIMESTAMP)", (scenario.id, scenario.model_dump_json()))
+                con.execute(
+                    "INSERT INTO scenarios(id, payload, active_plan_version_id, updated_at) VALUES (?, ?, NULL, CURRENT_TIMESTAMP)",
+                    (scenario.id, scenario.model_dump_json()),
+                )
             else:
                 if not row or current_revision != expected_revision:
                     raise ScenarioRevisionConflict(expected_revision, current_revision)
                 # A data edit makes the selected plan stale but preserves all
                 # published history. Replanning can still use the latest plan.
                 if preserve_active_plan:
-                    con.execute("UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (scenario.model_dump_json(), scenario.id))
-                else:
-                    active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario.id,)).fetchone()
+                    active = con.execute(
+                        "SELECT active_plan_version_id FROM scenarios WHERE id=?",
+                        (scenario.id,),
+                    ).fetchone()
                     if active and active["active_plan_version_id"]:
-                        plan_row = con.execute("SELECT payload FROM plan_versions WHERE id=?", (active["active_plan_version_id"],)).fetchone()
+                        plan_row = con.execute(
+                            "SELECT payload FROM plan_versions WHERE id=?",
+                            (active["active_plan_version_id"],),
+                        ).fetchone()
                         if plan_row:
                             plan = PlanVersion.model_validate_json(plan_row["payload"])
                             plan.coverage_status = PlanCoverageStatus.stale_data_changed
-                            con.execute("UPDATE plan_versions SET payload=? WHERE id=?", (plan.model_dump_json(), plan.id))
-                    con.execute("UPDATE scenarios SET payload=?, active_plan_version_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?", (scenario.model_dump_json(), scenario.id))
+                            con.execute(
+                                "UPDATE plan_versions SET payload=? WHERE id=?",
+                                (plan.model_dump_json(), plan.id),
+                            )
+                    con.execute(
+                        "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (scenario.model_dump_json(), scenario.id),
+                    )
+                else:
+                    active = con.execute(
+                        "SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario.id,)
+                    ).fetchone()
+                    if active and active["active_plan_version_id"]:
+                        plan_row = con.execute(
+                            "SELECT payload FROM plan_versions WHERE id=?", (active["active_plan_version_id"],)
+                        ).fetchone()
+                        if plan_row:
+                            plan = PlanVersion.model_validate_json(plan_row["payload"])
+                            plan.coverage_status = PlanCoverageStatus.stale_data_changed
+                            con.execute(
+                                "UPDATE plan_versions SET payload=? WHERE id=?", (plan.model_dump_json(), plan.id)
+                            )
+                    con.execute(
+                        "UPDATE scenarios SET payload=?, active_plan_version_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (scenario.model_dump_json(), scenario.id),
+                    )
             self._insert_revision(con, scenario, reason)
 
     def get_command_record(self, namespace: str, key: str, fingerprint: str) -> dict | None:
@@ -526,7 +765,9 @@ class Store:
             ).fetchone()
             if not scenario_row:
                 raise KeyError(f"scenario {scenario_id} not found")
-            scenario = self._upgrade_scenario(ScheduleScenario.model_validate_json(scenario_row["payload"]))
+            scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+            if command:
+                return scenario, False
             existing = next((item for item in scenario.work_orders if item.id == order.id), None)
             if existing and existing.model_dump(mode="json") != order.model_dump(mode="json"):
                 raise PublicationConflict(f"工单 {order.id} 已存在，但内容与本次请求不同")
@@ -541,7 +782,9 @@ class Store:
                     (scenario.model_dump_json(), scenario_id, expected_revision),
                 )
                 if con.execute("SELECT changes()").fetchone()[0] != 1:
-                    current = con.execute("SELECT json_extract(payload, '$.revision') FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
+                    current = con.execute(
+                        "SELECT json_extract(payload, '$.revision') FROM scenarios WHERE id=?", (scenario_id,)
+                    ).fetchone()
                     raise ScenarioRevisionConflict(expected_revision, int(current[0]) if current else -1)
                 self._insert_revision(con, scenario, f"接收突发工单 {order.id}")
                 active_plan_id = scenario_row["active_plan_version_id"]
@@ -579,17 +822,30 @@ class Store:
         payload: dict,
     ) -> None:
         with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT request_fingerprint FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT request_fingerprint, status FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, key),
             ).fetchone()
             if not row:
                 raise PublicationConflict("幂等命令记录不存在")
             if row["request_fingerprint"] != fingerprint:
                 raise PublicationConflict("相同幂等键对应了不同请求")
+            if row["status"] in {"COMPLETED", "FAILED"}:
+                if row["status"] == status:
+                    return
+                raise PublicationConflict("幂等命令已进入终态，不能覆盖")
             con.execute(
                 "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, payload=?, updated_at=? WHERE namespace=? AND key=?",
-                (status, resource_type, resource_id, json.dumps(payload, ensure_ascii=False, sort_keys=True), _now(), namespace, key),
+                (
+                    status,
+                    resource_type,
+                    resource_id,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    _now(),
+                    namespace,
+                    key,
+                ),
             )
 
     def begin_command_record(
@@ -602,7 +858,7 @@ class Store:
         resource_type: str | None,
         resource_id: str | None,
         payload: dict,
-    ) -> None:
+    ) -> bool:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
@@ -612,7 +868,7 @@ class Store:
             if row:
                 if row["request_fingerprint"] != fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同请求")
-                return
+                return False
             now = _now()
             con.execute(
                 """
@@ -631,6 +887,7 @@ class Store:
                     now,
                 ),
             )
+            return True
 
     def transition_work_order(
         self,
@@ -654,7 +911,18 @@ class Store:
                 if command["request_fingerprint"] != request_fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同执行请求")
                 payload = json.loads(command["payload"])
-                return WorkOrderExecutionResult.model_validate(payload["result"])
+                stored = WorkOrderExecutionResult.model_validate(payload["result"])
+                scenario_row = con.execute(
+                    "SELECT payload FROM scenarios WHERE id=?",
+                    (scenario_id,),
+                ).fetchone()
+                if not scenario_row:
+                    raise KeyError(f"场景 {scenario_id} 不存在")
+                current_scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+                return WorkOrderExecutionResult(
+                    scenario=current_scenario,
+                    event=stored.event,
+                )
 
             scenario_row = con.execute(
                 "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
@@ -662,7 +930,7 @@ class Store:
             ).fetchone()
             if not scenario_row:
                 raise KeyError(f"场景 {scenario_id} 不存在")
-            scenario = self._upgrade_scenario(ScheduleScenario.model_validate_json(scenario_row["payload"]))
+            scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
             if scenario.revision != request.expected_revision:
                 raise ScenarioRevisionConflict(request.expected_revision, scenario.revision)
             order = next((item for item in scenario.work_orders if item.id == work_order_id), None)
@@ -686,9 +954,58 @@ class Store:
             expected_status = WorkOrderStatus.pending if action == "start" else WorkOrderStatus.started
             target_status = WorkOrderStatus.started if action == "start" else WorkOrderStatus.completed
             if order.status is not expected_status:
-                raise PublicationConflict(
-                    f"工单当前为 {order.status.value}，不能执行 {action} 操作"
+                raise PublicationConflict(f"工单当前为 {order.status.value}，不能执行 {action} 操作")
+            if action == "start":
+                assignments_by_order = {item.work_order_id: item for item in plan.selected.assignments}
+                for active_order in scenario.work_orders:
+                    if active_order.status is not WorkOrderStatus.started:
+                        continue
+                    active_assignment = assignments_by_order.get(active_order.id)
+                    if active_assignment and active_assignment.technician_id == request.technician_id:
+                        raise PublicationConflict(f"技师 {request.technician_id} 已有服务中的工单 {active_order.id}")
+                route = sorted(
+                    [item for item in plan.selected.assignments if item.technician_id == request.technician_id],
+                    key=lambda item: item.sequence,
                 )
+                predecessors = [item for item in route if item.sequence < assignment.sequence]
+                incomplete = [
+                    item.work_order_id
+                    for item in predecessors
+                    if next(
+                        candidate.status for candidate in scenario.work_orders if candidate.id == item.work_order_id
+                    )
+                    is not WorkOrderStatus.completed
+                ]
+                if incomplete:
+                    raise PublicationConflict(f"路线前序工单尚未完成：{', '.join(incomplete)}")
+                if predecessors:
+                    predecessor = predecessors[-1]
+                    predecessor_order = next(
+                        item for item in scenario.work_orders if item.id == predecessor.work_order_id
+                    )
+                    completion_row = con.execute(
+                        """
+                        SELECT payload FROM work_order_execution_events
+                        WHERE scenario_id=? AND work_order_id=? AND action='complete'
+                        ORDER BY sequence DESC LIMIT 1
+                        """,
+                        (scenario_id, predecessor.work_order_id),
+                    ).fetchone()
+                    if not completion_row:
+                        raise PublicationConflict(f"路线前序工单 {predecessor.work_order_id} 缺少完成事件")
+                    completion = WorkOrderExecutionEvent.model_validate_json(completion_row["payload"])
+                    earliest_start = completion.occurred_at + self.travel_provider.minutes(
+                        predecessor_order.location,
+                        order.location,
+                    )
+                else:
+                    technician = next(item for item in scenario.technicians if item.id == request.technician_id)
+                    earliest_start = technician.shift_start + self.travel_provider.minutes(
+                        technician.start_location,
+                        order.location,
+                    )
+                if request.occurred_at < earliest_start:
+                    raise PublicationConflict(f"开始时间早于前序服务和行程允许的最早时间 {earliest_start}")
             if action == "complete":
                 start_row = con.execute(
                     "SELECT payload FROM work_order_execution_events WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY occurred_at DESC LIMIT 1",
@@ -704,14 +1021,21 @@ class Store:
 
             order.status = target_status
             if target_status is WorkOrderStatus.completed:
-                scenario.locked_assignments = [item for item in scenario.locked_assignments if item.work_order_id != work_order_id]
+                scenario.locked_assignments = [
+                    item for item in scenario.locked_assignments if item.work_order_id != work_order_id
+                ]
             scenario.revision += 1
+            sequence_row = con.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM work_order_execution_events WHERE scenario_id=?",
+                (scenario_id,),
+            ).fetchone()
             event = WorkOrderExecutionEvent(
                 id=f"EXEC-{uuid.uuid4().hex[:12]}",
                 scenario_id=scenario_id,
                 work_order_id=work_order_id,
                 technician_id=request.technician_id,
                 action=action,
+                sequence=int(sequence_row["next_sequence"]),
                 occurred_at=request.occurred_at,
                 scenario_revision=scenario.revision,
                 plan_version_id=plan.id,
@@ -723,10 +1047,21 @@ class Store:
                 "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (scenario.model_dump_json(), scenario_id),
             )
-            self._insert_revision(con, scenario, f"工单 {work_order_id} {'开始服务' if action == 'start' else '完成服务'}")
+            self._insert_revision(
+                con, scenario, f"工单 {work_order_id} {'开始服务' if action == 'start' else '完成服务'}"
+            )
             con.execute(
-                "INSERT INTO work_order_execution_events(id, scenario_id, work_order_id, action, occurred_at, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (event.id, scenario_id, work_order_id, action, request.occurred_at, event.model_dump_json(), event.created_at),
+                "INSERT INTO work_order_execution_events(id, scenario_id, work_order_id, action, sequence, occurred_at, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.id,
+                    scenario_id,
+                    work_order_id,
+                    action,
+                    event.sequence,
+                    request.occurred_at,
+                    event.model_dump_json(),
+                    event.created_at,
+                ),
             )
             now = _now()
             con.execute(
@@ -746,10 +1081,111 @@ class Store:
             )
             return result
 
+    @staticmethod
+    def _execution_source_context(
+        con: sqlite3.Connection,
+        scenario: ScheduleScenario,
+        active_plan_version_id: str | None,
+    ) -> ExecutionSourceContext:
+        sequence_row = con.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM work_order_execution_events WHERE scenario_id=?",
+            (scenario.id,),
+        ).fetchone()
+        watermark = int(sequence_row["sequence"])
+        plan: PlanVersion | None = None
+        if active_plan_version_id:
+            plan_row = con.execute(
+                "SELECT payload FROM plan_versions WHERE id=? AND scenario_id=?",
+                (active_plan_version_id, scenario.id),
+            ).fetchone()
+            if plan_row:
+                plan = PlanVersion.model_validate_json(plan_row["payload"])
+        assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
+        started_sources: list[ExecutionSourceAssignment] = []
+        for order in sorted(scenario.work_orders, key=lambda item: item.id):
+            if order.status is not WorkOrderStatus.started:
+                continue
+            assignment = assignments.get(order.id)
+            if not assignment or not plan:
+                continue
+            event_row = con.execute(
+                """
+                SELECT payload FROM work_order_execution_events
+                WHERE scenario_id=? AND work_order_id=? AND action='start'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (scenario.id, order.id),
+            ).fetchone()
+            start_event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"]) if event_row else None
+            started_sources.append(
+                ExecutionSourceAssignment(
+                    work_order_id=order.id,
+                    technician_id=assignment.technician_id,
+                    source_schedule_id=plan.selected.id,
+                    source_assignment_hash=content_hash(assignment),
+                    sequence=assignment.sequence,
+                    planned_start_at=assignment.start_time,
+                    planned_finish_at=assignment.finish_time,
+                    actual_start_at=start_event.occurred_at if start_event else None,
+                    projected_available_at=(start_event.occurred_at + order.service_duration)
+                    if start_event
+                    else assignment.finish_time,
+                )
+            )
+        event_rows = con.execute(
+            "SELECT payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
+            (scenario.id,),
+        ).fetchall()
+        latest_by_technician: dict[str, WorkOrderExecutionEvent] = {}
+        for event_row in event_rows:
+            event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"])
+            latest_by_technician[event.technician_id] = event
+        orders = {item.id: item for item in scenario.work_orders}
+        projections: list[TechnicianExecutionProjection] = []
+        for technician_id, event in sorted(latest_by_technician.items()):
+            order = orders.get(event.work_order_id)
+            if not order:
+                continue
+            state = "started" if order.status is WorkOrderStatus.started else "completed"
+            available_at = (
+                event.occurred_at + order.service_duration
+                if state == "started" and event.action == "start"
+                else event.occurred_at
+            )
+            projections.append(
+                TechnicianExecutionProjection(
+                    technician_id=technician_id,
+                    source_work_order_id=order.id,
+                    state=state,
+                    effective_location=order.location,
+                    available_at=available_at,
+                    execution_event_sequence=event.sequence,
+                )
+            )
+        return ExecutionSourceContext(
+            active_plan_version_id=plan.id if plan else active_plan_version_id,
+            active_plan_snapshot_hash=plan.scenario_snapshot_hash if plan else None,
+            active_schedule_id=plan.selected.id if plan else None,
+            execution_event_sequence=watermark,
+            started_assignments=started_sources,
+            technician_projections=projections,
+        )
+
+    def execution_source_context(self, scenario_id: str) -> ExecutionSourceContext:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
+                (scenario_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"scenario {scenario_id} not found")
+            scenario = ScheduleScenario.model_validate_json(row["payload"])
+            return self._execution_source_context(con, scenario, row["active_plan_version_id"])
+
     def list_execution_events(self, scenario_id: str) -> list[WorkOrderExecutionEvent]:
         with self._connect() as con:
             rows = con.execute(
-                "SELECT payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY occurred_at, created_at",
+                "SELECT payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
                 (scenario_id,),
             ).fetchall()
         return [WorkOrderExecutionEvent.model_validate_json(row["payload"]) for row in rows]
@@ -775,7 +1211,7 @@ class Store:
                 row = con.execute("SELECT payload FROM scenarios WHERE id=?", (existing["resource_id"],)).fetchone()
                 if not row:
                     raise PublicationConflict("幂等克隆记录引用的场景不存在")
-                return self._upgrade_scenario(ScheduleScenario.model_validate_json(row["payload"]))
+                return ScheduleScenario.model_validate_json(row["payload"])
             if con.execute("SELECT 1 FROM scenarios WHERE id=?", (scenario.id,)).fetchone():
                 raise PublicationConflict("克隆场景标识已存在")
             con.execute(
@@ -794,7 +1230,11 @@ class Store:
                     idempotency_key,
                     request_fingerprint,
                     scenario.id,
-                    json.dumps({"scenario_id": scenario.id, "source_version_id": source_version_id}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(
+                        {"scenario_id": scenario.id, "source_version_id": source_version_id},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
                     now,
                     now,
                 ),
@@ -803,17 +1243,31 @@ class Store:
 
     def list_revisions(self, scenario_id: str) -> list[ScenarioRevision]:
         with self._connect() as con:
-            rows = con.execute("SELECT payload FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario_id,)).fetchall()
+            rows = con.execute(
+                "SELECT payload FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario_id,)
+            ).fetchall()
         return [ScenarioRevision.model_validate_json(row["payload"]) for row in rows]
 
     def next_version(self, scenario_id: str) -> int:
         with self._connect() as con:
-            row = con.execute("SELECT COALESCE(MAX(number), 0) AS v FROM plan_versions WHERE scenario_id=?", (scenario_id,)).fetchone()
+            row = con.execute(
+                "SELECT COALESCE(MAX(number), 0) AS v FROM plan_versions WHERE scenario_id=?", (scenario_id,)
+            ).fetchone()
         return int(row["v"]) + 1
 
     @staticmethod
     def _version_label(action: str, strategy: str, number: int) -> str:
-        names = {"baseline": "人工基线", "balanced": "均衡优化", "completion": "完成率优先", "punctuality": "准时优先", "low_travel": "低行程", "low_overtime": "低加班", "fair_workload": "工作量公平", "stable": "稳定重排", "custom": "自定义策略"}
+        names = {
+            "baseline": "人工基线",
+            "balanced": "均衡优化",
+            "completion": "覆盖率优先",
+            "punctuality": "准时优先",
+            "low_travel": "低行程",
+            "low_overtime": "低加班",
+            "fair_workload": "工作量公平",
+            "stable": "稳定重排",
+            "custom": "自定义策略",
+        }
         return f"历史恢复 V{number:03d}" if action == "restore" else names.get(strategy, action)
 
     def publish_plan(
@@ -831,29 +1285,63 @@ class Store:
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
         candidate_id: str,
+        experiment_id: str | None = None,
+        experiment_candidate_id: str | None = None,
     ) -> PlanVersion:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             if idempotency_key:
-                publication = con.execute("SELECT request_fingerprint, plan_version_id FROM publication_keys WHERE key=?", (idempotency_key,)).fetchone()
+                publication = con.execute(
+                    "SELECT request_fingerprint, plan_version_id FROM publication_keys WHERE key=?", (idempotency_key,)
+                ).fetchone()
                 if publication:
                     if publication["request_fingerprint"] != (request_fingerprint or ""):
                         raise PublicationConflict("同一实验已经发布了另一个候选方案")
-                    existing = con.execute("SELECT payload FROM plan_versions WHERE id=?", (publication["plan_version_id"],)).fetchone()
+                    existing = con.execute(
+                        "SELECT payload FROM plan_versions WHERE id=?", (publication["plan_version_id"],)
+                    ).fetchone()
                     if not existing:
                         raise PublicationConflict("幂等发布记录引用的方案不存在")
                     plan = PlanVersion.model_validate_json(existing["payload"])
-                    active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (plan.scenario_id,)).fetchone()
+                    if experiment_id and experiment_candidate_id:
+                        experiment_row = con.execute(
+                            "SELECT payload FROM strategy_experiments WHERE id=?",
+                            (experiment_id,),
+                        ).fetchone()
+                        if not experiment_row:
+                            raise PublicationConflict("策略实验不存在")
+                        experiment = StrategyExperiment.model_validate_json(experiment_row["payload"])
+                        if experiment.winner_candidate_id not in {None, experiment_candidate_id}:
+                            raise PublicationConflict("策略实验已经发布其他候选")
+                        experiment.winner_candidate_id = experiment_candidate_id
+                        experiment.winner_plan_version_id = plan.id
+                        experiment.published_at = experiment.published_at or plan.created_at
+                        con.execute(
+                            "UPDATE strategy_experiments SET payload=? WHERE id=?",
+                            (experiment.model_dump_json(), experiment.id),
+                        )
+                    active = con.execute(
+                        "SELECT active_plan_version_id FROM scenarios WHERE id=?", (plan.scenario_id,)
+                    ).fetchone()
                     plan.active = bool(active and active["active_plan_version_id"] == plan.id)
                     return plan
-            current_row = con.execute("SELECT payload FROM scenarios WHERE id=?", (scenario.id,)).fetchone()
+            current_row = con.execute(
+                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?", (scenario.id,)
+            ).fetchone()
             if not current_row:
                 raise KeyError(f"scenario {scenario.id} not found")
-            current_revision = ScheduleScenario.model_validate_json(current_row["payload"]).revision
-            required_revision = expected_revision if expected_revision is not None else (scenario.revision - 1 if replace_scenario else scenario.revision)
+            current_scenario = ScheduleScenario.model_validate_json(current_row["payload"])
+            current_revision = current_scenario.revision
+            required_revision = (
+                expected_revision
+                if expected_revision is not None
+                else (scenario.revision - 1 if replace_scenario else scenario.revision)
+            )
             if current_revision != required_revision:
                 raise ScenarioRevisionConflict(required_revision, current_revision)
-            candidate_row = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
+            candidate_row = con.execute(
+                "SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)
+            ).fetchone()
             if not candidate_row:
                 raise PublicationConflict("候选方案不存在")
             candidate = ScheduleCandidate.model_validate_json(candidate_row["payload"])
@@ -869,6 +1357,11 @@ class Store:
                 raise PublicationConflict("待发布排程与已验证候选不一致")
             if candidate.solver_config_hash != selected.solver_config_hash:
                 raise PublicationConflict("候选方案的求解配置指纹与排程不一致")
+            selected_policy_fingerprint = selected.solver_policy.fingerprint if selected.solver_policy else ""
+            if not selected_policy_fingerprint:
+                raise PublicationConflict("候选方案缺少完整求解政策快照")
+            if candidate.solver_policy_fingerprint != selected_policy_fingerprint:
+                raise PublicationConflict("候选方案的求解政策指纹与排程不一致")
             expected_context_hash = content_hash(candidate.planning_context) if candidate.planning_context else None
             if candidate.planning_context_hash != expected_context_hash:
                 raise PublicationConflict("候选方案的计划上下文指纹不一致")
@@ -886,13 +1379,20 @@ class Store:
                 raise PublicationConflict("求解记录与候选方案的来源版本不一致")
             if candidate_run.solver_config_hash != candidate.solver_config_hash:
                 raise PublicationConflict("求解记录与候选方案的求解配置指纹不一致")
+            if candidate_run.solver_policy_fingerprint != candidate.solver_policy_fingerprint:
+                raise PublicationConflict("求解记录与候选方案的求解政策指纹不一致")
             if candidate_run.action == "replan" and candidate.planning_context is None:
                 raise PublicationConflict("重排候选缺少计划上下文")
-            if candidate_run.candidate_id != candidate.id or candidate_run.planning_context_hash != candidate.planning_context_hash:
+            if (
+                candidate_run.candidate_id != candidate.id
+                or candidate_run.planning_context_hash != candidate.planning_context_hash
+            ):
                 raise PublicationConflict("求解记录与候选方案的计划上下文不一致")
             publication_source: PlanVersion | None = None
             if source_version_id:
-                source_row = con.execute("SELECT payload FROM plan_versions WHERE id=?", (source_version_id,)).fetchone()
+                source_row = con.execute(
+                    "SELECT payload FROM plan_versions WHERE id=?", (source_version_id,)
+                ).fetchone()
                 if not source_row:
                     raise PublicationConflict("来源方案不存在")
                 publication_source = PlanVersion.model_validate_json(source_row["payload"])
@@ -908,11 +1408,18 @@ class Store:
                 publication_source.selected if publication_source and selected.kind == "replan" else None,
                 candidate.planning_context,
                 self.travel_provider,
+                self._execution_source_context(
+                    con,
+                    current_scenario,
+                    current_row["active_plan_version_id"],
+                ),
             )
             if not transaction_verification.publishable:
                 codes = ", ".join(item.code for item in transaction_verification.errors)
                 raise PublicationConflict(f"发布事务复核失败：{codes}")
-            row = con.execute("SELECT COALESCE(MAX(number), 0) + 1 AS v FROM plan_versions WHERE scenario_id=?", (scenario.id,)).fetchone()
+            row = con.execute(
+                "SELECT COALESCE(MAX(number), 0) + 1 AS v FROM plan_versions WHERE scenario_id=?", (scenario.id,)
+            ).fetchone()
             number = int(row["v"])
             chosen = selected.model_copy(deep=True)
             chosen.version = number
@@ -927,35 +1434,127 @@ class Store:
                 item.schedule.scenario_revision = scenario.revision
                 persisted_artifacts.append(item)
             if not any(item.schedule.id == chosen.id for item in persisted_artifacts):
-                persisted_artifacts.append(ScheduleArtifact(id=f"ART-{uuid.uuid4().hex[:10]}", role="selected", strategy=chosen.strategy, schedule=chosen))
+                persisted_artifacts.append(
+                    ScheduleArtifact(
+                        id=f"ART-{uuid.uuid4().hex[:10]}", role="selected", strategy=chosen.strategy, schedule=chosen
+                    )
+                )
             source_hash = None
             if publication_source:
-                source_hash = publication_source.scenario_snapshot_hash or (content_hash(publication_source.scenario_snapshot) if publication_source.scenario_snapshot else None)
-            plan = PlanVersion(id=plan_id, scenario_id=scenario.id, number=number, action=action, label=label or self._version_label(action, chosen.strategy, number), data_revision=scenario.revision, source_version_id=source_version_id, relation=relation, active=True, created_at=_now(), scenario_snapshot=scenario.model_copy(deep=True), selected=chosen, artifacts=persisted_artifacts, candidate_id=candidate_id, scenario_snapshot_hash=content_hash(scenario), source_plan_snapshot_hash=source_hash)
-            con.execute("UPDATE plan_versions SET payload=json_set(payload, '$.active', 0) WHERE scenario_id=?", (scenario.id,))
-            con.execute("INSERT INTO plan_versions(id, scenario_id, number, payload, created_at) VALUES (?, ?, ?, ?, ?)", (plan.id, plan.scenario_id, number, plan.model_dump_json(), plan.created_at))
-            con.execute("INSERT INTO schedules(id, scenario_id, kind, version, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)", (chosen.id, chosen.scenario_id, chosen.kind, number, chosen.model_dump_json(), chosen.created_at))
+                source_hash = publication_source.scenario_snapshot_hash or (
+                    content_hash(publication_source.scenario_snapshot) if publication_source.scenario_snapshot else None
+                )
+            plan = PlanVersion(
+                id=plan_id,
+                scenario_id=scenario.id,
+                number=number,
+                action=action,
+                label=label or self._version_label(action, chosen.strategy, number),
+                data_revision=scenario.revision,
+                source_version_id=source_version_id,
+                relation=relation,
+                active=True,
+                created_at=_now(),
+                scenario_snapshot=scenario.model_copy(deep=True),
+                selected=chosen,
+                artifacts=persisted_artifacts,
+                candidate_id=candidate_id,
+                scenario_snapshot_hash=content_hash(scenario),
+                source_plan_snapshot_hash=source_hash,
+            )
+            con.execute(
+                "UPDATE plan_versions SET payload=json_set(payload, '$.active', 0) WHERE scenario_id=?", (scenario.id,)
+            )
+            con.execute(
+                "INSERT INTO plan_versions(id, scenario_id, number, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (plan.id, plan.scenario_id, number, plan.model_dump_json(), plan.created_at),
+            )
+            con.execute(
+                "INSERT INTO schedules(id, scenario_id, kind, version, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (chosen.id, chosen.scenario_id, chosen.kind, number, chosen.model_dump_json(), chosen.created_at),
+            )
             for artifact in persisted_artifacts:
-                con.execute("INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) VALUES (?, ?, NULL, ?, ?, ?)", (artifact.id, plan.id, artifact.role, artifact.model_dump_json(), plan.created_at))
+                con.execute(
+                    "INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) VALUES (?, ?, NULL, ?, ?, ?)",
+                    (artifact.id, plan.id, artifact.role, artifact.model_dump_json(), plan.created_at),
+                )
             if replace_scenario:
-                con.execute("INSERT INTO scenarios(id, payload, active_plan_version_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, active_plan_version_id=excluded.active_plan_version_id, updated_at=CURRENT_TIMESTAMP", (scenario.id, scenario.model_dump_json(), plan.id))
-                revision_reason = f"恢复方案 V{number:03d}" if action == "restore" else f"突发工单局部重排 V{number:03d}"
+                con.execute(
+                    "INSERT INTO scenarios(id, payload, active_plan_version_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, active_plan_version_id=excluded.active_plan_version_id, updated_at=CURRENT_TIMESTAMP",
+                    (scenario.id, scenario.model_dump_json(), plan.id),
+                )
+                revision_reason = (
+                    f"恢复方案 V{number:03d}" if action == "restore" else f"突发工单局部重排 V{number:03d}"
+                )
                 self._insert_revision(con, scenario, revision_reason)
             else:
-                con.execute("UPDATE scenarios SET active_plan_version_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (plan.id, scenario.id))
+                con.execute(
+                    "UPDATE scenarios SET active_plan_version_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (plan.id, scenario.id),
+                )
             if idempotency_key:
-                con.execute("INSERT INTO publication_keys(key, request_fingerprint, plan_version_id, created_at) VALUES (?, ?, ?, ?)", (idempotency_key, request_fingerprint or "", plan.id, plan.created_at))
+                con.execute(
+                    "INSERT INTO publication_keys(key, request_fingerprint, plan_version_id, created_at) VALUES (?, ?, ?, ?)",
+                    (idempotency_key, request_fingerprint or "", plan.id, plan.created_at),
+                )
+            if experiment_id or experiment_candidate_id:
+                if not experiment_id or not experiment_candidate_id:
+                    raise PublicationConflict("实验发布缺少实验或候选标识")
+                experiment_row = con.execute(
+                    "SELECT payload FROM strategy_experiments WHERE id=?",
+                    (experiment_id,),
+                ).fetchone()
+                if not experiment_row:
+                    raise PublicationConflict("策略实验不存在")
+                experiment = StrategyExperiment.model_validate_json(experiment_row["payload"])
+                if experiment.scenario_id != scenario.id:
+                    raise PublicationConflict("策略实验不属于当前场景")
+                if not any(item.id == experiment_candidate_id for item in experiment.candidates):
+                    raise PublicationConflict("策略实验候选不存在")
+                if experiment.winner_candidate_id not in {None, experiment_candidate_id}:
+                    raise PublicationConflict("策略实验已经发布其他候选")
+                experiment.winner_candidate_id = experiment_candidate_id
+                experiment.winner_plan_version_id = plan.id
+                experiment.published_at = plan.created_at
+                con.execute(
+                    "UPDATE strategy_experiments SET payload=? WHERE id=?",
+                    (experiment.model_dump_json(), experiment.id),
+                )
             return plan
 
     def save_schedule_run(self, run: ScheduleRun) -> ScheduleRun:
         with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            existing_row = con.execute(
+                "SELECT payload FROM schedule_runs WHERE id=?",
+                (run.id,),
+            ).fetchone()
+            if existing_row:
+                existing = ScheduleRun.model_validate_json(existing_row["payload"])
+                terminal = {
+                    ScheduleRunStatus.optimal,
+                    ScheduleRunStatus.feasible,
+                    ScheduleRunStatus.time_limit_feasible,
+                    ScheduleRunStatus.time_limit_no_solution,
+                    ScheduleRunStatus.infeasible,
+                    ScheduleRunStatus.no_solution,
+                    ScheduleRunStatus.invalid_model,
+                    ScheduleRunStatus.failed,
+                    ScheduleRunStatus.cancelled,
+                }
+                if existing.status in terminal:
+                    if existing.model_dump(mode="json") != run.model_dump(mode="json"):
+                        raise PublicationConflict("求解记录已进入终态，不能覆盖")
+                    return existing
             con.execute(
                 "INSERT INTO schedule_runs(id, scenario_id, status, payload, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, payload=excluded.payload",
                 (run.id, run.scenario_id, run.status.value, run.model_dump_json(), run.started_at),
             )
         return run
 
-    def complete_schedule_run(self, run: ScheduleRun, candidate: ScheduleCandidate) -> tuple[ScheduleRun, ScheduleCandidate]:
+    def complete_schedule_run(
+        self, run: ScheduleRun, candidate: ScheduleCandidate
+    ) -> tuple[ScheduleRun, ScheduleCandidate]:
         if candidate.run_id != run.id or candidate.scenario_id != run.scenario_id:
             raise PublicationConflict("候选方案与求解记录不匹配")
         if run.status in {ScheduleRunStatus.queued, ScheduleRunStatus.running} or run.candidate_id != candidate.id:
@@ -968,13 +1567,22 @@ class Store:
             stored = ScheduleRun.model_validate_json(run_row["payload"])
             if stored.status not in {ScheduleRunStatus.queued, ScheduleRunStatus.running}:
                 if stored.candidate_id == candidate.id:
-                    existing = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate.id,)).fetchone()
+                    existing = con.execute(
+                        "SELECT payload FROM schedule_candidates WHERE id=?", (candidate.id,)
+                    ).fetchone()
                     if existing:
                         return stored, ScheduleCandidate.model_validate_json(existing["payload"])
                 raise PublicationConflict("求解记录已经结束，不能再次完成")
             con.execute(
                 "INSERT INTO schedule_candidates(id, run_id, scenario_id, publishable, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (candidate.id, candidate.run_id, candidate.scenario_id, int(candidate.publishable), candidate.model_dump_json(), candidate.created_at),
+                (
+                    candidate.id,
+                    candidate.run_id,
+                    candidate.scenario_id,
+                    int(candidate.publishable),
+                    candidate.model_dump_json(),
+                    candidate.created_at,
+                ),
             )
             con.execute(
                 "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
@@ -989,7 +1597,9 @@ class Store:
 
     def list_schedule_runs(self, scenario_id: str) -> list[ScheduleRun]:
         with self._connect() as con:
-            rows = con.execute("SELECT payload FROM schedule_runs WHERE scenario_id=? ORDER BY created_at", (scenario_id,)).fetchall()
+            rows = con.execute(
+                "SELECT payload FROM schedule_runs WHERE scenario_id=? ORDER BY created_at", (scenario_id,)
+            ).fetchall()
         return [ScheduleRun.model_validate_json(row["payload"]) for row in rows]
 
     def save_schedule_candidate(self, candidate: ScheduleCandidate) -> ScheduleCandidate:
@@ -1002,7 +1612,14 @@ class Store:
                 return stored
             con.execute(
                 "INSERT INTO schedule_candidates(id, run_id, scenario_id, publishable, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (candidate.id, candidate.run_id, candidate.scenario_id, int(candidate.publishable), candidate.model_dump_json(), candidate.created_at),
+                (
+                    candidate.id,
+                    candidate.run_id,
+                    candidate.scenario_id,
+                    int(candidate.publishable),
+                    candidate.model_dump_json(),
+                    candidate.created_at,
+                ),
             )
         return candidate
 
@@ -1013,7 +1630,9 @@ class Store:
 
     def published_for_key(self, key: str, fingerprint: str) -> PlanVersion | None:
         with self._connect() as con:
-            row = con.execute("SELECT request_fingerprint, plan_version_id FROM publication_keys WHERE key=?", (key,)).fetchone()
+            row = con.execute(
+                "SELECT request_fingerprint, plan_version_id FROM publication_keys WHERE key=?", (key,)
+            ).fetchone()
             if not row:
                 return None
             if row["request_fingerprint"] != fingerprint:
@@ -1022,13 +1641,17 @@ class Store:
             if not plan_row:
                 raise PublicationConflict("幂等发布记录引用的方案不存在")
             plan = PlanVersion.model_validate_json(plan_row["payload"])
-            active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (plan.scenario_id,)).fetchone()
+            active = con.execute(
+                "SELECT active_plan_version_id FROM scenarios WHERE id=?", (plan.scenario_id,)
+            ).fetchone()
         plan.active = bool(active and active["active_plan_version_id"] == plan.id)
         return plan
 
     def list_plan_versions(self, scenario_id: str, include_snapshots: bool = False) -> list[PlanVersion]:
         with self._connect() as con:
-            rows = con.execute("SELECT payload FROM plan_versions WHERE scenario_id=? ORDER BY number", (scenario_id,)).fetchall()
+            rows = con.execute(
+                "SELECT payload FROM plan_versions WHERE scenario_id=? ORDER BY number", (scenario_id,)
+            ).fetchall()
             active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
         active_id = active["active_plan_version_id"] if active else None
         plans = []
@@ -1045,7 +1668,10 @@ class Store:
         normalized = version_id[1:] if version_id.upper().startswith("V") else version_id
         numeric = int(normalized) if normalized.isdigit() else -1
         with self._connect() as con:
-            row = con.execute("SELECT payload FROM plan_versions WHERE scenario_id=? AND (id=? OR number=?)", (scenario_id, version_id, numeric)).fetchone()
+            row = con.execute(
+                "SELECT payload FROM plan_versions WHERE scenario_id=? AND (id=? OR number=?)",
+                (scenario_id, version_id, numeric),
+            ).fetchone()
             active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
         if not row:
             return None
@@ -1056,16 +1682,24 @@ class Store:
     def active_plan_version(self, scenario_id: str) -> PlanVersion | None:
         with self._connect() as con:
             row = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
-        return self.get_plan_version(scenario_id, row["active_plan_version_id"]) if row and row["active_plan_version_id"] else None
+        return (
+            self.get_plan_version(scenario_id, row["active_plan_version_id"])
+            if row and row["active_plan_version_id"]
+            else None
+        )
 
     def latest_plan_version(self, scenario_id: str) -> PlanVersion | None:
         with self._connect() as con:
-            row = con.execute("SELECT id FROM plan_versions WHERE scenario_id=? ORDER BY number DESC LIMIT 1", (scenario_id,)).fetchone()
+            row = con.execute(
+                "SELECT id FROM plan_versions WHERE scenario_id=? ORDER BY number DESC LIMIT 1", (scenario_id,)
+            ).fetchone()
         return self.get_plan_version(scenario_id, row["id"]) if row else None
 
     def rename_plan_version(self, scenario_id: str, version_id: str, label: str) -> PlanVersion | None:
         with self._lock, self._connect() as con:
-            row = con.execute("SELECT payload FROM plan_versions WHERE scenario_id=? AND id=?", (scenario_id, version_id)).fetchone()
+            row = con.execute(
+                "SELECT payload FROM plan_versions WHERE scenario_id=? AND id=?", (scenario_id, version_id)
+            ).fetchone()
             if not row:
                 return None
             current = PlanVersion.model_validate_json(row["payload"])
@@ -1075,14 +1709,19 @@ class Store:
 
     def save_schedule(self, result: ScheduleResult) -> None:
         with self._lock, self._connect() as con:
-            con.execute("INSERT OR REPLACE INTO schedules(id, scenario_id, kind, version, payload) VALUES (?, ?, ?, ?, ?)", (result.id, result.scenario_id, result.kind, result.version, result.model_dump_json()))
+            con.execute(
+                "INSERT OR REPLACE INTO schedules(id, scenario_id, kind, version, payload) VALUES (?, ?, ?, ?, ?)",
+                (result.id, result.scenario_id, result.kind, result.version, result.model_dump_json()),
+            )
 
     def get_schedule(self, schedule_id: str) -> ScheduleResult | None:
         with self._connect() as con:
             row = con.execute("SELECT payload FROM schedules WHERE id=?", (schedule_id,)).fetchone()
         return ScheduleResult.model_validate_json(row["payload"]) if row else None
 
-    def latest_schedule(self, scenario_id: str, kind: str | None = None, scenario_revision: int | None = None) -> ScheduleResult | None:
+    def latest_schedule(
+        self, scenario_id: str, kind: str | None = None, scenario_revision: int | None = None
+    ) -> ScheduleResult | None:
         for result in reversed(self.list_schedules(scenario_id)):
             if kind and result.kind != kind:
                 continue
@@ -1110,9 +1749,20 @@ class Store:
         if existing and existing.builtin:
             raise ValueError("内置策略不能修改")
         identifier = profile_id or f"custom-{uuid.uuid4().hex[:8]}"
-        profile = StrategyProfile(id=identifier, name=request.name, description=request.description, builtin=False, weights=request.weights, time_limit_seconds=request.time_limit_seconds, created_at=existing.created_at if existing else _now())
+        profile = StrategyProfile(
+            id=identifier,
+            name=request.name,
+            description=request.description,
+            builtin=False,
+            weights=request.weights,
+            time_limit_seconds=request.time_limit_seconds,
+            created_at=existing.created_at if existing else _now(),
+        )
         with self._lock, self._connect() as con:
-            con.execute("INSERT OR REPLACE INTO strategy_profiles(id, builtin, payload, created_at) VALUES (?, 0, ?, ?)", (profile.id, profile.model_dump_json(), profile.created_at))
+            con.execute(
+                "INSERT OR REPLACE INTO strategy_profiles(id, builtin, payload, created_at) VALUES (?, 0, ?, ?)",
+                (profile.id, profile.model_dump_json(), profile.created_at),
+            )
         return profile
 
     def delete_profile(self, profile_id: str) -> bool:
@@ -1128,9 +1778,7 @@ class Store:
     def save_experiment(self, experiment: StrategyExperiment) -> None:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute(
-                "SELECT payload FROM strategy_experiments WHERE id=?", (experiment.id,)
-            ).fetchone()
+            row = con.execute("SELECT payload FROM strategy_experiments WHERE id=?", (experiment.id,)).fetchone()
             if row:
                 current = StrategyExperiment.model_validate_json(row["payload"])
                 terminal = {"CANCELLED", "COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "INTERRUPTED"}
@@ -1144,16 +1792,27 @@ class Store:
                     else:
                         experiment.status = "CANCEL_REQUESTED"
                     experiment.cancel_requested_at = current.cancel_requested_at
-            con.execute("INSERT OR REPLACE INTO strategy_experiments(id, scenario_id, payload, created_at) VALUES (?, ?, ?, ?)", (experiment.id, experiment.scenario_id, experiment.model_dump_json(), experiment.created_at))
+            con.execute(
+                "INSERT OR REPLACE INTO strategy_experiments(id, scenario_id, payload, created_at) VALUES (?, ?, ?, ?)",
+                (experiment.id, experiment.scenario_id, experiment.model_dump_json(), experiment.created_at),
+            )
             for candidate in experiment.candidates:
-                artifact = ScheduleArtifact(id=candidate.id, role="candidate", strategy=candidate.profile_id, schedule=candidate.schedule)
-                con.execute("INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) VALUES (?, NULL, ?, 'candidate', ?, ?)", (artifact.id, experiment.id, artifact.model_dump_json(), experiment.created_at))
+                artifact = ScheduleArtifact(
+                    id=candidate.id, role="candidate", strategy=candidate.profile_id, schedule=candidate.schedule
+                )
+                con.execute(
+                    "INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) VALUES (?, NULL, ?, 'candidate', ?, ?)",
+                    (artifact.id, experiment.id, artifact.model_dump_json(), experiment.created_at),
+                )
 
     def queue_experiment(self, experiment: StrategyExperiment) -> tuple[StrategyExperiment, bool]:
         """Persist a queued experiment, coalescing an identical active request."""
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            rows = con.execute("SELECT payload FROM strategy_experiments WHERE scenario_id=? ORDER BY created_at DESC", (experiment.scenario_id,)).fetchall()
+            rows = con.execute(
+                "SELECT payload FROM strategy_experiments WHERE scenario_id=? ORDER BY created_at DESC",
+                (experiment.scenario_id,),
+            ).fetchall()
             for row in rows:
                 existing = StrategyExperiment.model_validate_json(row["payload"])
                 if (
@@ -1162,12 +1821,13 @@ class Store:
                     and existing.fingerprint == experiment.fingerprint
                 ):
                     return existing, False
-            con.execute("INSERT INTO strategy_experiments(id, scenario_id, payload, created_at) VALUES (?, ?, ?, ?)", (experiment.id, experiment.scenario_id, experiment.model_dump_json(), experiment.created_at))
+            con.execute(
+                "INSERT INTO strategy_experiments(id, scenario_id, payload, created_at) VALUES (?, ?, ?, ?)",
+                (experiment.id, experiment.scenario_id, experiment.model_dump_json(), experiment.created_at),
+            )
             return experiment, True
 
-    def active_experiment_by_fingerprint(
-        self, scenario_id: str, fingerprint: str
-    ) -> StrategyExperiment | None:
+    def active_experiment_by_fingerprint(self, scenario_id: str, fingerprint: str) -> StrategyExperiment | None:
         with self._connect() as con:
             rows = con.execute(
                 "SELECT payload FROM strategy_experiments WHERE scenario_id=? ORDER BY created_at DESC",
@@ -1175,10 +1835,7 @@ class Store:
             ).fetchall()
         for row in rows:
             experiment = StrategyExperiment.model_validate_json(row["payload"])
-            if (
-                experiment.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}
-                and experiment.fingerprint == fingerprint
-            ):
+            if experiment.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"} and experiment.fingerprint == fingerprint:
                 return experiment
         return None
 
@@ -1191,9 +1848,7 @@ class Store:
         """Atomically record cooperative cancellation without clobbering a terminal result."""
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute(
-                "SELECT payload FROM strategy_experiments WHERE id=?", (experiment_id,)
-            ).fetchone()
+            row = con.execute("SELECT payload FROM strategy_experiments WHERE id=?", (experiment_id,)).fetchone()
             if not row:
                 return None
             experiment = StrategyExperiment.model_validate_json(row["payload"])
