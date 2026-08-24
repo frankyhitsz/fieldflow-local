@@ -13,12 +13,18 @@ from typing import Literal
 from .fixtures import all_fixtures
 from .hashing import content_hash
 from .models import (
+    AnalysisIntegrityStatus,
     CapacityCounterfactualArtifact,
+    DecisionAnalysisArtifact,
     DecisionAnalysisRun,
     ExecutionSourceAssignment,
     ExecutionSourceContext,
+    FrozenBookingIdentity,
     PlanCoverageStatus,
     PlanVersion,
+    PublicationPlanningContext,
+    PublicationVerificationArtifact,
+    RouteEntryContext,
     ScenarioRevision,
     ScheduleArtifact,
     ScheduleCandidate,
@@ -26,6 +32,7 @@ from .models import (
     ScheduleRun,
     ScheduleRunStatus,
     ScheduleScenario,
+    SimulationScenarioSetArtifact,
     StrategyExperiment,
     StrategyProfile,
     StrategyProfileCreate,
@@ -42,7 +49,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def _upgrade_technician_costs(payload: object) -> bool:
@@ -445,6 +452,13 @@ class Store:
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
                     FOREIGN KEY(analysis_run_id) REFERENCES decision_analysis_runs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS decision_analysis_attempts (
+                    logical_analysis_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    analysis_run_id TEXT NOT NULL UNIQUE,
+                    PRIMARY KEY(logical_analysis_id, attempt_number),
+                    FOREIGN KEY(analysis_run_id) REFERENCES decision_analysis_runs(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS schedule_artifacts (
                     id TEXT PRIMARY KEY,
                     plan_version_id TEXT,
@@ -550,6 +564,7 @@ class Store:
                 con.executescript(
                     """
                     BEGIN IMMEDIATE;
+                    DROP TABLE IF EXISTS decision_analysis_attempts;
                     DROP TABLE IF EXISTS decision_analysis_artifacts;
                     ALTER TABLE decision_analysis_runs RENAME TO decision_analysis_runs_legacy;
                     CREATE TABLE decision_analysis_runs (
@@ -582,6 +597,23 @@ class Store:
                     """
                 )
                 con.execute("PRAGMA foreign_keys = ON")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS decision_analysis_attempts (
+                    logical_analysis_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    analysis_run_id TEXT NOT NULL UNIQUE,
+                    PRIMARY KEY(logical_analysis_id, attempt_number),
+                    FOREIGN KEY(analysis_run_id) REFERENCES decision_analysis_runs(id) ON DELETE CASCADE
+                )
+                """
+            )
+            for analysis_row in con.execute("SELECT id, payload FROM decision_analysis_runs").fetchall():
+                analysis = DecisionAnalysisRun.model_validate_json(analysis_row["payload"])
+                con.execute(
+                    "INSERT OR IGNORE INTO decision_analysis_attempts(logical_analysis_id, attempt_number, analysis_run_id) VALUES (?, ?, ?)",
+                    (analysis.logical_analysis_id or analysis.id, analysis.attempt_number, analysis.id),
+                )
             if version < 7:
                 scenario_rows = con.execute(
                     "SELECT DISTINCT scenario_id FROM work_order_execution_events ORDER BY scenario_id"
@@ -1670,6 +1702,90 @@ class Store:
         }
         return f"历史恢复 V{number:03d}" if action == "restore" else names.get(strategy, action)
 
+    @staticmethod
+    def _build_publication_planning_context(
+        scenario: ScheduleScenario,
+        chosen: ScheduleResult,
+        planning: object,
+    ) -> PublicationPlanningContext:
+        from .models import PlanningContext
+
+        if not isinstance(planning, PlanningContext):
+            raise PublicationConflict("重排候选缺少可冻结的发布计划上下文")
+        projections = {
+            item.technician_id: item
+            for item in (
+                planning.execution_source_context.technician_projections if planning.execution_source_context else []
+            )
+        }
+        orders = {item.id: item for item in scenario.work_orders}
+        routes: dict[str, list] = {}
+        for assignment in chosen.assignments:
+            routes.setdefault(assignment.technician_id, []).append(assignment)
+        frozen_by_id = {item.work_order_id: item for item in planning.frozen_assignments}
+        route_entries: list[RouteEntryContext] = []
+        for technician in sorted(scenario.technicians, key=lambda item: item.id):
+            projection = projections.get(technician.id)
+            location = projection.effective_location if projection else technician.start_location
+            available_at = max(
+                planning.planning_time,
+                projection.available_at if projection else technician.shift_start,
+            )
+            route = sorted(routes.get(technician.id, []), key=lambda item: item.sequence)
+            future = next(
+                (
+                    item
+                    for item in route
+                    if item.work_order_id not in frozen_by_id
+                    and orders.get(item.work_order_id)
+                    and orders[item.work_order_id].status is WorkOrderStatus.pending
+                ),
+                None,
+            )
+            route_entries.append(
+                RouteEntryContext(
+                    technician_id=technician.id,
+                    location=location,
+                    available_at=available_at,
+                    return_location=technician.start_location,
+                    first_future_work_order_id=future.work_order_id if future else None,
+                    source_work_order_id=projection.source_work_order_id if projection else None,
+                    source_execution_event_sequence=projection.execution_event_sequence if projection else None,
+                )
+            )
+        chosen_by_id = {item.work_order_id: item for item in chosen.assignments}
+        frozen_identities: list[FrozenBookingIdentity] = []
+        for frozen in sorted(planning.frozen_assignments, key=lambda item: item.work_order_id):
+            assignment = chosen_by_id.get(frozen.work_order_id)
+            frozen_identities.append(
+                FrozenBookingIdentity(
+                    work_order_id=frozen.work_order_id,
+                    technician_id=frozen.technician_id,
+                    source_sequence=(
+                        frozen.source_sequence
+                        or (assignment.source_sequence if assignment else None)
+                        or (assignment.sequence if assignment else None)
+                    ),
+                    source_assignment_hash=(
+                        frozen.source_assignment_hash or (assignment.source_assignment_hash if assignment else None)
+                    ),
+                )
+            )
+        context_payload = {
+            "policy_version": "FIELD_SERVICE_PUBLICATION_CONTEXT_V1",
+            "scenario_revision": scenario.revision,
+            "planning_time": planning.planning_time,
+            "execution_event_sequence": (
+                planning.execution_source_context.execution_event_sequence if planning.execution_source_context else 0
+            ),
+            "source_plan_version_id": planning.source_plan_version_id,
+            "source_plan_snapshot_hash": planning.source_plan_snapshot_hash,
+            "route_entries": [item.model_dump(mode="json") for item in route_entries],
+            "frozen_booking_identities": [item.model_dump(mode="json") for item in frozen_identities],
+        }
+        fingerprint = content_hash(context_payload)
+        return PublicationPlanningContext(**context_payload, context_fingerprint=fingerprint)
+
     def publish_plan(
         self,
         scenario: ScheduleScenario,
@@ -1695,6 +1811,7 @@ class Store:
         candidate_id: str,
         experiment_id: str | None = None,
         experiment_candidate_id: str | None = None,
+        publication_planning_context_override: PublicationPlanningContext | None = None,
     ) -> PlanVersion:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -1871,6 +1988,50 @@ class Store:
                 source_hash = publication_source.scenario_snapshot_hash or (
                     content_hash(publication_source.scenario_snapshot) if publication_source.scenario_snapshot else None
                 )
+            publication_context: PublicationPlanningContext | None = None
+            publication_context_hash: str | None = None
+            if chosen.kind == "replan":
+                publication_context = (
+                    publication_planning_context_override.model_copy(deep=True)
+                    if publication_planning_context_override
+                    else self._build_publication_planning_context(scenario, chosen, candidate.planning_context)
+                )
+                publication_context_hash = content_hash(
+                    publication_context.model_dump(exclude={"context_fingerprint"}, mode="json")
+                )
+                if (
+                    publication_context.context_fingerprint != publication_context_hash
+                    or publication_context.scenario_revision != scenario.revision
+                ):
+                    raise PublicationConflict("发布计划上下文与当前方案不一致")
+            verification_report_payload = transaction_verification.model_dump(exclude={"checked_at"}, mode="json")
+            verification_report_hash = content_hash(verification_report_payload)
+            verification_artifact_payload = {
+                "policy_version": "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+                "candidate_snapshot": candidate.model_dump(mode="json"),
+                "planning_context_snapshot": (
+                    candidate.planning_context.model_dump(mode="json")
+                    if candidate.planning_context
+                    else publication_context.model_dump(mode="json")
+                    if publication_context
+                    else None
+                ),
+                "transaction_verification_report": verification_report_payload,
+                "verified_schedule_hash": content_hash(chosen),
+            }
+            verification_artifact = PublicationVerificationArtifact(
+                **verification_artifact_payload,
+                artifact_hash=content_hash(verification_artifact_payload),
+            )
+            publication_manifest_hash = content_hash(
+                {
+                    "policy_version": "FIELD_SERVICE_PUBLICATION_MANIFEST_V1",
+                    "scenario_snapshot_hash": content_hash(scenario),
+                    "published_schedule_hash": content_hash(chosen),
+                    "publication_planning_context_hash": publication_context_hash,
+                    "publication_verification_artifact_hash": verification_artifact.artifact_hash,
+                }
+            )
             plan = PlanVersion(
                 id=plan_id,
                 scenario_id=scenario.id,
@@ -1896,10 +2057,12 @@ class Store:
                 candidate_id=candidate_id,
                 scenario_snapshot_hash=content_hash(scenario),
                 published_schedule_hash=content_hash(chosen),
-                publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V1",
-                publication_verification_report_hash=content_hash(
-                    transaction_verification.model_dump(exclude={"checked_at"}, mode="json")
-                ),
+                publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+                publication_verification_report_hash=verification_report_hash,
+                publication_verification_artifact=verification_artifact,
+                publication_planning_context=publication_context,
+                publication_planning_context_hash=publication_context_hash,
+                publication_manifest_hash=publication_manifest_hash,
                 source_plan_snapshot_hash=source_hash,
             )
             con.execute(
@@ -2136,6 +2299,12 @@ class Store:
             saved.number = int(row["number"])
             saved.id = f"AN-{saved.scenario_id}-{saved.number}-{uuid.uuid4().hex[:6]}"
             saved.logical_analysis_id = saved.logical_analysis_id or saved.id
+            if force_new and run.logical_analysis_id:
+                attempt_rows = con.execute(
+                    "SELECT attempt_number FROM decision_analysis_attempts WHERE logical_analysis_id=?",
+                    (saved.logical_analysis_id,),
+                ).fetchall()
+                saved.attempt_number = max((int(item["attempt_number"]) for item in attempt_rows), default=0) + 1
             con.execute(
                 """
                 INSERT INTO decision_analysis_runs(
@@ -2153,13 +2322,17 @@ class Store:
                     saved.created_at,
                 ),
             )
+            con.execute(
+                "INSERT INTO decision_analysis_attempts(logical_analysis_id, attempt_number, analysis_run_id) VALUES (?, ?, ?)",
+                (saved.logical_analysis_id, saved.attempt_number, saved.id),
+            )
             return saved, True
 
     def finish_decision_analysis_run(
         self,
         run: DecisionAnalysisRun,
         *,
-        artifacts: list[CapacityCounterfactualArtifact] | None = None,
+        artifacts: list[DecisionAnalysisArtifact] | None = None,
     ) -> DecisionAnalysisRun:
         if run.status not in {"COMPLETED", "FAILED", "INTERRUPTED"}:
             raise PublicationConflict("经营分析只能结束为完成、失败或中断")
@@ -2175,7 +2348,36 @@ class Store:
             if stored.input_hash != run.input_hash or stored.plan_version_id != run.plan_version_id:
                 raise PublicationConflict("经营分析终态与预留输入不一致")
             if stored.status != "RUNNING":
-                return stored
+                return self._validate_decision_analysis_integrity(con, stored)
+            artifact_manifest: list[dict[str, str]] = []
+            for artifact in artifacts or []:
+                expected_artifact_hash = content_hash(
+                    artifact.model_dump(exclude={"artifact_hash", "integrity_status"}, mode="json")
+                )
+                if artifact.artifact_hash != expected_artifact_hash:
+                    raise PublicationConflict("容量反事实证据指纹不一致")
+                artifact_manifest.append(
+                    {
+                        "artifact_id": artifact.id,
+                        "artifact_type": artifact.artifact_type,
+                        "artifact_hash": artifact.artifact_hash,
+                    }
+                )
+            run.result_hash = content_hash(run.result) if run.result is not None else None
+            run.artifact_manifest = sorted(artifact_manifest, key=lambda item: item["artifact_id"])
+            manifest_payload = {
+                "policy_version": "FIELD_SERVICE_ANALYSIS_MANIFEST_V1",
+                "analysis_id": run.id,
+                "input_hash": run.input_hash,
+                "result_hash": run.result_hash,
+                "artifact_manifest": run.artifact_manifest,
+                "status": run.status,
+                "build_sha": run.build_sha,
+                "algorithm_version": run.algorithm_version,
+                "schedule_hash": run.schedule_hash,
+            }
+            run.analysis_manifest_hash = content_hash(manifest_payload)
+            run.integrity_status = AnalysisIntegrityStatus.verified
             con.execute(
                 "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
                 (run.model_dump_json(), run.id),
@@ -2193,12 +2395,65 @@ class Store:
                         artifact.id,
                         artifact.scenario_id,
                         artifact.analysis_run_id,
-                        artifact.option_id,
+                        artifact.option_id if isinstance(artifact, CapacityCounterfactualArtifact) else "SCENARIO_SET",
                         artifact.model_dump_json(),
                         artifact.created_at,
                     ),
                 )
         return run
+
+    @staticmethod
+    def _validate_decision_analysis_integrity(
+        con: sqlite3.Connection,
+        run: DecisionAnalysisRun,
+    ) -> DecisionAnalysisRun:
+        checked = run.model_copy(deep=True)
+        if not checked.analysis_manifest_hash:
+            checked.integrity_status = AnalysisIntegrityStatus.legacy_unattested
+            return checked
+        if checked.result_hash != (content_hash(checked.result) if checked.result is not None else None):
+            checked.integrity_status = AnalysisIntegrityStatus.failed
+            return checked
+        artifact_rows = con.execute(
+            "SELECT id, payload FROM decision_analysis_artifacts WHERE analysis_run_id=?",
+            (checked.id,),
+        ).fetchall()
+        actual_artifacts: dict[str, str] = {}
+        for row in artifact_rows:
+            payload = json.loads(row["payload"])
+            artifact = (
+                SimulationScenarioSetArtifact.model_validate(payload)
+                if payload.get("artifact_type") == "SIMULATION_SCENARIO_SET"
+                else CapacityCounterfactualArtifact.model_validate(payload)
+            )
+            expected = content_hash(artifact.model_dump(exclude={"artifact_hash", "integrity_status"}, mode="json"))
+            if artifact.artifact_hash != expected:
+                artifact.integrity_status = AnalysisIntegrityStatus.failed
+                checked.integrity_status = AnalysisIntegrityStatus.failed
+                return checked
+            artifact.integrity_status = AnalysisIntegrityStatus.verified
+            actual_artifacts[row["id"]] = artifact.artifact_hash
+        declared = {item.get("artifact_id", ""): item.get("artifact_hash", "") for item in checked.artifact_manifest}
+        if declared != actual_artifacts:
+            checked.integrity_status = AnalysisIntegrityStatus.failed
+            return checked
+        manifest_payload = {
+            "policy_version": "FIELD_SERVICE_ANALYSIS_MANIFEST_V1",
+            "analysis_id": checked.id,
+            "input_hash": checked.input_hash,
+            "result_hash": checked.result_hash,
+            "artifact_manifest": checked.artifact_manifest,
+            "status": checked.status,
+            "build_sha": checked.build_sha,
+            "algorithm_version": checked.algorithm_version,
+            "schedule_hash": checked.schedule_hash,
+        }
+        checked.integrity_status = (
+            AnalysisIntegrityStatus.verified
+            if content_hash(manifest_payload) == checked.analysis_manifest_hash
+            else AnalysisIntegrityStatus.failed
+        )
+        return checked
 
     def list_decision_analysis_runs(self, scenario_id: str, plan_version_id: str) -> list[DecisionAnalysisRun]:
         with self._connect() as con:
@@ -2209,7 +2464,10 @@ class Store:
                 """,
                 (scenario_id, plan_version_id),
             ).fetchall()
-        return [DecisionAnalysisRun.model_validate_json(row["payload"]) for row in rows]
+            return [
+                self._validate_decision_analysis_integrity(con, DecisionAnalysisRun.model_validate_json(row["payload"]))
+                for row in rows
+            ]
 
     def get_decision_analysis_run(self, scenario_id: str, analysis_id: str) -> DecisionAnalysisRun | None:
         normalized = analysis_id[1:] if analysis_id.upper().startswith("A") else analysis_id
@@ -2222,13 +2480,17 @@ class Store:
                 """,
                 (scenario_id, analysis_id, numeric),
             ).fetchone()
-        return DecisionAnalysisRun.model_validate_json(row["payload"]) if row else None
+            return (
+                self._validate_decision_analysis_integrity(con, DecisionAnalysisRun.model_validate_json(row["payload"]))
+                if row
+                else None
+            )
 
     def list_decision_analysis_artifacts(
         self,
         scenario_id: str,
         analysis_run_id: str,
-    ) -> list[CapacityCounterfactualArtifact]:
+    ) -> list[DecisionAnalysisArtifact]:
         with self._connect() as con:
             rows = con.execute(
                 """
@@ -2237,14 +2499,33 @@ class Store:
                 """,
                 (scenario_id, analysis_run_id),
             ).fetchall()
-        return [CapacityCounterfactualArtifact.model_validate_json(row["payload"]) for row in rows]
+        artifacts: list[DecisionAnalysisArtifact] = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            artifact = (
+                SimulationScenarioSetArtifact.model_validate(payload)
+                if payload.get("artifact_type") == "SIMULATION_SCENARIO_SET"
+                else CapacityCounterfactualArtifact.model_validate(payload)
+            )
+            expected_hash = content_hash(
+                artifact.model_dump(exclude={"artifact_hash", "integrity_status"}, mode="json")
+            )
+            artifact.integrity_status = (
+                AnalysisIntegrityStatus.legacy_unattested
+                if not artifact.artifact_hash
+                else AnalysisIntegrityStatus.verified
+                if artifact.artifact_hash == expected_hash
+                else AnalysisIntegrityStatus.failed
+            )
+            artifacts.append(artifact)
+        return artifacts
 
     def get_decision_analysis_artifact(
         self,
         scenario_id: str,
         analysis_run_id: str,
         artifact_id: str,
-    ) -> CapacityCounterfactualArtifact | None:
+    ) -> DecisionAnalysisArtifact | None:
         with self._connect() as con:
             row = con.execute(
                 """
@@ -2253,7 +2534,23 @@ class Store:
                 """,
                 (scenario_id, analysis_run_id, artifact_id),
             ).fetchone()
-        return CapacityCounterfactualArtifact.model_validate_json(row["payload"]) if row else None
+        if not row:
+            return None
+        payload = json.loads(row["payload"])
+        artifact = (
+            SimulationScenarioSetArtifact.model_validate(payload)
+            if payload.get("artifact_type") == "SIMULATION_SCENARIO_SET"
+            else CapacityCounterfactualArtifact.model_validate(payload)
+        )
+        expected_hash = content_hash(artifact.model_dump(exclude={"artifact_hash", "integrity_status"}, mode="json"))
+        artifact.integrity_status = (
+            AnalysisIntegrityStatus.legacy_unattested
+            if not artifact.artifact_hash
+            else AnalysisIntegrityStatus.verified
+            if artifact.artifact_hash == expected_hash
+            else AnalysisIntegrityStatus.failed
+        )
+        return artifact
 
     def published_for_key(self, key: str, fingerprint: str) -> PlanVersion | None:
         with self._connect() as con:

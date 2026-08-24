@@ -3,7 +3,7 @@ import {
   AlertTriangle, BarChart3, Edit3, Plus, Save, ShieldCheck, Trash2, X, Zap,
 } from 'lucide-react'
 import { api } from './api'
-import type { CapacityAnalysis, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, Scenario, Schedule, Technician, WorkOrder } from './types'
+import type { CapacityAnalysis, CapacityCounterfactualArtifact, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, Scenario, Schedule, Technician, WorkOrder } from './types'
 
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
@@ -101,26 +101,29 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   const [horizonDays, setHorizonDays] = useState(1)
   const [decisionErrors, setDecisionErrors] = useState<string[]>([])
   const [retryableRuns, setRetryableRuns] = useState<DecisionAnalysisRun[]>([])
+  const [capacityAnalysisRunId, setCapacityAnalysisRunId] = useState<string>()
+  const [capacityArtifact, setCapacityArtifact] = useState<CapacityCounterfactualArtifact>()
   const [loadingExisting, setLoadingExisting] = useState(false)
   const [loadingDecision, setLoadingDecision] = useState(false)
   useEffect(() => {
     let cancelled = false
-    setCost(undefined); setRisk(undefined); setCapacity(undefined); setAnalysisNumbers({}); setDecisionErrors([]); setRetryableRuns([])
+    setCost(undefined); setRisk(undefined); setCapacity(undefined); setAnalysisNumbers({}); setDecisionErrors([]); setRetryableRuns([]); setCapacityAnalysisRunId(undefined); setCapacityArtifact(undefined)
     if (!planVersionId) return () => { cancelled = true }
     setLoadingExisting(true)
     api.analysisRuns(scenarioId, planVersionId)
       .then(runs => {
         if (cancelled) return
-        const latest = (type: DecisionAnalysisRun['analysis_type']) => [...runs].reverse().find(item => item.analysis_type === type && item.status === 'COMPLETED' && item.result)
+        const latest = (type: DecisionAnalysisRun['analysis_type']) => [...runs].reverse().find(item => item.analysis_type === type && item.status === 'COMPLETED' && item.integrity_status !== 'FAILED' && item.result)
         const costRun = latest('COST') as DecisionAnalysisRun<CostAnalysis> | undefined
         const riskRun = latest('RISK') as DecisionAnalysisRun<RiskSimulation> | undefined
         const capacityRun = latest('CAPACITY') as DecisionAnalysisRun<CapacityAnalysis> | undefined
         setCost(costRun?.result || undefined); setRisk(riskRun?.result || undefined); setCapacity(capacityRun?.result || undefined)
+        setCapacityAnalysisRunId(capacityRun?.id)
         setAnalysisNumbers({ cost: costRun?.number, risk: riskRun?.number, capacity: capacityRun?.number })
-        const failed = runs.filter(item => item.status === 'FAILED' || item.status === 'INTERRUPTED')
-        if (failed.length) {
-          setRetryableRuns(failed.slice(-3))
-          setDecisionErrors(failed.slice(-3).map(item => `A${String(item.number).padStart(3, '0')} ${typeof item.error?.message === 'string' ? item.error.message : item.status === 'INTERRUPTED' ? '分析被中断' : '分析失败'}`))
+        const issues = runs.filter(item => item.status === 'FAILED' || item.status === 'INTERRUPTED' || item.integrity_status === 'FAILED')
+        if (issues.length) {
+          setRetryableRuns(issues.filter(item => item.status === 'FAILED' || item.status === 'INTERRUPTED').slice(-3))
+          setDecisionErrors(issues.slice(-3).map(item => `A${String(item.number).padStart(3, '0')} ${item.integrity_status === 'FAILED' ? '完整性校验失败' : typeof item.error?.message === 'string' ? item.error.message : item.status === 'INTERRUPTED' ? '分析被中断' : '分析失败'}`))
         }
       })
       .catch(error => { if (!cancelled) setDecisionErrors([error instanceof Error ? error.message : '读取经营分析失败']) })
@@ -129,9 +132,19 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   }, [scenarioId, planVersionId])
   if (!schedule) return <section className="page-view"><div className="empty-view">请先生成一个方案，再查看运营复盘。</div></section>
   const completedResult = <T,>(run: DecisionAnalysisRun<T>, label: string): T => {
+    if (run.integrity_status === 'FAILED') throw new Error(`A${String(run.number).padStart(3, '0')}：完整性校验失败`)
     if (run.status === 'COMPLETED' && run.result) return run.result
     const message = typeof run.error?.message === 'string' ? run.error.message : `${label}没有完成`
     throw new Error(`A${String(run.number).padStart(3, '0')}：${message}`)
+  }
+  const waitForRun = async <T extends CostAnalysis | CapacityAnalysis | RiskSimulation,>(initial: DecisionAnalysisRun<T>): Promise<DecisionAnalysisRun<T>> => {
+    let current = initial
+    for (let attempt = 0; current.status === 'RUNNING' && attempt < 40; attempt += 1) {
+      await new Promise(resolve => window.setTimeout(resolve, 500))
+      current = await api.decisionAnalysisRun<T>(scenarioId, current.id)
+    }
+    if (current.status === 'RUNNING') throw new Error(`A${String(current.number).padStart(3, '0')} 仍在运行，请稍后回到本页查看。`)
+    return current
   }
   const rememberRetryable = (run: DecisionAnalysisRun) => {
     if (run.status !== 'FAILED' && run.status !== 'INTERRUPTED') return
@@ -140,7 +153,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   const retryAnalysis = async (run: DecisionAnalysisRun) => {
     setLoadingDecision(true); setDecisionErrors([])
     try {
-      const retried = await api.retryDecisionAnalysisRun(scenarioId, run.id)
+      const retried = await waitForRun(await api.retryDecisionAnalysisRun(scenarioId, run.id))
       if (retried.status !== 'COMPLETED' || !retried.result) {
         rememberRetryable(retried)
         throw new Error(`A${String(retried.number).padStart(3, '0')}：${typeof retried.error?.message === 'string' ? retried.error.message : '重试没有完成'}`)
@@ -150,7 +163,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
       } else if (retried.analysis_type === 'RISK') {
         setRisk(retried.result as RiskSimulation); setAnalysisNumbers(current => ({ ...current, risk: retried.number }))
       } else {
-        setCapacity(retried.result as CapacityAnalysis); setAnalysisNumbers(current => ({ ...current, capacity: retried.number }))
+        setCapacity(retried.result as CapacityAnalysis); setCapacityAnalysisRunId(retried.id); setAnalysisNumbers(current => ({ ...current, capacity: retried.number }))
       }
       setRetryableRuns(current => current.filter(item => item.logical_analysis_id !== retried.logical_analysis_id))
     } catch (error) {
@@ -161,8 +174,8 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     if (!planVersionId) return
     setLoadingDecision(true); setDecisionErrors([])
     const [costOutcome, riskOutcome] = await Promise.allSettled([
-      api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { horizonDays }),
-      api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { horizonDays }),
+      api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { horizonDays }).then(waitForRun),
+      api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { horizonDays }).then(waitForRun),
     ])
     const errors: string[] = []
     if (costOutcome.status === 'fulfilled') {
@@ -178,11 +191,21 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     setLoadingDecision(true); setDecisionErrors([])
     let run: DecisionAnalysisRun<CapacityAnalysis> | undefined
     try {
-      const created = await api.createDecisionAnalysisRun<CapacityAnalysis>(scenarioId, planVersionId, 'CAPACITY', { referenceMode: capacityMode, horizonDays })
+      const created = await waitForRun(await api.createDecisionAnalysisRun<CapacityAnalysis>(scenarioId, planVersionId, 'CAPACITY', { referenceMode: capacityMode, horizonDays }))
       run = created
-      setCapacity(completedResult(created, '容量分析')); setAnalysisNumbers(current => ({ ...current, capacity: created.number }))
+      setCapacity(completedResult(created, '容量分析')); setCapacityAnalysisRunId(created.id); setCapacityArtifact(undefined); setAnalysisNumbers(current => ({ ...current, capacity: created.number }))
     } catch (error) { if (run) rememberRetryable(run); setDecisionErrors([error instanceof Error ? error.message : '容量分析失败']) }
     finally { setLoadingDecision(false) }
+  }
+  const showCapacityArtifact = async (artifactId: string) => {
+    if (!capacityAnalysisRunId) return
+    try {
+      const artifact = await api.decisionAnalysisArtifact(scenarioId, capacityAnalysisRunId, artifactId)
+      if (artifact.artifact_type !== 'CAPACITY_COUNTERFACTUAL') throw new Error('该证据不是容量反事实结果')
+      setCapacityArtifact(artifact)
+    } catch (error) {
+      setDecisionErrors([error instanceof Error ? error.message : '读取容量证据失败'])
+    }
   }
   const breakdownLabels: Record<string, string> = { travel: '行程代价', sla_late: 'SLA 延迟代价', overtime: '加班代价', unassigned: '未分配代价', imbalance: '负载不均代价', replan_changes: '方案变更代价' }
   const cadenceLabel = { ONE_TIME: '一次性', PER_DAY: '每日', PER_SHIFT: '每班', PER_ORDER: '每单', PER_MONTH: '每月' }
@@ -225,7 +248,8 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
       <article><small>全日总迟到分钟 P95</small><b>{risk ? `${risk.full_day_total_late_minutes_p95} 分钟` : '—'}</b><p>P50 {risk?.full_day_total_late_minutes_p50 ?? '—'} · P90 {risk?.full_day_total_late_minutes_p90 ?? '—'} 分钟</p></article>
       <article><small>新增业务损害概率</small><b>{risk ? pct(risk.additional_disruption_probability) : '—'}</b><p>{risk ? `突发事件发生 ${pct(risk.emergency_event_probability)} · 实际致损 ${pct(risk.emergency_caused_failure_probability)} · 条件致损 ${pct(risk.emergency_failure_given_event_probability)}` : '—'}</p></article>
     </div>}
-    {capacity && <div className="capacity-table-wrap"><div className="capacity-reference"><b>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V · 尾部追加' : '相对同算法重算基线'}</b><span>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '保留现有 assignment，仅在路线尾部追加；这不是完整插入优化。' : '基准和选项使用相同贪心政策。'}{analysisNumbers.capacity ? ` · A${String(analysisNumbers.capacity).padStart(3, '0')}` : ''} · {capacity.analysis_horizon.days} 个工作日</span></div><table className="capacity-table"><thead><tr><th>容量方案</th><th>可执行性</th><th>完成率改善</th><th>SLA 改善</th><th>周期总影响</th><th>固定成本口径</th></tr></thead><tbody>{capacity.options.map(item => <tr key={item.option_id} className={item.feasible ? '' : 'capacity-invalid'}><td><b>{item.name}</b><small>{item.assumption}</small></td><td>{item.feasible ? '可执行' : item.option_applicable ? '不可执行' : '不适用'}{item.violations.length ? <details><summary>{item.violations.length} 项违规</summary><ul>{item.violations.map((violation, index) => <li key={`${violation.code}-${index}`}>{violation.message}</li>)}</ul></details> : <small>完整约束校验通过</small>}</td><td>{pp(item.completion_improvement_percentage_points)}</td><td>{pp(item.sla_improvement_percentage_points)}</td><td>{item.horizon_total_impact_cents == null ? '—' : money(item.horizon_total_impact_cents)}</td><td>{cadenceLabel[item.fixed_cost_cadence]} {money(item.fixed_capacity_cost_cents)}<small>{item.cost_units_per_day} {unitLabel[item.cost_unit_type]}</small><small>{item.economic_impact_offset_days == null ? '无可计算经济影响抵消点' : `${item.economic_impact_offset_days} 日抵消经济影响`}</small></td></tr>)}</tbody></table><p className="decision-note">不可执行方案只保留诊断路线与违规，不展示正式收益；经济影响抵消天数包含模拟损失改善，不等同于现金回本。</p></div>}
+    {capacity && <div className="capacity-table-wrap"><div className="capacity-reference"><b>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V · 尾部追加' : '相对同算法重算基线'}</b><span>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '保留现有 assignment，仅在路线尾部追加；这不是完整插入优化。' : '基准和选项使用相同贪心政策。'}{analysisNumbers.capacity ? ` · A${String(analysisNumbers.capacity).padStart(3, '0')}` : ''} · {capacity.analysis_horizon.days} 个工作日</span></div><table className="capacity-table"><thead><tr><th>容量方案</th><th>可执行性</th><th>完成率改善</th><th>SLA 改善</th><th>周期总影响</th><th>固定成本口径</th><th>证据</th></tr></thead><tbody>{capacity.options.map(item => <tr key={item.option_id} className={item.feasible ? '' : 'capacity-invalid'}><td><b>{item.name}</b><small>{item.assumption}</small></td><td>{item.feasible ? '可执行' : item.option_applicable ? '不可执行' : '不适用'}{item.violations.length ? <details><summary>{item.violations.length} 项违规</summary><ul>{item.violations.map((violation, index) => <li key={`${violation.code}-${index}`}>{violation.message}</li>)}</ul></details> : <small>完整约束校验通过</small>}</td><td>{pp(item.completion_improvement_percentage_points)}</td><td>{pp(item.sla_improvement_percentage_points)}</td><td>{item.horizon_total_impact_cents == null ? '—' : money(item.horizon_total_impact_cents)}</td><td>{cadenceLabel[item.fixed_cost_cadence]} {money(item.fixed_capacity_cost_cents)}<small>{item.cost_units_per_day} {unitLabel[item.cost_unit_type]}</small><small>{item.economic_impact_offset_days == null ? '无可计算经济影响抵消点' : `${item.economic_impact_offset_days} 日抵消经济影响`}</small></td><td><button disabled={!item.artifact_id} onClick={() => item.artifact_id && showCapacityArtifact(item.artifact_id)}>查看证据</button></td></tr>)}</tbody></table><p className="decision-note">不可执行方案只保留诊断路线与违规，不展示正式收益；经济影响抵消天数包含模拟损失改善，不等同于现金回本。</p></div>}
+    {capacityArtifact && <article className="tradeoff-card capacity-evidence" aria-live="polite"><ShieldCheck size={20} /><div><h2>{capacityArtifact.option_id} 反事实证据</h2><p>完整性：{capacityArtifact.integrity_status} · 指纹 {capacityArtifact.artifact_hash.slice(0, 12)}… · 内部分配 {capacityArtifact.counterfactual_kpis?.internal_assignment_count ?? '—'} · 外部承接 {capacityArtifact.counterfactual_kpis?.external_assignment_count ?? 0} · 未服务 {capacityArtifact.counterfactual_kpis?.unserved_count ?? '—'}</p>{capacityArtifact.external_assignments.length > 0 && <details><summary>外部承接清单（{capacityArtifact.external_assignments.length}）</summary><ul>{capacityArtifact.external_assignments.map(item => <li key={item.work_order_id}>{item.work_order_id} · {item.provider_id} · {item.assumed_on_time ? '假设 SLA 内完成' : '未承诺准时'}</li>)}</ul></details>}<button onClick={() => setCapacityArtifact(undefined)}>关闭证据</button></div></article>}
   </section>
 }
 
@@ -249,7 +273,7 @@ export function WorkOrderEditor({ initial, emergencyPreset, onClose, onSave, onD
     <div className="editor-head"><div><span className="eyebrow">WORK ORDER</span><h2 id="work-order-editor-title">{initial ? `编辑 ${initial.id}` : order.is_emergency ? '登记突发工单' : '新增工单'}</h2></div><button className="icon-btn" onClick={onClose} aria-label="关闭工单编辑"><X /></button></div>
     <div className="form-grid"><label className="span-2">客户名称<input disabled={executionLocked} value={order.customer_name} onChange={e => patch('customer_name', e.target.value)} placeholder="例如：衡安数据中心" /></label><label className="span-2">任务内容<input disabled={executionLocked} value={order.title} onChange={e => patch('title', e.target.value)} placeholder="例如：核心机房断电告警" /></label>
       <fieldset className="span-2"><legend>所需技能</legend>{Object.entries(skillLabel).map(([key, label]) => <label className="check" key={key}><input disabled={executionLocked} type="checkbox" checked={order.required_skills.includes(key)} onChange={e => patch('required_skills', e.target.checked ? [...order.required_skills, key] : order.required_skills.filter(item => item !== key))} />{label}</label>)}</fieldset>
-      <label>时间窗开始<ServiceTimeInput disabled={executionLocked} label="时间窗开始" value={order.window_start} onChange={value => patch('window_start', value)} /></label><label>时间窗结束<ServiceTimeInput disabled={executionLocked} label="时间窗结束" value={order.window_end} onChange={value => patch('window_end', value)} /></label><label>SLA 截止<ServiceTimeInput disabled={executionLocked} label="SLA 截止" value={order.sla_deadline} onChange={value => patch('sla_deadline', value)} /></label><label>服务时长（分钟）<input disabled={executionLocked} type="number" min="5" max="480" value={order.service_duration} onChange={e => patch('service_duration', Number(e.target.value))} /></label>
+      <label>允许开始时间<ServiceTimeInput disabled={executionLocked} label="允许开始时间" value={order.window_start} onChange={value => patch('window_start', value)} /></label><label>最晚开始时间<ServiceTimeInput disabled={executionLocked} label="最晚开始时间" value={order.window_end} onChange={value => patch('window_end', value)} /></label><label>SLA 截止<ServiceTimeInput disabled={executionLocked} label="SLA 截止" value={order.sla_deadline} onChange={value => patch('sla_deadline', value)} /></label><label>服务时长（分钟）<input disabled={executionLocked} type="number" min="5" max="480" value={order.service_duration} onChange={e => patch('service_duration', Number(e.target.value))} /></label>
       <label>横坐标<input disabled={executionLocked} type="number" min="0" max="100" value={order.location.x} onChange={e => patch('location', { ...order.location, x: Number(e.target.value) })} /></label><label>纵坐标<input disabled={executionLocked} type="number" min="0" max="100" value={order.location.y} onChange={e => patch('location', { ...order.location, y: Number(e.target.value) })} /></label>
       <label>优先级<select disabled={executionLocked} value={order.priority} onChange={e => patch('priority', e.target.value as WorkOrder['priority'])}><option value="urgent">紧急</option><option value="high">高</option><option value="normal">普通</option><option value="low">低</option></select></label><label>执行状态<span className="readonly-field">{{ pending: '待处理', started: '服务中', completed: '已完成' }[order.status]}</span></label>
       <label className="switch-line span-2"><input disabled={executionLocked} type="checkbox" checked={order.is_emergency} onChange={e => { if (e.target.checked) { setOrder(current => ({ ...current, is_emergency: true, priority: 'urgent', drop_penalty: Math.max(8000, current.drop_penalty), reported_at: current.reported_at ?? 600 })) } else { setOrder(current => ({ ...current, is_emergency: false, drop_penalty: current.priority === 'high' ? 4800 : current.priority === 'low' ? 1400 : 2500, reported_at: null })) } }} /><Zap size={15} />标记为突发工单<span>突发单会在局部重排中获得更高的保留优先级</span></label>

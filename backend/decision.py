@@ -10,6 +10,8 @@ from .models import (
     AnalysisHorizon,
     CapacityAnalysis,
     CapacityAnalysisRequest,
+    CapacityCostSource,
+    CapacityCounterfactualKPI,
     CapacityOptionId,
     CapacityOptionResult,
     CapacityReferenceMode,
@@ -21,6 +23,7 @@ from .models import (
     DecisionAnalysisContext,
     DecisionAnalysisScope,
     DecisionCostPolicy,
+    ExternalAssignment,
     LaborCostMode,
     PlanCostBreakdown,
     PlanVersion,
@@ -28,12 +31,15 @@ from .models import (
     RiskExecutionPolicy,
     RiskSimulationRequest,
     RiskSimulationResult,
+    RouteEntryContext,
     ScheduleAssignment,
     ScheduleResult,
     ScheduleScenario,
+    SimulationEmergencyEvent,
     Skill,
     Technician,
     UnassignedWorkOrder,
+    WorkOrderDisposition,
 )
 from .provenance import DECISION_ALGORITHM_VERSION, decision_build_sha
 from .scheduler import baseline_schedule, calculate_kpis
@@ -99,6 +105,7 @@ def _validate_analysis_input(
     plan: PlanVersion,
     provider: TravelTimeProvider,
     context: DecisionAnalysisContext,
+    analysis_type: str = "COST",
 ) -> ScheduleScenario:
     if context.analysis_scope is not DecisionAnalysisScope.ex_ante_frozen_plan:
         raise DecisionAnalysisError(
@@ -185,12 +192,69 @@ def _validate_analysis_input(
             stored_hash=plan.published_schedule_hash,
             recomputed_hash=content_hash(plan.selected),
         )
+    publication_context = plan.publication_planning_context
+    if plan.selected.kind == "replan" and analysis_type in {"CAPACITY", "RISK"} and publication_context is None:
+        raise DecisionAnalysisError(
+            "REPLAN_ANALYSIS_CONTEXT_NOT_AVAILABLE",
+            "该历史重排方案没有冻结发布时路线起点；风险与容量分析会产生误导，已拒绝运行",
+            plan_version_id=plan.id,
+        )
+    if publication_context is not None:
+        expected_context_hash = content_hash(
+            publication_context.model_dump(exclude={"context_fingerprint"}, mode="json")
+        )
+        if (
+            publication_context.context_fingerprint != expected_context_hash
+            or plan.publication_planning_context_hash != expected_context_hash
+        ):
+            raise DecisionAnalysisError(
+                "PUBLICATION_CONTEXT_HASH_MISMATCH",
+                "发布计划上下文与冻结指纹不一致",
+            )
+    verification_artifact = plan.publication_verification_artifact
+    if verification_artifact is not None:
+        artifact_hash = content_hash(verification_artifact.model_dump(exclude={"artifact_hash"}, mode="json"))
+        if artifact_hash != verification_artifact.artifact_hash:
+            raise DecisionAnalysisError(
+                "PUBLICATION_VERIFICATION_ARTIFACT_HASH_MISMATCH",
+                "发布验证证据与冻结指纹不一致",
+            )
+        if verification_artifact.verified_schedule_hash != content_hash(plan.selected):
+            raise DecisionAnalysisError(
+                "PUBLICATION_VERIFICATION_SCHEDULE_MISMATCH",
+                "发布验证证据没有绑定当前冻结排程",
+            )
+        report_hash = content_hash(verification_artifact.transaction_verification_report)
+        if report_hash != plan.publication_verification_report_hash:
+            raise DecisionAnalysisError(
+                "PUBLICATION_VERIFICATION_REPORT_HASH_MISMATCH",
+                "发布验证报告与方案保存的报告指纹不一致",
+            )
+        expected_manifest_hash = content_hash(
+            {
+                "policy_version": "FIELD_SERVICE_PUBLICATION_MANIFEST_V1",
+                "scenario_snapshot_hash": plan.scenario_snapshot_hash,
+                "published_schedule_hash": content_hash(plan.selected),
+                "publication_planning_context_hash": plan.publication_planning_context_hash,
+                "publication_verification_artifact_hash": verification_artifact.artifact_hash,
+            }
+        )
+        if plan.publication_manifest_hash != expected_manifest_hash:
+            raise DecisionAnalysisError(
+                "PUBLICATION_MANIFEST_HASH_MISMATCH",
+                "发布清单没有完整绑定业务快照、排程与验证证据",
+            )
     structural = verify_counterfactual_schedule(
         plan.scenario_snapshot,
         plan.selected,
         provider,
-        allow_started_first=True,
-        allow_route_entry_context=plan.selected.kind == "replan",
+        route_entries=(publication_context.route_entries if publication_context else None),
+        frozen_work_order_ids=(
+            {item.work_order_id for item in publication_context.frozen_booking_identities}
+            if publication_context
+            else None
+        ),
+        allow_started_first=publication_context is None,
     )
     if not structural.valid:
         raise DecisionAnalysisError(
@@ -221,6 +285,7 @@ def canonical_decision_input_hash(
             "analysis_type": analysis_type,
             "scenario_snapshot_hash": plan.scenario_snapshot_hash,
             "canonical_schedule_hash": schedule_signature(plan.selected),
+            "publication_planning_context_hash": plan.publication_planning_context_hash,
             "travel_model_fingerprint": provider.fingerprint,
             "authoritative_request": authoritative_request,
             "analysis_context": context,
@@ -322,7 +387,7 @@ def cost_analysis(
 ) -> CostAnalysis:
     context = context or default_analysis_context()
     horizon = horizon or AnalysisHorizon()
-    scenario = _validate_analysis_input(plan, provider, context)
+    scenario = _validate_analysis_input(plan, provider, context, "COST")
     policy = policy or DecisionCostPolicy()
     signature = schedule_signature(plan.selected)
     build_sha = decision_build_sha()
@@ -334,6 +399,25 @@ def cost_analysis(
         provider,
     )
     breakdown = analyze_plan_cost(scenario, plan.selected, policy)
+    assumptions = [
+        "该记录是事前冻结计划分析，不含实际执行，也不代表当前剩余预测。",
+        (
+            "人工成本按完整付费班次计。"
+            if policy.labor_cost_mode is LaborCostMode.paid_shift
+            else "人工成本按计划占用分钟计，包括服务、行程和等待。"
+        ),
+        (
+            "付费班次模式将加班基础工资与加班溢价分开计算。"
+            if policy.labor_cost_mode is LaborCostMode.paid_shift
+            else "占用分钟模式的正常人工已含加班基础工资，只另计加班溢价。"
+        ),
+        "现金运营成本与 SLA/未服务经济损失分开列示；总经济影响不是财务结算。",
+        f"分析周期为 {horizon.days} 个工作日；每日计划假设在周期内重复。",
+    ]
+    if plan.selected.kind == "replan" and plan.publication_planning_context is None:
+        assumptions.append(
+            "LEGACY_REPLAN_CONTEXT_WARNING：旧重排版本缺少发布时路线起点；本成本分析只使用冻结排程工时。"
+        )
     return CostAnalysis(
         scenario_id=plan.scenario_id,
         plan_version_id=plan.id,
@@ -355,21 +439,7 @@ def cost_analysis(
         policy_fingerprint=content_hash(policy),
         breakdown=breakdown,
         horizon_total_economic_impact_cents=breakdown.total_economic_impact_cents * horizon.days,
-        assumptions=[
-            "该记录是事前冻结计划分析，不含实际执行，也不代表当前剩余预测。",
-            (
-                "人工成本按完整付费班次计。"
-                if policy.labor_cost_mode is LaborCostMode.paid_shift
-                else "人工成本按计划占用分钟计，包括服务、行程和等待。"
-            ),
-            (
-                "付费班次模式将加班基础工资与加班溢价分开计算。"
-                if policy.labor_cost_mode is LaborCostMode.paid_shift
-                else "占用分钟模式的正常人工已含加班基础工资，只另计加班溢价。"
-            ),
-            "现金运营成本与 SLA/未服务经济损失分开列示；总经济影响不是财务结算。",
-            f"分析周期为 {horizon.days} 个工作日；每日计划假设在周期内重复。",
-        ],
+        assumptions=assumptions,
     )
 
 
@@ -730,7 +800,8 @@ def verify_counterfactual_schedule(
     fixed_schedule: ScheduleResult | None = None,
     externally_covered_work_order_ids: set[str] | None = None,
     allow_started_first: bool = False,
-    allow_route_entry_context: bool = False,
+    route_entries: list[RouteEntryContext] | None = None,
+    frozen_work_order_ids: set[str] | None = None,
 ) -> CapacityVerificationReport:
     violations: list[CapacityViolation] = []
     technicians = {item.id: item for item in scenario.technicians}
@@ -738,6 +809,8 @@ def verify_counterfactual_schedule(
     assigned_ids = [item.work_order_id for item in schedule.assignments]
     unassigned_ids = [item.work_order_id for item in schedule.unassigned]
     external_ids = externally_covered_work_order_ids or set()
+    frozen_ids = frozen_work_order_ids or set()
+    entries = {item.technician_id: item for item in route_entries or []}
     for work_order_id in sorted(set(assigned_ids) & set(unassigned_ids)):
         violations.append(
             CapacityViolation(code="DUPLICATE_COVERAGE", message="工单同时已分配和未分配", work_order_id=work_order_id)
@@ -810,6 +883,7 @@ def verify_counterfactual_schedule(
             violations.append(
                 CapacityViolation(code="NON_CONTIGUOUS_SEQUENCE", message="路线序号不连续", technician_id=technician_id)
             )
+        entry = entries.get(technician_id)
         available_at = technician.shift_start
         location = technician.start_location
         for route_index, assignment in enumerate(ordered):
@@ -833,8 +907,16 @@ def verify_counterfactual_schedule(
                         technician_id=technician_id,
                     )
                 )
-            contextual_entry = route_index == 0 and (
-                allow_route_entry_context or (allow_started_first and order.status.value == "started")
+            if entry and assignment.work_order_id == entry.first_future_work_order_id:
+                available_at = entry.available_at
+                location = entry.location
+            frozen_prefix = bool(
+                entry
+                and assignment.work_order_id in frozen_ids
+                and assignment.work_order_id != entry.first_future_work_order_id
+            )
+            contextual_entry = frozen_prefix or (
+                route_index == 0 and allow_started_first and order.status.value == "started" and not entry
             )
             travel = provider.minutes(location, order.location, available_at)
             arrival = available_at + travel
@@ -886,10 +968,12 @@ def verify_counterfactual_schedule(
                         technician_id=technician_id,
                     )
                 )
-            available_at = assignment.finish_time
-            location = order.location
+            if not frozen_prefix:
+                available_at = assignment.finish_time
+                location = order.location
         if ordered:
-            return_minutes = provider.minutes(location, technician.start_location, available_at)
+            return_location = entry.return_location if entry else technician.start_location
+            return_minutes = provider.minutes(location, return_location, available_at)
             if available_at + return_minutes > technician.shift_end + technician.overtime_limit:
                 violations.append(
                     CapacityViolation(
@@ -964,7 +1048,12 @@ def capacity_analysis(
     context: DecisionAnalysisContext | None = None,
 ) -> CapacityAnalysis:
     context = context or default_analysis_context(request.analysis_scope or DecisionAnalysisScope.ex_ante_frozen_plan)
-    scenario = _validate_analysis_input(plan, provider, context)
+    scenario = _validate_analysis_input(plan, provider, context, "CAPACITY")
+    if plan.selected.kind == "replan" and request.reference_mode is CapacityReferenceMode.controlled_reoptimization:
+        raise DecisionAnalysisError(
+            "REPLAN_CONTROLLED_REOPTIMIZATION_NOT_SUPPORTED",
+            "重排方案缺少可证明等价的受控再优化模型；请选择已选方案增量模式",
+        )
     policy = request.cost_policy
     selected_options = tuple(request.option_ids) if request.option_ids else CAPACITY_OPTIONS
     selected_signature = schedule_signature(plan.selected)
@@ -1001,12 +1090,25 @@ def capacity_analysis(
             applicable=applicable,
         )
         outsourced = 0
+        external_assignments: list[ExternalAssignment] = []
         if option_id == "outsource_unserved":
             outsourced = len(base.unassigned)
             alternative_schedule = base.model_copy(deep=True)
             external_ids = {item.work_order_id for item in base.unassigned}
             alternative_schedule.unassigned = []
-            alternative_cost = analyze_plan_cost(scenario, base, policy, outsourced_orders=outsourced)
+            alternative_schedule.kpis = calculate_kpis(
+                scenario,
+                alternative_schedule.assignments,
+                alternative_schedule.unassigned,
+                provider=provider,
+            )
+            use_cost_policy = request.capacity_policy.outsource_cost_source is CapacityCostSource.cost_policy
+            alternative_cost = analyze_plan_cost(
+                scenario,
+                base,
+                policy,
+                outsourced_orders=outsourced if use_cost_policy else 0,
+            )
             daily_alternative_total = (
                 alternative_cost.total_economic_impact_cents - alternative_cost.unserved_revenue_cents
             )
@@ -1019,6 +1121,26 @@ def capacity_analysis(
             overtime_minutes = base.kpis.total_overtime_minutes
             signature = content_hash(
                 {"base": schedule_signature(base), "outsourced": sorted(item.work_order_id for item in base.unassigned)}
+            )
+            external_assignments = [
+                ExternalAssignment(
+                    work_order_id=work_order_id,
+                    cost_cents=(
+                        policy.outsourcing_cost_per_order_cents
+                        if use_cost_policy
+                        else fixed_cost
+                        if cadence is CostCadence.per_order
+                        else 0
+                    ),
+                )
+                for work_order_id in sorted(external_ids)
+            ]
+            changed_inputs.update(
+                {
+                    "outsourcing_cost_source": request.capacity_policy.outsource_cost_source.value,
+                    "external_service_assumption": "SAME_DAY_WITHIN_SLA",
+                    "external_assignment_count": len(external_assignments),
+                }
             )
         else:
             external_ids = set()
@@ -1034,6 +1156,43 @@ def capacity_analysis(
                         option_id=option_id,
                     )
             alternative_cost = analyze_plan_cost(alternative, alternative_schedule, policy)
+            if option_id == "add_technician" and request.capacity_policy.add_technician_cost_mode.value == "FIXED_ONLY":
+                affected_value = changed_inputs.get("affected_technician_ids", [])
+                affected_ids = affected_value if isinstance(affected_value, list) else []
+                candidate_id = next(
+                    (str(item) for item in affected_ids if str(item) not in {tech.id for tech in scenario.technicians}),
+                    None,
+                )
+                candidate = next((item for item in alternative.technicians if item.id == candidate_id), None)
+                candidate_kpi = next(
+                    (item for item in alternative_schedule.kpis.technician if item.technician_id == candidate_id),
+                    None,
+                )
+                if candidate and candidate_kpi:
+                    paid_shift = policy.labor_cost_mode is LaborCostMode.paid_shift
+                    regular_minutes = (
+                        candidate.shift_end - candidate.shift_start if paid_shift else candidate_kpi.occupied_minutes
+                    )
+                    regular = regular_minutes * candidate.cost_per_minute_cents
+                    overtime_base = (
+                        candidate_kpi.overtime_minutes * candidate.cost_per_minute_cents if paid_shift else 0
+                    )
+                    overtime_premium = (
+                        candidate_kpi.overtime_minutes
+                        * candidate.cost_per_minute_cents
+                        * policy.overtime_premium_basis_points
+                        // 10_000
+                    )
+                    labor_total = regular + overtime_base + overtime_premium
+                    alternative_cost.regular_labor_cost_cents -= regular
+                    alternative_cost.overtime_base_cost_cents -= overtime_base
+                    alternative_cost.overtime_premium_cost_cents -= overtime_premium
+                    alternative_cost.labor_cost_cents -= regular
+                    alternative_cost.overtime_cost_cents -= overtime_premium
+                    alternative_cost.cash_operating_cost_cents -= labor_total
+                    alternative_cost.total_economic_impact_cents -= labor_total
+                    alternative_cost.total_cost_cents -= labor_total
+                    alternative_cost.technician_cost_cents.pop(candidate.id, None)
             daily_alternative_total = alternative_cost.total_economic_impact_cents
             completion_rate = alternative_schedule.kpis.completion_rate
             sla_rate = alternative_schedule.kpis.committed_on_time_rate
@@ -1041,6 +1200,10 @@ def capacity_analysis(
             travel_minutes = alternative_schedule.kpis.total_travel_minutes
             overtime_minutes = alternative_schedule.kpis.total_overtime_minutes
             signature = schedule_signature(alternative_schedule)
+        if option_id == "add_technician":
+            changed_inputs["cost_mode"] = request.capacity_policy.add_technician_cost_mode.value
+            changed_inputs["wage_source"] = "DecisionCostPolicy + TechnicianArchetype.cost_per_minute_cents"
+            changed_inputs["fixed_cost_source"] = "CapacityPolicy.add_technician_fixed_cost_cents"
         alternative_schedule.id = f"CF-{plan.id}-{option_id}"
         alternative_schedule.created_at = plan.created_at
         alternative_schedule.runtime_ms = 0
@@ -1050,6 +1213,18 @@ def capacity_analysis(
             provider,
             fixed_schedule=base if request.reference_mode is CapacityReferenceMode.selected_plan_delta else None,
             externally_covered_work_order_ids=external_ids,
+            route_entries=(
+                plan.publication_planning_context.route_entries
+                if plan.publication_planning_context
+                and request.reference_mode is CapacityReferenceMode.selected_plan_delta
+                else None
+            ),
+            frozen_work_order_ids=(
+                {item.work_order_id for item in plan.publication_planning_context.frozen_booking_identities}
+                if plan.publication_planning_context
+                and request.reference_mode is CapacityReferenceMode.selected_plan_delta
+                else None
+            ),
         )
         violations = list(verification.violations)
         if not applicable:
@@ -1057,6 +1232,12 @@ def capacity_analysis(
         decision_valid = applicable and verification.valid
         daily_operating_delta = daily_alternative_total - base_cost.total_economic_impact_cents
         charged_fixed_cost = fixed_cost if applicable else 0
+        if option_id == "outsource_unserved" and (
+            request.capacity_policy.outsource_cost_source is CapacityCostSource.cost_policy
+        ):
+            charged_fixed_cost = 0
+        if option_id == "add_technician" and request.capacity_policy.add_technician_cost_mode.value == "WAGE_ONLY":
+            charged_fixed_cost = 0
         horizon_fixed_cost = _horizon_cost(
             charged_fixed_cost,
             cadence,
@@ -1102,6 +1283,39 @@ def capacity_analysis(
             "daily_operating_delta_cents": daily_operating_delta,
             "horizon_total_impact_cents": horizon_total_impact,
         }
+        assigned_by_id = {item.work_order_id: item for item in alternative_schedule.assignments}
+        unserved_ids = {item.work_order_id for item in alternative_schedule.unassigned}
+        dispositions: list[WorkOrderDisposition] = []
+        for order in sorted(active_orders, key=lambda item: item.id):
+            assignment = assigned_by_id.get(order.id)
+            if assignment:
+                dispositions.append(
+                    WorkOrderDisposition(
+                        work_order_id=order.id,
+                        disposition="INTERNAL",
+                        technician_id=assignment.technician_id,
+                    )
+                )
+            elif order.id in external_ids:
+                dispositions.append(
+                    WorkOrderDisposition(
+                        work_order_id=order.id,
+                        disposition="EXTERNAL",
+                        external_provider_id="EXTERNAL-PROVIDER",
+                    )
+                )
+            elif order.id in unserved_ids:
+                dispositions.append(WorkOrderDisposition(work_order_id=order.id, disposition="UNSERVED"))
+        counterfactual_kpis = CapacityCounterfactualKPI(
+            active_work_order_count=len(active_orders),
+            internal_assignment_count=len(assigned_by_id),
+            external_assignment_count=len(external_ids),
+            unserved_count=unassigned_count,
+            completion_rate=round(completion_rate, 4),
+            sla_on_time_rate=round(sla_rate, 4),
+            travel_minutes=travel_minutes,
+            overtime_minutes=overtime_minutes,
+        )
         options.append(
             CapacityOptionResult(
                 option_id=option_id,
@@ -1145,6 +1359,9 @@ def capacity_analysis(
                 diagnostic_schedule=alternative_schedule,
                 verification_report=verification,
                 route_diff=_capacity_route_diff(base, alternative_schedule, external_ids),
+                external_assignments=external_assignments,
+                work_order_dispositions=dispositions,
+                counterfactual_kpis=counterfactual_kpis,
             )
         )
     return CapacityAnalysis(
@@ -1199,6 +1416,66 @@ def _keyed_draw(seed: int, trial: int, event_type: str, *entity_ids: object, mod
     return int(digest[:16], 16) % modulo
 
 
+def build_simulation_scenario_set(
+    scenario: ScheduleScenario,
+    request: RiskSimulationRequest,
+    seed: int,
+) -> dict[str, object]:
+    technicians = {item.id: item for item in scenario.technicians}
+    orders = sorted(scenario.work_orders, key=lambda item: item.id)
+    technician_ids = sorted(technicians)
+    emergency_events: list[SimulationEmergencyEvent] = []
+    for trial in range(request.trials):
+        if not technician_ids or (
+            _keyed_draw(seed, trial, "emergency_event", modulo=10_000) >= request.emergency_order_basis_points
+        ):
+            continue
+        technician_id = technician_ids[_keyed_draw(seed, trial, "emergency_technician", modulo=len(technician_ids))]
+        technician = technicians[technician_id]
+        event_span = max(1, technician.shift_end - technician.shift_start)
+        event_time = technician.shift_start + _keyed_draw(
+            seed,
+            trial,
+            "emergency_time",
+            technician_id,
+            modulo=event_span,
+        )
+        if orders:
+            target_order = orders[_keyed_draw(seed, trial, "emergency_location", modulo=len(orders))]
+            location = target_order.location
+        else:
+            location = technician.start_location
+        technician_skills = sorted(technician.skills, key=lambda item: item.value)
+        required_skill = technician_skills[
+            _keyed_draw(seed, trial, "emergency_skill", technician_id, modulo=len(technician_skills))
+        ]
+        emergency_events.append(
+            SimulationEmergencyEvent(
+                trial=trial,
+                technician_id=technician_id,
+                event_time=event_time,
+                location=location,
+                duration_minutes=30 + _keyed_draw(seed, trial, "emergency_duration", technician_id, modulo=61),
+                required_skill=required_skill,
+            )
+        )
+    return {
+        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V2",
+        "keyed_random_version": "FIELD_SERVICE_KEYED_RANDOM_V1",
+        "scenario_snapshot_hash": content_hash(scenario),
+        "seed": seed,
+        "trials": request.trials,
+        "travel_delay_max_percent": request.travel_delay_max_percent,
+        "service_duration_jitter_percent": request.service_duration_jitter_percent,
+        "technician_absence_basis_points": request.technician_absence_basis_points,
+        "emergency_order_basis_points": request.emergency_order_basis_points,
+        "customer_no_show_basis_points": request.customer_no_show_basis_points,
+        "technician_ids": technician_ids,
+        "work_order_ids": [item.id for item in orders],
+        "emergency_events": [item.model_dump(mode="json") for item in emergency_events],
+    }
+
+
 def simulate_plan_risk(
     plan: PlanVersion,
     request: RiskSimulationRequest,
@@ -1207,17 +1484,32 @@ def simulate_plan_risk(
     context: DecisionAnalysisContext | None = None,
 ) -> RiskSimulationResult:
     context = context or default_analysis_context(request.analysis_scope or DecisionAnalysisScope.ex_ante_frozen_plan)
-    scenario = _validate_analysis_input(plan, provider, context)
+    scenario = _validate_analysis_input(plan, provider, context, "RISK")
     schedule = plan.selected
     seed = scenario.seed if request.seed is None else request.seed
     orders = {item.id: item for item in scenario.work_orders}
     technicians = {item.id: item for item in scenario.technicians}
+    scenario_set_manifest = build_simulation_scenario_set(scenario, request, seed)
+    event_payload = scenario_set_manifest["emergency_events"]
+    emergency_events_by_trial = (
+        {item.trial: item for item in (SimulationEmergencyEvent.model_validate(event) for event in event_payload)}
+        if isinstance(event_payload, list)
+        else {}
+    )
     routes: dict[str, list[ScheduleAssignment]] = defaultdict(list)
+    publication_context = plan.publication_planning_context
+    route_entries = (
+        {item.technician_id: item for item in publication_context.route_entries} if publication_context else {}
+    )
+    frozen_ids = (
+        {item.work_order_id for item in publication_context.frozen_booking_identities} if publication_context else set()
+    )
     for assignment in schedule.assignments:
-        routes[assignment.technician_id].append(assignment)
+        if assignment.work_order_id not in frozen_ids:
+            routes[assignment.technician_id].append(assignment)
     for route in routes.values():
         route.sort(key=lambda item: item.sequence)
-    active_count = len([item for item in scenario.work_orders if item.status.value != "completed"])
+    active_count = sum(len(route) for route in routes.values()) + len(schedule.unassigned)
     initially_unserved = len(schedule.unassigned)
     sla_rates: list[float] = []
     late_totals: list[int] = []
@@ -1238,7 +1530,7 @@ def simulate_plan_risk(
     def trial_outcome(
         trial: int,
         absent: set[str],
-        emergency_delay: dict[str, int],
+        emergency_events: dict[str, SimulationEmergencyEvent],
     ) -> dict[str, int | bool]:
         on_time = 0
         total_late = 0
@@ -1252,11 +1544,35 @@ def simulate_plan_risk(
             if technician_id in absent:
                 unserved += len(route)
                 continue
-            current = technician.shift_start + emergency_delay.get(technician_id, 0)
-            current_location = technician.start_location
-            predecessor_id = f"DEPOT:{technician_id}"
+            route_entry = route_entries.get(technician_id)
+            current = route_entry.available_at if route_entry else technician.shift_start
+            current_location = route_entry.location if route_entry else technician.start_location
+            predecessor_id = (
+                f"ENTRY:{technician_id}:{route_entry.location.x}:{route_entry.location.y}"
+                if route_entry
+                else f"DEPOT:{technician_id}"
+            )
+            emergency = emergency_events.get(technician_id)
+            emergency_consumed = False
+
+            def apply_emergency(
+                event: SimulationEmergencyEvent | None = emergency,
+                event_technician_id: str = technician_id,
+            ) -> None:
+                nonlocal current, current_location, emergency_consumed, predecessor_id
+                assert event is not None
+                depart_at = max(current, event.event_time)
+                current = (
+                    depart_at + provider.minutes(current_location, event.location, depart_at) + event.duration_minutes
+                )
+                current_location = event.location
+                predecessor_id = f"EMERGENCY:{trial}:{event_technician_id}"
+                emergency_consumed = True
+
             for assignment in route:
                 order = orders[assignment.work_order_id]
+                if emergency and not emergency_consumed and emergency.event_time <= max(current, assignment.start_time):
+                    apply_emergency()
                 delay_percent = _keyed_draw(
                     seed,
                     trial,
@@ -1302,7 +1618,10 @@ def simulate_plan_risk(
                 current_location = order.location
                 predecessor_id = order.id
             if route:
-                return_minutes = provider.minutes(current_location, technician.start_location, current)
+                if emergency and not emergency_consumed:
+                    apply_emergency()
+                return_location = route_entry.return_location if route_entry else technician.start_location
+                return_minutes = provider.minutes(current_location, return_location, current)
                 delay_percent = _keyed_draw(
                     seed,
                     trial,
@@ -1329,26 +1648,15 @@ def simulate_plan_risk(
     for trial in range(request.trials):
         absent = {
             technician_id
-            for technician_id in routes
+            for technician_id in technicians
             if _keyed_draw(seed, trial, "absence", technician_id, modulo=10_000)
             < request.technician_absence_basis_points
         }
-        emergency_delay: dict[str, int] = {}
-        emergency_event = bool(
-            routes and _keyed_draw(seed, trial, "emergency_event", modulo=10_000) < request.emergency_order_basis_points
-        )
-        if emergency_event:
-            route_ids = sorted(routes)
-            technician_id = route_ids[_keyed_draw(seed, trial, "emergency_technician", modulo=len(route_ids))]
-            emergency_delay[technician_id] = 30 + _keyed_draw(
-                seed,
-                trial,
-                "emergency_duration",
-                technician_id,
-                modulo=61,
-            )
+        emergency = emergency_events_by_trial.get(trial)
+        emergency_event = emergency is not None
+        trial_emergency = {emergency.technician_id: emergency} if emergency else {}
         baseline_outcome = trial_outcome(trial, absent, {})
-        outcome = trial_outcome(trial, absent, emergency_delay)
+        outcome = trial_outcome(trial, absent, trial_emergency)
         absence_failure = bool(absent)
         no_show_failure = bool(outcome["no_show_failure"])
         window_failure = bool(outcome["window_failure"])
@@ -1398,21 +1706,7 @@ def simulate_plan_risk(
     late_p50 = _percentile(late_totals, 0.5)
     late_p90 = _percentile(late_totals, 0.9)
     late_p95 = _percentile(late_totals, 0.95)
-    scenario_set_hash = content_hash(
-        {
-            "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V1",
-            "scenario_snapshot_hash": plan.scenario_snapshot_hash,
-            "seed": seed,
-            "trials": request.trials,
-            "travel_delay_max_percent": request.travel_delay_max_percent,
-            "service_duration_jitter_percent": request.service_duration_jitter_percent,
-            "technician_absence_basis_points": request.technician_absence_basis_points,
-            "emergency_order_basis_points": request.emergency_order_basis_points,
-            "customer_no_show_basis_points": request.customer_no_show_basis_points,
-            "technician_ids": sorted(technicians),
-            "work_order_ids": sorted(orders),
-        }
-    )
+    scenario_set_hash = content_hash(scenario_set_manifest)
     emergency_event_probability = round(emergency_event_trials / request.trials, 4)
     emergency_caused_probability = round(emergency_caused_failure_trials / request.trials, 4)
     return RiskSimulationResult(

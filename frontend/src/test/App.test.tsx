@@ -102,8 +102,8 @@ describe('FieldFlow navigation and render safety', () => {
   it('edits next-day service times without wrapping them to the current day', () => {
     const order = { ...scenario.work_orders[0], window_end: 1500, sla_deadline: 1530 }
     render(<WorkOrderEditor initial={order} onClose={() => undefined} onSave={async () => undefined} />)
-    expect(screen.getByRole('combobox', { name: '时间窗结束日期' })).toHaveValue('1')
-    expect(screen.getByLabelText('时间窗结束', { selector: 'input' })).toHaveValue('01:00')
+    expect(screen.getByRole('combobox', { name: '最晚开始时间日期' })).toHaveValue('1')
+    expect(screen.getByLabelText('最晚开始时间', { selector: 'input' })).toHaveValue('01:00')
     expect(screen.getByLabelText('SLA 截止', { selector: 'input' })).toHaveValue('01:30')
   })
 

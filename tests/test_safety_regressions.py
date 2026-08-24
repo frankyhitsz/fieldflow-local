@@ -1399,7 +1399,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -2362,6 +2362,74 @@ def test_replan_persists_explicit_frozen_context_and_only_warns_on_planned_depar
         assert started["work_order_id"] not in context["inferred_departure_warnings"]
         candidate = client.get(f"/api/scenarios/main/schedule-candidates/{run['candidate_id']}").json()
         assert candidate["planning_context_hash"] == run["planning_context_hash"]
+        plan = client.get("/api/scenarios/main/plan-versions").json()[-1]
+        publication_context = plan["publication_planning_context"]
+        assert plan["publication_planning_context_hash"] == publication_context["context_fingerprint"]
+        assert plan["publication_manifest_hash"]
+        assert len(publication_context["route_entries"]) == len(client.get("/api/scenarios/main").json()["technicians"])
+        entry = next(
+            item for item in publication_context["route_entries"] if item["technician_id"] == started["technician_id"]
+        )
+        projection = next(
+            item
+            for item in context["execution_source_context"]["technician_projections"]
+            if item["technician_id"] == started["technician_id"]
+        )
+        assert entry["location"] == projection["effective_location"]
+        assert entry["available_at"] == projection["available_at"]
+        risk = client.post(
+            f"/api/scenarios/main/plan-versions/{plan['id']}/analysis-runs",
+            json={
+                "analysis_type": "RISK",
+                "analysis_scope": "EX_ANTE_FROZEN_PLAN",
+                "request": {"seed": 7, "trials": 50},
+            },
+        )
+        assert risk.status_code == 201, risk.text
+        assert risk.json()["status"] == "COMPLETED", risk.text
+        assert risk.json()["integrity_status"] == "VERIFIED"
+        artifacts = client.get(f"/api/scenarios/main/analysis-runs/{risk.json()['id']}/artifacts").json()
+        assert artifacts[0]["artifact_type"] == "SIMULATION_SCENARIO_SET"
+        assert artifacts[0]["scenario_set_hash"] == risk.json()["result"]["simulation_scenario_set_hash"]
+        if artifacts[0]["emergency_events"]:
+            assert {"event_time", "location", "duration_minutes", "required_skill"} <= set(
+                artifacts[0]["emergency_events"][0]
+            )
+        frozen_context_hash = plan["publication_planning_context_hash"]
+        current_revision = client.get("/api/scenarios/main").json()["revision"]
+        completed = client.post(
+            f"/api/scenarios/main/work-orders/{started['work_order_id']}/complete",
+            json={
+                "technician_id": started["technician_id"],
+                "occurred_at": 720,
+                "expected_revision": current_revision,
+                "idempotency_key": "context-complete-after-publication-001",
+            },
+        )
+        assert completed.status_code == 200, completed.text
+        historical = client.get(f"/api/scenarios/main/plan-versions/{plan['id']}").json()
+        assert historical["publication_planning_context_hash"] == frozen_context_hash
+        replayed_risk = client.post(
+            f"/api/scenarios/main/plan-versions/{plan['id']}/analysis-runs",
+            json={
+                "analysis_type": "RISK",
+                "analysis_scope": "EX_ANTE_FROZEN_PLAN",
+                "request": {"seed": 7, "trials": 50},
+            },
+        )
+        assert replayed_risk.status_code == 200
+        assert replayed_risk.json()["id"] == risk.json()["id"]
+        controlled = client.post(
+            f"/api/scenarios/main/plan-versions/{plan['id']}/analysis-runs",
+            json={
+                "analysis_type": "CAPACITY",
+                "analysis_scope": "EX_ANTE_FROZEN_PLAN",
+                "request": {"reference_mode": "CONTROLLED_REOPTIMIZATION"},
+            },
+        )
+        assert controlled.status_code == 201
+        assert controlled.json()["status"] == "FAILED"
+        assert controlled.json()["error"]["code"] == "REPLAN_CONTROLLED_REOPTIMIZATION_NOT_SUPPORTED"
 
 
 def test_failed_compound_emergency_replan_keeps_demand_and_last_plan(monkeypatch, tmp_path):

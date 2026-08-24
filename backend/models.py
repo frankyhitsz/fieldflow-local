@@ -117,6 +117,23 @@ class RiskExecutionPolicy(str, Enum):
     earliest_feasible_execution = "EARLIEST_FEASIBLE_EXECUTION"
 
 
+class AnalysisIntegrityStatus(str, Enum):
+    verified = "VERIFIED"
+    failed = "FAILED"
+    legacy_unattested = "LEGACY_UNATTESTED"
+
+
+class CapacityCostSource(str, Enum):
+    cost_policy = "COST_POLICY"
+    capacity_policy = "CAPACITY_POLICY"
+
+
+class AdditionalTechnicianCostMode(str, Enum):
+    wage_only = "WAGE_ONLY"
+    fixed_only = "FIXED_ONLY"
+    wage_plus_fixed = "WAGE_PLUS_FIXED"
+
+
 class FreezeReason(str, Enum):
     started = "STARTED"
     completed = "COMPLETED"
@@ -580,6 +597,44 @@ class ScheduleArtifact(BaseModel):
     schedule: ScheduleResult
 
 
+class RouteEntryContext(BaseModel):
+    technician_id: Identifier
+    location: Point
+    available_at: int = Field(ge=0, le=2760)
+    return_location: Point
+    first_future_work_order_id: Identifier | None = None
+    source_work_order_id: Identifier | None = None
+    source_execution_event_sequence: int | None = Field(default=None, ge=1)
+
+
+class FrozenBookingIdentity(BaseModel):
+    work_order_id: Identifier
+    technician_id: Identifier
+    source_sequence: int | None = Field(default=None, ge=1)
+    source_assignment_hash: str | None = None
+
+
+class PublicationPlanningContext(BaseModel):
+    policy_version: str = "FIELD_SERVICE_PUBLICATION_CONTEXT_V1"
+    scenario_revision: int = Field(ge=0)
+    planning_time: int = Field(ge=0, le=1800)
+    execution_event_sequence: int = Field(ge=0)
+    source_plan_version_id: str | None = None
+    source_plan_snapshot_hash: str | None = None
+    route_entries: list[RouteEntryContext] = Field(default_factory=list)
+    frozen_booking_identities: list[FrozenBookingIdentity] = Field(default_factory=list)
+    context_fingerprint: str
+
+
+class PublicationVerificationArtifact(BaseModel):
+    policy_version: str = "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2"
+    candidate_snapshot: dict[str, Any]
+    planning_context_snapshot: dict[str, Any] | None = None
+    transaction_verification_report: dict[str, Any]
+    verified_schedule_hash: str
+    artifact_hash: str
+
+
 class PlanVersion(BaseModel):
     id: str
     scenario_id: str
@@ -609,6 +664,10 @@ class PlanVersion(BaseModel):
     published_schedule_hash: str = ""
     publication_verification_policy_version: str = ""
     publication_verification_report_hash: str = ""
+    publication_verification_artifact: PublicationVerificationArtifact | None = None
+    publication_planning_context: PublicationPlanningContext | None = None
+    publication_planning_context_hash: str | None = None
+    publication_manifest_hash: str = ""
     source_plan_snapshot_hash: str | None = None
     coverage_status: PlanCoverageStatus = PlanCoverageStatus.current_and_complete
 
@@ -788,7 +847,8 @@ class AnalysisHorizon(BaseModel):
 
 
 class CapacityPolicy(BaseModel):
-    policy_version: str = "FIELD_SERVICE_CAPACITY_V3"
+    policy_version: str = "FIELD_SERVICE_CAPACITY_V4"
+    add_technician_cost_mode: AdditionalTechnicianCostMode = AdditionalTechnicianCostMode.wage_plus_fixed
     add_technician_fixed_cost_cents: int = Field(default=60_000, ge=0)
     add_technician_cost_cadence: CostCadence = CostCadence.per_day
     add_skill_fixed_cost_cents: int = Field(default=15_000, ge=0)
@@ -799,8 +859,19 @@ class CapacityPolicy(BaseModel):
     allow_overtime_cost_cadence: CostCadence = CostCadence.per_day
     outsource_unserved_fixed_cost_cents: int = Field(default=0, ge=0)
     outsource_unserved_cost_cadence: CostCadence = CostCadence.per_order
+    outsource_cost_source: CapacityCostSource = CapacityCostSource.cost_policy
     relocate_one_technician_start_fixed_cost_cents: int = Field(default=40_000, ge=0)
     relocate_one_technician_start_cost_cadence: CostCadence = CostCadence.one_time
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_explicit_outsource_cost_source(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "outsource_cost_source" in value:
+            return value
+        migrated = dict(value)
+        if int(migrated.get("outsource_unserved_fixed_cost_cents", 0) or 0) > 0:
+            migrated["outsource_cost_source"] = CapacityCostSource.capacity_policy.value
+        return migrated
 
 
 class TechnicianArchetype(BaseModel):
@@ -968,6 +1039,32 @@ class CapacityViolation(BaseModel):
     technician_id: str | None = None
 
 
+class ExternalAssignment(BaseModel):
+    work_order_id: Identifier
+    provider_id: Identifier = "EXTERNAL-PROVIDER"
+    service_assumption: Literal["SAME_DAY_WITHIN_SLA"] = "SAME_DAY_WITHIN_SLA"
+    assumed_on_time: bool = True
+    cost_cents: int = Field(default=0, ge=0)
+
+
+class WorkOrderDisposition(BaseModel):
+    work_order_id: Identifier
+    disposition: Literal["INTERNAL", "EXTERNAL", "UNSERVED"]
+    technician_id: Identifier | None = None
+    external_provider_id: Identifier | None = None
+
+
+class CapacityCounterfactualKPI(BaseModel):
+    active_work_order_count: int = Field(ge=0)
+    internal_assignment_count: int = Field(ge=0)
+    external_assignment_count: int = Field(ge=0)
+    unserved_count: int = Field(ge=0)
+    completion_rate: float = Field(ge=0, le=1)
+    sla_on_time_rate: float = Field(ge=0, le=1)
+    travel_minutes: int = Field(ge=0)
+    overtime_minutes: int = Field(ge=0)
+
+
 class CapacityVerificationReport(BaseModel):
     valid: bool
     violations: list[CapacityViolation] = Field(default_factory=list)
@@ -1016,6 +1113,10 @@ class CapacityOptionResult(BaseModel):
     verification_report: CapacityVerificationReport | None = None
     route_diff: list[dict[str, Any]] = Field(default_factory=list)
     artifact_id: str | None = None
+    artifact_hash: str | None = None
+    external_assignments: list[ExternalAssignment] = Field(default_factory=list)
+    work_order_dispositions: list[WorkOrderDisposition] = Field(default_factory=list)
+    counterfactual_kpis: CapacityCounterfactualKPI | None = None
 
 
 class CapacityAnalysis(BaseModel):
@@ -1121,6 +1222,7 @@ class RiskSimulationResult(BaseModel):
     plan_failure_probability: float = Field(ge=0, le=1)
     expected_unserved_orders: float = Field(ge=0)
     assumptions: list[str] = Field(default_factory=list)
+    scenario_set_artifact_id: str | None = None
 
 
 class CostAnalysisParameters(BaseModel):
@@ -1195,8 +1297,13 @@ class DecisionAnalysisRun(BaseModel):
     logical_analysis_id: str = ""
     retry_of_analysis_id: str | None = None
     attempt_number: int = Field(default=1, ge=1)
+    supersedes_analysis_id: str | None = None
     status: Literal["RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"] = "RUNNING"
     result: CostAnalysis | CapacityAnalysis | RiskSimulationResult | None = None
+    result_hash: str | None = None
+    artifact_manifest: list[dict[str, str]] = Field(default_factory=list)
+    analysis_manifest_hash: str | None = None
+    integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     error: dict[str, Any] | None = None
     created_at: str
     finished_at: str | None = None
@@ -1216,6 +1323,7 @@ class DecisionAnalysisRun(BaseModel):
 
 
 class CapacityCounterfactualArtifact(BaseModel):
+    artifact_type: Literal["CAPACITY_COUNTERFACTUAL"] = "CAPACITY_COUNTERFACTUAL"
     id: str
     scenario_id: str
     analysis_run_id: str
@@ -1224,7 +1332,44 @@ class CapacityCounterfactualArtifact(BaseModel):
     verification_report: CapacityVerificationReport
     route_diff: list[dict[str, Any]] = Field(default_factory=list)
     changed_inputs: dict[str, Any] = Field(default_factory=dict)
+    external_assignments: list[ExternalAssignment] = Field(default_factory=list)
+    work_order_dispositions: list[WorkOrderDisposition] = Field(default_factory=list)
+    counterfactual_kpis: CapacityCounterfactualKPI | None = None
+    artifact_hash: str = ""
+    integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     created_at: str
+
+
+class SimulationEmergencyEvent(BaseModel):
+    trial: int = Field(ge=0)
+    technician_id: Identifier
+    event_time: int = Field(ge=0, le=2280)
+    location: Point
+    duration_minutes: int = Field(ge=1, le=480)
+    required_skill: Skill
+
+
+class SimulationScenarioSetArtifact(BaseModel):
+    artifact_type: Literal["SIMULATION_SCENARIO_SET"] = "SIMULATION_SCENARIO_SET"
+    id: str
+    scenario_id: str
+    analysis_run_id: str
+    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V2"
+    keyed_random_version: str = "FIELD_SERVICE_KEYED_RANDOM_V1"
+    scenario_snapshot_hash: str
+    seed: int
+    trials: int
+    technician_ids: list[Identifier]
+    work_order_ids: list[Identifier]
+    exogenous_parameters: dict[str, int]
+    emergency_events: list[SimulationEmergencyEvent] = Field(default_factory=list)
+    scenario_set_hash: str
+    artifact_hash: str = ""
+    integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    created_at: str
+
+
+DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSetArtifact
 
 
 class VerificationIssue(BaseModel):

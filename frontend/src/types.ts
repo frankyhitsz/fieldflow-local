@@ -95,6 +95,7 @@ export type PlanVersion = {
   artifacts: { id: string; role: 'baseline' | 'selected' | 'candidate'; strategy: string; schedule: Schedule }[]
   candidate_id: string | null; scenario_snapshot_hash: string; published_schedule_hash: string
   publication_verification_policy_version: string; publication_verification_report_hash: string
+  publication_planning_context_hash?: string | null; publication_manifest_hash?: string
   source_plan_snapshot_hash: string | null
 }
 
@@ -178,7 +179,7 @@ export type CapacityOption = {
   cash_payback_days: number | null; break_even_days: number | null
   schedule_signature: string; diagnostic_metrics: Record<string, number>
   diagnostic_schedule: Schedule | null; verification_report: { valid: boolean; violations: CapacityViolation[] } | null
-  route_diff: Record<string, unknown>[]; artifact_id: string | null
+  route_diff: Record<string, unknown>[]; artifact_id: string | null; artifact_hash: string | null
 }
 
 export type CapacityAnalysis = AnalysisContextFields & {
@@ -213,6 +214,7 @@ export type RiskSimulation = AnalysisContextFields & {
   baseline_unserved_orders: number; expected_total_unserved_orders: number
   plan_failure_probability: number; expected_unserved_orders: number
   assumptions: string[]
+  scenario_set_artifact_id: string | null
 }
 
 export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimulation> = {
@@ -225,12 +227,30 @@ export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimula
   algorithm_version: string; build_sha: string; input_hash: string
   request_snapshot: Record<string, unknown>; logical_analysis_id: string
   retry_of_analysis_id: string | null; attempt_number: number
+  supersedes_analysis_id: string | null
   status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; result: T | null
+  result_hash: string | null; artifact_manifest: { artifact_id: string; artifact_type: string; artifact_hash: string }[]
+  analysis_manifest_hash: string | null; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'
   error: Record<string, unknown> | null; created_at: string; finished_at: string | null
 }
 
 export type CapacityCounterfactualArtifact = {
+  artifact_type: 'CAPACITY_COUNTERFACTUAL'
   id: string; scenario_id: string; analysis_run_id: string; option_id: CapacityOption['option_id']
   schedule: Schedule; verification_report: { valid: boolean; violations: CapacityViolation[] }
-  route_diff: Record<string, unknown>[]; changed_inputs: Record<string, unknown>; created_at: string
+  route_diff: Record<string, unknown>[]; changed_inputs: Record<string, unknown>
+  external_assignments: { work_order_id: string; provider_id: string; service_assumption: string; assumed_on_time: boolean; cost_cents: number }[]
+  work_order_dispositions: { work_order_id: string; disposition: 'INTERNAL' | 'EXTERNAL' | 'UNSERVED'; technician_id: string | null; external_provider_id: string | null }[]
+  counterfactual_kpis: { active_work_order_count: number; internal_assignment_count: number; external_assignment_count: number; unserved_count: number; completion_rate: number; sla_on_time_rate: number; travel_minutes: number; overtime_minutes: number } | null
+  artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; created_at: string
 }
+
+export type SimulationScenarioSetArtifact = {
+  artifact_type: 'SIMULATION_SCENARIO_SET'; id: string; scenario_id: string; analysis_run_id: string
+  policy_version: string; keyed_random_version: string; scenario_snapshot_hash: string; seed: number; trials: number
+  technician_ids: string[]; work_order_ids: string[]; exogenous_parameters: Record<string, number>
+  emergency_events: { trial: number; technician_id: string; event_time: number; location: Point; duration_minutes: number; required_skill: string }[]
+  scenario_set_hash: string; artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; created_at: string
+}
+
+export type DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSetArtifact

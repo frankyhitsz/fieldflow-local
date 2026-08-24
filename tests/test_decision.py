@@ -1,6 +1,7 @@
 import importlib
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
 import pytest
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 from backend.decision import (
     DecisionAnalysisError,
     analyze_plan_cost,
+    build_simulation_scenario_set,
     canonical_decision_input_hash,
     capacity_analysis,
     cost_analysis,
@@ -65,6 +67,7 @@ def _plan(fixture_id: str = "main") -> PlanVersion:
 
 def test_cost_model_uses_integer_cents_and_reconciles_total():
     plan = _plan()
+    assert plan.scenario_snapshot is not None
     scenario = plan.scenario_snapshot
     assert scenario is not None
     breakdown = analyze_plan_cost(scenario, plan.selected)
@@ -392,6 +395,17 @@ def test_analysis_scope_is_part_of_canonical_input_hash():
     assert ex_ante != remaining
 
 
+def test_publication_context_hash_is_part_of_analysis_input():
+    plan = _plan()
+    provider = EuclideanTravelTimeProvider()
+    context = DecisionAnalysisContext(analysis_scope=DecisionAnalysisScope.ex_ante_frozen_plan)
+    plan.publication_planning_context_hash = "context-one"
+    first = canonical_decision_input_hash(plan, "RISK", {"seed": 5}, context, provider)
+    plan.publication_planning_context_hash = "context-two"
+    second = canonical_decision_input_hash(plan, "RISK", {"seed": 5}, context, provider)
+    assert first != second
+
+
 def test_cost_horizon_and_capacity_cost_cadence_are_not_mixed():
     plan = _plan()
     daily = cost_analysis(plan, horizon=AnalysisHorizon(days=1))
@@ -452,6 +466,44 @@ def test_new_technician_uses_conservative_or_explicit_archetype():
     assert set(explicit.changed_inputs["candidate_technician"]["skills"]) == {Skill.hvac}
 
 
+def test_additional_technician_cost_mode_selects_wage_and_fixed_sources_once():
+    plan = _plan()
+    wage_only = capacity_analysis(
+        plan,
+        CapacityAnalysisRequest.model_validate(
+            {
+                "option_ids": ["add_technician"],
+                "capacity_policy": {"add_technician_cost_mode": "WAGE_ONLY"},
+            }
+        ),
+    ).options[0]
+    combined = capacity_analysis(
+        plan,
+        CapacityAnalysisRequest.model_validate(
+            {
+                "option_ids": ["add_technician"],
+                "capacity_policy": {"add_technician_cost_mode": "WAGE_PLUS_FIXED"},
+            }
+        ),
+    ).options[0]
+    fixed_only = capacity_analysis(
+        plan,
+        CapacityAnalysisRequest.model_validate(
+            {
+                "option_ids": ["add_technician"],
+                "capacity_policy": {"add_technician_cost_mode": "FIXED_ONLY"},
+            }
+        ),
+    ).options[0]
+    assert wage_only.fixed_capacity_cost_cents == 0
+    assert combined.fixed_capacity_cost_cents == 60_000
+    assert fixed_only.fixed_capacity_cost_cents == 60_000
+    assert combined.changed_inputs["cost_mode"] == "WAGE_PLUS_FIXED"
+    assert fixed_only.daily_operating_delta_cents is not None
+    assert combined.daily_operating_delta_cents is not None
+    assert fixed_only.daily_operating_delta_cents <= combined.daily_operating_delta_cents
+
+
 def test_outsource_capacity_option_includes_configured_fixed_cost():
     plan = _plan()
     base = capacity_analysis(
@@ -469,8 +521,12 @@ def test_outsource_capacity_option_includes_configured_fixed_cost():
     ).options[0]
     assert with_fixed_cost.fixed_capacity_cost_cents == 4_321
     outsourced = len(plan.selected.unassigned)
-    assert with_fixed_cost.projected_total_cost_cents == base.projected_total_cost_cents + 4_321 * outsourced
-    assert with_fixed_cost.marginal_cost_cents == base.marginal_cost_cents + 4_321 * outsourced
+    assert with_fixed_cost.changed_inputs["outsourcing_cost_source"] == "CAPACITY_POLICY"
+    assert with_fixed_cost.projected_total_cost_cents == (
+        base.projected_total_cost_cents
+        - DecisionCostPolicy().outsourcing_cost_per_order_cents * outsourced
+        + 4_321 * outsourced
+    )
 
 
 def test_risk_simulation_is_seeded_and_percentiles_are_monotonic():
@@ -520,6 +576,11 @@ def test_emergency_event_without_business_harm_is_not_a_disruption():
                 technician.shift_start,
             )
             first.arrival_time = technician.shift_start + first.travel_minutes
+    for order in plan.scenario_snapshot.work_orders:
+        order.window_end = 1800
+        order.sla_deadline = 2280
+    for assignment in plan.selected.assignments:
+        assignment.sla_late_minutes = 0
     plan.scenario_snapshot_hash = content_hash(plan.scenario_snapshot)
     plan.selected.scenario_snapshot_hash = plan.scenario_snapshot_hash
     plan.selected.kpis = calculate_kpis(
@@ -555,6 +616,53 @@ def test_two_plans_share_keyed_risk_scenario_set_for_paired_comparison():
     second_result = simulate_plan_risk(second, request)
     assert first_result.simulation_scenario_set_hash == second_result.simulation_scenario_set_hash
     assert first_result.simulation_input_hash != second_result.simulation_input_hash
+
+
+def test_emergency_target_draw_uses_snapshot_technicians_not_plan_routes(monkeypatch):
+    import backend.decision as decision_module
+
+    plan = _plan()
+    assert plan.scenario_snapshot is not None
+    original = decision_module._keyed_draw
+    emergency_moduli: list[int] = []
+
+    def tracked(seed, trial, event_type, *entity_ids, modulo):
+        if event_type == "emergency_technician":
+            emergency_moduli.append(modulo)
+        return original(seed, trial, event_type, *entity_ids, modulo=modulo)
+
+    monkeypatch.setattr(decision_module, "_keyed_draw", tracked)
+    simulate_plan_risk(
+        plan,
+        RiskSimulationRequest(
+            seed=23,
+            trials=50,
+            emergency_order_basis_points=10_000,
+        ),
+    )
+    assert emergency_moduli
+    assert set(emergency_moduli) == {len(plan.scenario_snapshot.technicians)}
+    manifest = build_simulation_scenario_set(
+        plan.scenario_snapshot,
+        RiskSimulationRequest(seed=23, trials=50, emergency_order_basis_points=10_000),
+        23,
+    )
+    changed = json.loads(json.dumps(manifest))
+    changed["emergency_events"][0]["duration_minutes"] += 1
+    assert content_hash(manifest) != content_hash(changed)
+
+
+def test_legacy_replan_without_publication_context_rejects_route_sensitive_analysis():
+    plan = _plan()
+    plan.selected.kind = "replan"
+    cost = cost_analysis(plan)
+    assert "LEGACY_REPLAN_CONTEXT_WARNING" in "".join(cost.assumptions)
+    with pytest.raises(DecisionAnalysisError, match="路线起点") as risk_error:
+        simulate_plan_risk(plan, RiskSimulationRequest(seed=3, trials=50))
+    assert risk_error.value.code == "REPLAN_ANALYSIS_CONTEXT_NOT_AVAILABLE"
+    with pytest.raises(DecisionAnalysisError) as capacity_error:
+        capacity_analysis(plan, CapacityAnalysisRequest(option_ids=["extend_shift"]))
+    assert capacity_error.value.code == "REPLAN_ANALYSIS_CONTEXT_NOT_AVAILABLE"
 
 
 def test_capacity_per_shift_cost_multiplies_affected_technicians_and_days():
@@ -734,6 +842,10 @@ def test_decision_endpoints_use_frozen_plan_without_consuming_versions(monkeypat
         assert len(capacity.json()["options"]) == 6
         assert risk.json()["seed"] == 7
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
+        assert [
+            item["number"]
+            for item in client.get(f"/api/scenarios/main/plan-versions/{version_id}/analysis-runs").json()
+        ] == [1, 2, 3]
 
 
 def test_published_plan_integrity_is_attested_and_checked_by_analysis_report_and_activation(monkeypatch, tmp_path):
@@ -746,8 +858,10 @@ def test_published_plan_integrity_is_attested_and_checked_by_analysis_report_and
         client.post("/api/scenarios/main/baseline")
         plan = client.get("/api/scenarios/main/plan-versions").json()[0]
         assert plan["published_schedule_hash"]
-        assert plan["publication_verification_policy_version"] == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V1"
+        assert plan["publication_verification_policy_version"] == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2"
         assert plan["publication_verification_report_hash"]
+        assert plan["publication_verification_artifact"]["artifact_hash"]
+        assert plan["publication_manifest_hash"]
         with closing(sqlite3.connect(database)) as connection, connection:
             payload = json.loads(
                 connection.execute("SELECT payload FROM plan_versions WHERE id=?", (plan["id"],)).fetchone()[0]
@@ -849,8 +963,13 @@ def test_failed_decision_analysis_is_persisted_and_deduplicated(monkeypatch, tmp
         assert [item["number"] for item in client.get(endpoint).json()] == [1]
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
         assert client.get("/api/scenarios/main").json()["revision"] == 0
+        assert client.post(f"/api/scenarios/main/analysis-runs/{first.json()['id']}/retry").status_code == 422
 
-        retry = client.post(f"/api/scenarios/main/analysis-runs/{first.json()['id']}/retry")
+        retry_headers = {"Idempotency-Key": "decision-exact-retry-second-001"}
+        retry = client.post(
+            f"/api/scenarios/main/analysis-runs/{first.json()['id']}/retry",
+            headers=retry_headers,
+        )
         assert retry.status_code == 201
         retry_body = retry.json()
         assert retry_body["id"] != first.json()["id"]
@@ -858,6 +977,29 @@ def test_failed_decision_analysis_is_persisted_and_deduplicated(monkeypatch, tmp
         assert retry_body["logical_analysis_id"] == first.json()["logical_analysis_id"]
         assert retry_body["attempt_number"] == 2
         assert retry_body["status"] == "FAILED"
+        retry_replay = client.post(
+            f"/api/scenarios/main/analysis-runs/{first.json()['id']}/retry",
+            headers=retry_headers,
+        )
+        assert retry_replay.status_code == 200
+        assert retry_replay.json()["id"] == retry_body["id"]
+        third = client.post(
+            f"/api/scenarios/main/analysis-runs/{first.json()['id']}/retry",
+            headers={"Idempotency-Key": "decision-exact-retry-third-001"},
+        )
+        assert third.status_code == 201
+        assert third.json()["attempt_number"] == 3
+        assert third.json()["logical_analysis_id"] == first.json()["logical_analysis_id"]
+        rerun = client.post(f"/api/scenarios/main/analysis-runs/{first.json()['id']}/rerun-current")
+        assert rerun.status_code == 201
+        assert rerun.json()["supersedes_analysis_id"] == first.json()["id"]
+        assert rerun.json()["logical_analysis_id"] == rerun.json()["id"]
+        with closing(sqlite3.connect(database)) as connection:
+            attempts = connection.execute(
+                "SELECT attempt_number FROM decision_analysis_attempts WHERE logical_analysis_id=? ORDER BY attempt_number",
+                (first.json()["logical_analysis_id"],),
+            ).fetchall()
+        assert [item[0] for item in attempts] == [1, 2, 3]
         assert client.get(endpoint).json()[0]["status"] == "FAILED"
 
 
@@ -885,6 +1027,73 @@ def test_analysis_run_request_is_discriminated_and_rejects_silent_overrides(monk
         )
         assert valid.status_code == 201
         assert valid.json()["result"]["analysis_horizon"]["days"] == 2
+
+
+def test_exact_retry_rejects_runtime_drift_and_points_to_current_rerun(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "decision-retry-drift.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    original_cost_analysis = main_module.cost_analysis
+
+    def fail_cost(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        monkeypatch.setattr(main_module, "cost_analysis", fail_cost)
+        failed = client.post(
+            f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs",
+            json={"analysis_type": "COST"},
+        )
+        assert failed.status_code == 201
+        assert failed.json()["status"] == "FAILED"
+        monkeypatch.setattr(main_module, "cost_analysis", original_cost_analysis)
+        monkeypatch.setattr(main_module, "decision_build_sha", lambda: "different-build")
+        retried = client.post(
+            f"/api/scenarios/main/analysis-runs/{failed.json()['id']}/retry",
+            headers={"Idempotency-Key": "retry-runtime-drift-001"},
+        )
+        assert retried.status_code == 409
+        assert retried.json()["detail"]["code"] == "ANALYSIS_EXACT_RETRY_CONTEXT_CHANGED"
+        assert retried.json()["detail"]["rerun_current_endpoint"].endswith("/rerun-current")
+
+
+def test_concurrent_exact_retry_with_one_key_creates_one_attempt(monkeypatch, tmp_path):
+    database = tmp_path / "decision-retry-concurrent.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+
+    def fail_cost(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(main_module, "cost_analysis", fail_cost)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        failed = client.post(
+            f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs",
+            json={"analysis_type": "COST"},
+        ).json()
+        endpoint = f"/api/scenarios/main/analysis-runs/{failed['id']}/retry"
+
+        def retry_once():
+            return client.post(endpoint, headers={"Idempotency-Key": "concurrent-analysis-retry-001"})
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = [future.result() for future in [executor.submit(retry_once), executor.submit(retry_once)]]
+        successful = [response.json() for response in responses if response.status_code in {200, 201}]
+        assert successful
+        assert len({item["id"] for item in successful}) == 1
+        with closing(sqlite3.connect(database)) as connection:
+            attempts = connection.execute(
+                "SELECT attempt_number FROM decision_analysis_attempts WHERE logical_analysis_id=? ORDER BY attempt_number",
+                (failed["logical_analysis_id"],),
+            ).fetchall()
+        assert [item[0] for item in attempts] == [1, 2]
 
 
 def test_analysis_run_replay_status_codes_are_truthful(monkeypatch, tmp_path):
@@ -915,7 +1124,8 @@ def test_analysis_run_replay_status_codes_are_truthful(monkeypatch, tmp_path):
 
 
 def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatch, tmp_path):
-    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "decision-artifacts.db"))
+    database = tmp_path / "decision-artifacts.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
     import backend.main as main_module
 
     main_module = importlib.reload(main_module)
@@ -940,6 +1150,82 @@ def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatc
         detail = client.get(f"/api/scenarios/main/analysis-runs/{body['id']}/artifacts/{artifact['id']}")
         assert detail.status_code == 200
         assert detail.json() == artifact
+        assert artifact["integrity_status"] == "VERIFIED"
+        outsourced = next(item for item in artifacts.json() if item["option_id"] == "outsource_unserved")
+        option = next(item for item in body["result"]["options"] if item["option_id"] == "outsource_unserved")
+        assert option["artifact_hash"] == outsourced["artifact_hash"]
+        assert len(outsourced["external_assignments"]) == outsourced["counterfactual_kpis"]["external_assignment_count"]
+        assert outsourced["counterfactual_kpis"]["completion_rate"] == option["completion_rate"]
+        assert (
+            len(outsourced["work_order_dispositions"]) == outsourced["counterfactual_kpis"]["active_work_order_count"]
+        )
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload FROM decision_analysis_artifacts WHERE id=?", (outsourced["id"],)
+                ).fetchone()[0]
+            )
+            payload["external_assignments"][0]["assumed_on_time"] = False
+            connection.execute(
+                "UPDATE decision_analysis_artifacts SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), outsourced["id"]),
+            )
+        checked = client.get(f"/api/scenarios/main/analysis-runs/{body['id']}").json()
+        assert checked["integrity_status"] == "FAILED"
+        checked_artifact = client.get(
+            f"/api/scenarios/main/analysis-runs/{body['id']}/artifacts/{outsourced['id']}"
+        ).json()
+        assert checked_artifact["integrity_status"] == "FAILED"
+
+
+def test_analysis_result_tampering_and_legacy_attestation_are_visible(monkeypatch, tmp_path):
+    database = tmp_path / "analysis-result-integrity.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        first = client.post(
+            f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs",
+            json={"analysis_type": "COST"},
+        ).json()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = json.loads(
+                connection.execute("SELECT payload FROM decision_analysis_runs WHERE id=?", (first["id"],)).fetchone()[
+                    0
+                ]
+            )
+            payload["result"]["breakdown"]["travel_cost_cents"] += 1
+            connection.execute(
+                "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), first["id"]),
+            )
+        assert client.get(f"/api/scenarios/main/analysis-runs/{first['id']}").json()["integrity_status"] == "FAILED"
+
+        second = client.post(
+            f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs",
+            json={"analysis_type": "COST", "request": {"analysis_horizon": {"days": 2}}},
+        ).json()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = json.loads(
+                connection.execute("SELECT payload FROM decision_analysis_runs WHERE id=?", (second["id"],)).fetchone()[
+                    0
+                ]
+            )
+            payload["result_hash"] = None
+            payload["artifact_manifest"] = []
+            payload["analysis_manifest_hash"] = None
+            payload["integrity_status"] = "LEGACY_UNATTESTED"
+            connection.execute(
+                "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), second["id"]),
+            )
+        assert (
+            client.get(f"/api/scenarios/main/analysis-runs/{second['id']}").json()["integrity_status"]
+            == "LEGACY_UNATTESTED"
+        )
 
 
 def test_direct_decision_endpoints_are_deprecated_in_openapi(monkeypatch, tmp_path):
@@ -952,6 +1238,72 @@ def test_direct_decision_endpoints_are_deprecated_in_openapi(monkeypatch, tmp_pa
         assert paths["/api/scenarios/{scenario_id}/plan-versions/{version_id}/cost-analysis"]["get"]["deprecated"]
         assert paths["/api/scenarios/{scenario_id}/plan-versions/{version_id}/capacity-analysis"]["post"]["deprecated"]
         assert paths["/api/scenarios/{scenario_id}/plan-versions/{version_id}/risk-simulation"]["post"]["deprecated"]
+
+
+def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "paired-risk.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        assert (
+            client.post(
+                "/api/scenarios/main/optimize",
+                json={"strategy": "balanced", "time_limit_seconds": 1},
+            ).status_code
+            == 200
+        )
+        before, after = client.get("/api/scenarios/main/plan-versions").json()
+        compared = client.post(
+            f"/api/scenarios/main/risk-comparison?before={before['id']}&after={after['id']}",
+            json={"analysis_scope": "EX_ANTE_FROZEN_PLAN", "seed": 29, "trials": 50},
+        )
+        assert compared.status_code == 200, compared.text
+        body = compared.json()
+        assert body["scenario_set_hash"]
+        assert body["before_analysis_id"] != body["after_analysis_id"]
+        assert set(body["delta"]) == {
+            "expected_sla_on_time_rate",
+            "expected_overtime_minutes",
+            "additional_disruption_probability",
+            "expected_total_unserved_orders",
+        }
+
+
+def test_replan_analysis_detects_publication_route_entry_tampering(monkeypatch, tmp_path):
+    database = tmp_path / "route-entry-tamper.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        assert (
+            client.post("/api/scenarios/main/replan", json={"planning_time": 600, "time_limit_seconds": 1}).status_code
+            == 200
+        )
+        plan = client.get("/api/scenarios/main/plan-versions").json()[-1]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = json.loads(
+                connection.execute("SELECT payload FROM plan_versions WHERE id=?", (plan["id"],)).fetchone()[0]
+            )
+            payload["publication_planning_context"]["route_entries"][0]["location"]["x"] += 1
+            connection.execute(
+                "UPDATE plan_versions SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), plan["id"]),
+            )
+        run = client.post(
+            f"/api/scenarios/main/plan-versions/{plan['id']}/analysis-runs",
+            json={
+                "analysis_type": "RISK",
+                "analysis_scope": "EX_ANTE_FROZEN_PLAN",
+                "request": {"seed": 31, "trials": 50},
+            },
+        )
+        assert run.status_code == 201
+        assert run.json()["status"] == "FAILED"
+        assert run.json()["error"]["code"] == "PUBLICATION_CONTEXT_HASH_MISMATCH"
 
 
 def test_active_started_plan_requires_explicit_analysis_scope(monkeypatch, tmp_path):
@@ -994,7 +1346,7 @@ def test_active_started_plan_requires_explicit_analysis_scope(monkeypatch, tmp_p
         assert explicit.status_code == 201
         assert explicit.json()["status"] == "COMPLETED"
         assert explicit.json()["actual_execution_included"] is False
-        assert explicit.json()["current_execution_watermark"] == 1
+        assert explicit.json()["current_execution_watermark"] == 0
 
 
 def test_active_completed_plan_requires_explicit_ex_ante_scope(monkeypatch, tmp_path):
@@ -1038,9 +1390,9 @@ def test_active_completed_plan_requires_explicit_ex_ante_scope(monkeypatch, tmp_
         body = explicit.json()
         assert body["status"] == "COMPLETED"
         assert body["analysis_scope"] == "EX_ANTE_FROZEN_PLAN"
-        assert body["current_execution_watermark"] == 2
-        assert body["analysis_as_of_time"] == assignment["finish_time"]
-        assert body["execution_context_hash"]
+        assert body["current_execution_watermark"] == 0
+        assert body["analysis_as_of_time"] is None
+        assert body["execution_context_hash"] is None
         assert body["actual_execution_included"] is False
         assert "不含实际执行" in "".join(body["result"]["assumptions"])
         assert client.get(f"/api/scenarios/main/plan-versions/{version['id']}").json()["number"] == 1
@@ -1087,7 +1439,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -1141,4 +1493,4 @@ def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17

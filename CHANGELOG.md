@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.5.3 — unreleased
+## 0.5.4 — unreleased
+
+- Bound every published replan to an immutable publication-time route-entry context used by risk and capacity analysis.
+- Made outsourced coverage self-contained with external assignments, work-order dispositions, formal counterfactual KPIs and artifact hashes.
+- Persisted plan-independent simulation scenario sets, including emergency time, location, duration and skill, and added paired risk comparison.
+- Split exact retry from current-context rerun, added idempotent transactional attempt allocation and database uniqueness.
+- Added result, artifact and manifest attestations, publication verification artifacts and read-time tamper detection.
+- Made technician and outsourcing cost sources explicit; deprecated direct analysis routes now create audited A records.
+- Added structured frontend API errors, RUNNING analysis polling and a capacity evidence viewer.
+
+## 0.5.3
 
 - Corrected paid-shift overtime cash cost by separating regular labor, overtime base wage and overtime premium.
 - Added explicit capacity cost units; infeasible options now expose diagnostics without formal benefit, impact or payback claims.

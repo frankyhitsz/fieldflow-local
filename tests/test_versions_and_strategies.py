@@ -528,6 +528,49 @@ def test_replan_activation_preserves_lineage_and_original_stability_baseline(mon
             restored["selected"]["kpis"]["same_technician_rate"]
             == replan_plan["selected"]["kpis"]["same_technician_rate"]
         )
+        assert (
+            restored["publication_planning_context"]["route_entries"]
+            == replan_plan["publication_planning_context"]["route_entries"]
+        )
+        risk = client.post(
+            f"/api/scenarios/main/plan-versions/{restored['id']}/analysis-runs",
+            json={
+                "analysis_type": "RISK",
+                "analysis_scope": "EX_ANTE_FROZEN_PLAN",
+                "request": {"seed": 41, "trials": 50},
+            },
+        )
+        assert risk.status_code == 201
+        assert risk.json()["status"] == "COMPLETED", risk.text
+
+        preview = client.get(f"/api/scenarios/main/plan-versions/{replan_plan['id']}/rollback-preview").json()
+        rolled_back = client.post(
+            f"/api/scenarios/main/plan-versions/{replan_plan['id']}/restore",
+            json={
+                "expected_revision": preview["expected_revision"],
+                "confirmation_token": preview["confirmation_token"],
+                "reason": "验证重排上下文恢复",
+                "allow_delete_new_orders": False,
+                "idempotency_key": "restore-replan-context-001",
+            },
+        )
+        assert rolled_back.status_code == 200, rolled_back.text
+        restored_again = rolled_back.json()
+        assert (
+            restored_again["publication_planning_context"]["route_entries"]
+            == replan_plan["publication_planning_context"]["route_entries"]
+        )
+        assert restored_again["publication_planning_context"]["scenario_revision"] == 1
+        restored_risk = client.post(
+            f"/api/scenarios/main/plan-versions/{restored_again['id']}/analysis-runs",
+            json={
+                "analysis_type": "RISK",
+                "analysis_scope": "EX_ANTE_FROZEN_PLAN",
+                "request": {"seed": 43, "trials": 50},
+            },
+        )
+        assert restored_risk.status_code == 201
+        assert restored_risk.json()["status"] == "COMPLETED", restored_risk.text
 
 
 def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
@@ -798,7 +841,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 17
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -813,7 +856,7 @@ def test_schema_versions_1_through_15_converge_to_current_schema(tmp_path, legac
     migrated = Store(database)
     assert migrated.get_scenario("main") is not None
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert "publication_key" in {row[1] for row in connection.execute("PRAGMA table_info(command_keys)").fetchall()}
@@ -868,7 +911,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"

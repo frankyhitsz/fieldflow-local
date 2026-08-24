@@ -1,7 +1,16 @@
 import type {
-  CapacityAnalysis, CapacityCounterfactualArtifact, Comparison, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
-  ExecutionEvent, ExecutionResult, ManualReassignmentResult, StrategyProfile, StrategyWeights, Technician, WorkOrder,
+  CapacityAnalysis, Comparison, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
+  DecisionAnalysisArtifact, ExecutionEvent, ExecutionResult, ManualReassignmentResult, StrategyProfile, StrategyWeights, Technician, WorkOrder,
 } from './types'
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly details?: Record<string, unknown>,
+  ) { super(message); this.name = 'ApiError' }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
@@ -27,8 +36,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`
-    try { const body = await response.json(); message = body.detail?.message || body.detail || message } catch { /* noop */ }
-    throw new Error(typeof message === 'string' ? message : JSON.stringify(message))
+    let code: string | undefined
+    let details: Record<string, unknown> | undefined
+    try {
+      const body = await response.json()
+      const detail = body.detail
+      if (detail && typeof detail === 'object') {
+        details = detail as Record<string, unknown>
+        code = typeof details.code === 'string' ? details.code : undefined
+        message = typeof details.message === 'string' ? details.message : message
+      } else if (typeof detail === 'string') message = detail
+    } catch { /* noop */ }
+    throw new ApiError(message, response.status, code, details)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
@@ -86,9 +105,11 @@ export const api = {
         : { seed: options?.seed ?? null, trials: options?.trials ?? 500 }
     return request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, analysis_scope: 'EX_ANTE_FROZEN_PLAN', request: parameters }) })
   },
-  retryDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/retry`, { method: 'POST' }),
-  decisionAnalysisArtifacts: (scenarioId: string, analysisId: string) => request<CapacityCounterfactualArtifact[]>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts`),
-  decisionAnalysisArtifact: (scenarioId: string, analysisId: string, artifactId: string) => request<CapacityCounterfactualArtifact>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts/${artifactId}`),
+  decisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}`),
+  retryDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string, idempotencyKey = `analysis-retry-${crypto.randomUUID()}`) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } }),
+  rerunDecisionAnalysisCurrent: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/rerun-current`, { method: 'POST' }),
+  decisionAnalysisArtifacts: (scenarioId: string, analysisId: string) => request<DecisionAnalysisArtifact[]>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts`),
+  decisionAnalysisArtifact: (scenarioId: string, analysisId: string, artifactId: string) => request<DecisionAnalysisArtifact>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts/${artifactId}`),
   createTechnician: (scenarioId: string, technician: Technician) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians`, { method: 'POST', body: JSON.stringify(technician) }),
   updateTechnician: (scenarioId: string, technicianId: string, technician: Partial<Technician>) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians/${technicianId}`, { method: 'PUT', body: JSON.stringify(technician) }),
 }

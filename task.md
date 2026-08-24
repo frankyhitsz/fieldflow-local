@@ -4,55 +4,49 @@
 
 ## 本轮目标
 
-完成 `pro-plan.md` 的 v0.5.3 决策正确性工作包 FF-1001～FF-1010。修复必须覆盖模型、迁移、接口、界面和故障注入；经过三轮独立审计与整套验证后再提交。
+逐条复核新版 `pro-plan.md`，完成 v0.5.4 的 FF-1101～FF-1109。能在现有单机架构内闭环的建议直接实现；需要新运行时或新领域数据的 M1～M4 项保留到对应版本，不添加无法工作的占位类型。
 
-## 第一轮：数字口径与反事实证据
+## 第一轮：发布上下文、外部覆盖与共同场景
 
-- [x] 拆分正常人工、加班基础工资和加班溢价，修正 `PAID_SHIFT` 少算加班基础工资的问题。
-- [x] 对 `OCCUPIED_MINUTES`、`PAID_SHIFT` 和随机整数政策验证现金成本恒等式；`SALARIED_ALLOCATION` 继续稳定拒绝。
-- [x] 容量成本增加单位类型、每日单位数和受影响实体；修正 `PER_SHIFT` 未乘技师数量的问题，拒绝无定义单位的 cadence。
-- [x] 不可执行容量方案的正式 KPI、周期影响和抵消天数改为 null，仅保留诊断指标和违规。
-- [x] 合成技师使用确定性保留 ID 并检查冲突；反事实场景重新走 Pydantic 聚合校验。
-- [x] 突发事件发生与实际致损分开统计；共同随机量按 seed、trial、事件和实体派生并保存场景集哈希。
+- [x] replan V 保存 `PublicationPlanningContext`：每位技师的 route entry、可用时间、返回点、发布执行水位、来源方案和冻结分配身份。
+- [x] 发布清单绑定场景快照、正式排程、PlanningContext 和发布验证 Artifact；上下文篡改会阻止分析。
+- [x] 风险从历史 route entry 开始；selected-plan 容量复核使用同一入口；replan 的受控重算稳定返回 `REPLAN_CONTROLLED_REOPTIMIZATION_NOT_SUPPORTED`。
+- [x] 旧 replan 仅保留带警告的成本分析，容量和风险返回 `REPLAN_ANALYSIS_CONTEXT_NOT_AVAILABLE`。
+- [x] 外包反事实增加 `ExternalAssignment`、逐工单 disposition、外部 SLA 假设和统一 KPI；Formal result 绑定 Artifact 哈希。
+- [x] 共同随机场景先于计划生成，突发目标不依赖已用路线，并冻结事件时间、位置、时长和技能；新增配对风险比较接口及场景集 Artifact。
 
-## 第二轮：A-run、冻结计划和 Saga
+## 第二轮：重试、证明链和成本来源
 
-- [x] A-run 请求改为 COST/CAPACITY/RISK 判别联合，重复或无关参数返回 422，不再静默覆盖。
-- [x] 新分析返回 201、运行中复用返回 202、终态复用返回 200。
-- [x] 失败或中断 A 可显式 retry；新 attempt 保存 logical ID、来源 A、attempt 序号和原始请求，原记录不改写。
-- [x] 容量 A 的每个选项保存规范化路线、完整校验报告、路线差异和输入变化 Artifact，并提供列表和详情接口。
-- [x] 新 V 保存发布排程哈希、校验政策和报告哈希；分析、报告和历史激活共用冻结计划完整性检查。
-- [x] 人工改派锁定后数据变化进入不可覆盖的 `FAILED_CONTEXT_CHANGED`；同 key 稳定重放，新 key 可重新发起。
-- [x] Schema 升至 v16，移除阻止 retry 的输入唯一约束并增加反事实 Artifact 表；旧库迁移前保留时间戳备份。
+- [x] 精确 retry 校验原 build、发布上下文、旅行模型、排程和请求；运行时漂移返回稳定冲突并提示 current rerun。
+- [x] current rerun 创建新的 logical analysis 并保存 `supersedes_analysis_id`，不冒充 retry。
+- [x] Schema v17 增加 `(logical_analysis_id, attempt_number)` 唯一表；attempt 在 `BEGIN IMMEDIATE` 事务内分配，重试幂等键合并双击。
+- [x] A 终态保存 result hash、Artifact manifest 和 analysis manifest；读取时检测结果篡改、Artifact 篡改或缺失，旧 A 标记 `LEGACY_UNATTESTED`。
+- [x] 发布时保存 Candidate、PlanningContext、事务复核报告、验证政策和正式排程哈希；分析、报告和历史激活统一验证。
+- [x] 新增技师成本显式区分 `WAGE_ONLY`、`FIXED_ONLY`、`WAGE_PLUS_FIXED`；外包费用只从成本政策或容量政策二选一。
 
-## 第三轮：界面、边界与交付审计
+## 第三轮：API、界面和边界审计
 
-- [x] 运营复盘分列正常人工、加班基础工资和溢价；突发事件与实际致损使用不同标签。
-- [x] 不可执行容量行用 `—` 隐藏正式数字，可展开全部违规；“回本”改为“经济影响抵消天数”。
-- [x] 失败和中断 A 在页面提供显式重试按钮，并说明原记录会保留。
-- [x] 补充成本、容量单位、无效方案、共同随机场景、冻结损坏、状态码、retry、Artifact 和 Saga 终态测试。
-- [x] 更新 OpenAPI 快照并完成 Ruff、Pyright、TypeScript、后端、React、构建、Demo、Benchmark 和依赖审计；本机 Chromium 的 SIGTRAP 由 Linux Playwright 5 项全通过补证。
-- [x] 核心提交 `51b6c87` 已推送；GitHub Actions `32730300122` 的 `python-compat` 与 `fieldflow` 均通过，Linux Playwright 补齐页面验证。
+- [x] deprecated 同步分析接口内部创建/复用 A，不再绕过审计。
+- [x] 前端 `ApiError` 保留 status、code 和 details；RUNNING A 自动轮询，不再把 202 当失败终态。
+- [x] 容量表可读取 Artifact，展示完整性、内部/外部/未服务计数和外部承接清单。
+- [x] 补充 route-entry 历史一致性、受控重算拒绝、外包 Artifact、计划无关随机事件、配对比较、并发 retry、运行时漂移、结果/Artifact 篡改、Legacy 证明和成本来源测试。
+- [x] 额外发现并修正风险仿真中突发事件只在班次起点加固定延迟的简化：现在按冻结事件时间和位置插入行程与服务时长。
+- [x] `make verify` 除本机 Chromium SIGTRAP 外全部通过；API Playwright 1 项通过，三轮 auto-review 记录已更新。Linux 页面门禁待推送后由 GitHub Actions 补证。
 
-## 后续版本范围
+## 经复核不在 v0.5.4 实现
 
-- [ ] v0.6.0：持久 Job Queue、Outbox、进度、取消、启动对账和显式迁移 CLI。
-- [ ] v0.7.0：Booking、调度收件箱、技师端流程、资产、周期维护、库存和 Crew。
-- [ ] v0.8.0：incurred/remaining/combined 分析、组合容量、敏感性、风险校准和多日模型。
-- [ ] v1.0.0：正式 Benchmark、依赖锁、许可证选择和 GitHub 分支治理。
+- M1 的持久 Job Queue、子进程硬取消、Lease、完整依赖注入、三类 D 修订、严格不可变展示元数据、Location/Depot 实体、显式迁移 CLI 和数据生命周期需要运行时或存储契约升级。
+- M2 的 Booking、工单收件箱、技师端、资产、库存、通知和 Crew 需要新的业务实体，不能用现有 assignment 伪装。
+- M3/M4 的执行感知预测、多日模型、正式 Benchmark、许可证和分支治理按路线图保留；许可证及仓库治理必须由仓库所有者选择。
 
 ## 当前验证
 
 ```text
-make lint                         通过
-Python 依赖审计                  无已知漏洞
-npm production audit             0 vulnerabilities
-后端、接口与属性测试              179 passed；coverage 89.31%
-React 组件                        10 passed
-生产构建                          通过
-Demo check                       通过
-Benchmark smoke                  通过（严格完整性检查暴露的无效延迟 Fixture 已修正）
-Playwright API 生命周期           1 passed
-Playwright 浏览器页面             本机 Chromium 被系统 SIGTRAP 终止；Linux CI 5 tests success
-GitHub Actions 32730300122       python-compat success；fieldflow success；Linux Playwright success
+Ruff / Pyright                     通过
+决策测试                           59 passed
+后端完整测试                       188 passed；coverage 90.10%
+React 组件                         10 passed
+TypeScript / 生产构建              通过
+完整 make verify                   lint/audit/test/build/demo/benchmark 通过；本机页面 Chromium SIGTRAP
+GitHub Actions                     待推送后确认
 ```
