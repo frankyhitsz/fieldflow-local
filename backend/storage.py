@@ -13,6 +13,7 @@ from typing import Literal
 from .fixtures import all_fixtures
 from .hashing import content_hash
 from .models import (
+    CapacityCounterfactualArtifact,
     DecisionAnalysisRun,
     ExecutionSourceAssignment,
     ExecutionSourceContext,
@@ -41,7 +42,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
 
 
 def _upgrade_technician_costs(payload: object) -> bool:
@@ -430,9 +431,19 @@ class Store:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(scenario_id, number),
-                    UNIQUE(plan_version_id, analysis_type, input_hash),
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
                     FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS decision_analysis_artifacts (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    analysis_run_id TEXT NOT NULL,
+                    option_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(analysis_run_id, option_id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
+                    FOREIGN KEY(analysis_run_id) REFERENCES decision_analysis_runs(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS schedule_artifacts (
                     id TEXT PRIMARY KEY,
@@ -530,6 +541,47 @@ class Store:
                 con.execute(
                     "UPDATE command_keys SET publication_key=namespace || ':' || key WHERE namespace LIKE '%:replan'"
                 )
+            decision_run_sql = con.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_analysis_runs'"
+            ).fetchone()["sql"]
+            if "UNIQUE(plan_version_id, analysis_type, input_hash)" in decision_run_sql:
+                con.commit()
+                con.execute("PRAGMA foreign_keys = OFF")
+                con.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    DROP TABLE IF EXISTS decision_analysis_artifacts;
+                    ALTER TABLE decision_analysis_runs RENAME TO decision_analysis_runs_legacy;
+                    CREATE TABLE decision_analysis_runs (
+                        id TEXT PRIMARY KEY,
+                        scenario_id TEXT NOT NULL,
+                        number INTEGER NOT NULL,
+                        plan_version_id TEXT NOT NULL,
+                        analysis_type TEXT NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(scenario_id, number),
+                        FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
+                        FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO decision_analysis_runs SELECT * FROM decision_analysis_runs_legacy;
+                    DROP TABLE decision_analysis_runs_legacy;
+                    CREATE TABLE decision_analysis_artifacts (
+                        id TEXT PRIMARY KEY,
+                        scenario_id TEXT NOT NULL,
+                        analysis_run_id TEXT NOT NULL,
+                        option_id TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(analysis_run_id, option_id),
+                        FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
+                        FOREIGN KEY(analysis_run_id) REFERENCES decision_analysis_runs(id) ON DELETE CASCADE
+                    );
+                    COMMIT;
+                    """
+                )
+                con.execute("PRAGMA foreign_keys = ON")
             if version < 7:
                 scenario_rows = con.execute(
                     "SELECT DISTINCT scenario_id FROM work_order_execution_events ORDER BY scenario_id"
@@ -648,6 +700,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_plan_applicability_scenario ON plan_applicability(scenario_id, active);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_applicability_active_unique ON plan_applicability(scenario_id) WHERE active=1;
                 CREATE INDEX IF NOT EXISTS idx_decision_analysis_plan ON decision_analysis_runs(plan_version_id, number);
+                CREATE INDEX IF NOT EXISTS idx_decision_analysis_artifacts_run ON decision_analysis_artifacts(analysis_run_id, option_id);
                 CREATE INDEX IF NOT EXISTS idx_revisions_scenario ON scenario_revisions(scenario_id, number);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_plan ON schedule_artifacts(plan_version_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
@@ -1033,7 +1086,8 @@ class Store:
                 raise PublicationConflict("幂等命令记录不存在")
             if row["request_fingerprint"] != fingerprint:
                 raise PublicationConflict("相同幂等键对应了不同请求")
-            if row["status"] in {"COMPLETED", "FAILED"}:
+            terminal_statuses = {"COMPLETED", "FAILED", "FAILED_AFTER_LOCK", "FAILED_CONTEXT_CHANGED"}
+            if row["status"] in terminal_statuses:
                 if row["status"] == status:
                     return
                 raise PublicationConflict("幂等命令已进入终态，不能覆盖")
@@ -1841,6 +1895,11 @@ class Store:
                 artifacts=persisted_artifacts,
                 candidate_id=candidate_id,
                 scenario_snapshot_hash=content_hash(scenario),
+                published_schedule_hash=content_hash(chosen),
+                publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V1",
+                publication_verification_report_hash=content_hash(
+                    transaction_verification.model_dump(exclude={"checked_at"}, mode="json")
+                ),
                 source_plan_snapshot_hash=source_hash,
             )
             con.execute(
@@ -2044,18 +2103,25 @@ class Store:
             row = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
         return ScheduleCandidate.model_validate_json(row["payload"]) if row else None
 
-    def reserve_decision_analysis_run(self, run: DecisionAnalysisRun) -> tuple[DecisionAnalysisRun, bool]:
+    def reserve_decision_analysis_run(
+        self,
+        run: DecisionAnalysisRun,
+        *,
+        force_new: bool = False,
+    ) -> tuple[DecisionAnalysisRun, bool]:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            existing = con.execute(
-                """
-                SELECT payload FROM decision_analysis_runs
-                WHERE plan_version_id=? AND analysis_type=? AND input_hash=?
-                """,
-                (run.plan_version_id, run.analysis_type, run.input_hash),
-            ).fetchone()
-            if existing:
-                return DecisionAnalysisRun.model_validate_json(existing["payload"]), False
+            if not force_new:
+                existing = con.execute(
+                    """
+                    SELECT payload FROM decision_analysis_runs
+                    WHERE plan_version_id=? AND analysis_type=? AND input_hash=?
+                    ORDER BY number DESC LIMIT 1
+                    """,
+                    (run.plan_version_id, run.analysis_type, run.input_hash),
+                ).fetchone()
+                if existing:
+                    return DecisionAnalysisRun.model_validate_json(existing["payload"]), False
             plan = con.execute(
                 "SELECT 1 FROM plan_versions WHERE id=? AND scenario_id=?",
                 (run.plan_version_id, run.scenario_id),
@@ -2069,6 +2135,7 @@ class Store:
             saved = run.model_copy(deep=True)
             saved.number = int(row["number"])
             saved.id = f"AN-{saved.scenario_id}-{saved.number}-{uuid.uuid4().hex[:6]}"
+            saved.logical_analysis_id = saved.logical_analysis_id or saved.id
             con.execute(
                 """
                 INSERT INTO decision_analysis_runs(
@@ -2088,7 +2155,12 @@ class Store:
             )
             return saved, True
 
-    def finish_decision_analysis_run(self, run: DecisionAnalysisRun) -> DecisionAnalysisRun:
+    def finish_decision_analysis_run(
+        self,
+        run: DecisionAnalysisRun,
+        *,
+        artifacts: list[CapacityCounterfactualArtifact] | None = None,
+    ) -> DecisionAnalysisRun:
         if run.status not in {"COMPLETED", "FAILED", "INTERRUPTED"}:
             raise PublicationConflict("经营分析只能结束为完成、失败或中断")
         with self._lock, self._connect() as con:
@@ -2108,6 +2180,24 @@ class Store:
                 "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
                 (run.model_dump_json(), run.id),
             )
+            for artifact in artifacts or []:
+                if artifact.analysis_run_id != run.id or artifact.scenario_id != run.scenario_id:
+                    raise PublicationConflict("容量反事实证据与经营分析不一致")
+                con.execute(
+                    """
+                    INSERT INTO decision_analysis_artifacts(
+                        id, scenario_id, analysis_run_id, option_id, payload, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact.id,
+                        artifact.scenario_id,
+                        artifact.analysis_run_id,
+                        artifact.option_id,
+                        artifact.model_dump_json(),
+                        artifact.created_at,
+                    ),
+                )
         return run
 
     def list_decision_analysis_runs(self, scenario_id: str, plan_version_id: str) -> list[DecisionAnalysisRun]:
@@ -2133,6 +2223,37 @@ class Store:
                 (scenario_id, analysis_id, numeric),
             ).fetchone()
         return DecisionAnalysisRun.model_validate_json(row["payload"]) if row else None
+
+    def list_decision_analysis_artifacts(
+        self,
+        scenario_id: str,
+        analysis_run_id: str,
+    ) -> list[CapacityCounterfactualArtifact]:
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT payload FROM decision_analysis_artifacts
+                WHERE scenario_id=? AND analysis_run_id=? ORDER BY option_id
+                """,
+                (scenario_id, analysis_run_id),
+            ).fetchall()
+        return [CapacityCounterfactualArtifact.model_validate_json(row["payload"]) for row in rows]
+
+    def get_decision_analysis_artifact(
+        self,
+        scenario_id: str,
+        analysis_run_id: str,
+        artifact_id: str,
+    ) -> CapacityCounterfactualArtifact | None:
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT payload FROM decision_analysis_artifacts
+                WHERE scenario_id=? AND analysis_run_id=? AND id=?
+                """,
+                (scenario_id, analysis_run_id, artifact_id),
+            ).fetchone()
+        return CapacityCounterfactualArtifact.model_validate_json(row["payload"]) if row else None
 
     def published_for_key(self, key: str, fingerprint: str) -> PlanVersion | None:
         with self._connect() as con:

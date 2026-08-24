@@ -4,7 +4,13 @@ from hypothesis import strategies as st
 from backend.decision import analyze_plan_cost, capacity_analysis
 from backend.fixtures import get_fixture
 from backend.hashing import content_hash
-from backend.models import AnalysisHorizon, CapacityAnalysisRequest, DecisionCostPolicy, PlanVersion
+from backend.models import (
+    AnalysisHorizon,
+    CapacityAnalysisRequest,
+    DecisionCostPolicy,
+    LaborCostMode,
+    PlanVersion,
+)
 from backend.scheduler import baseline_schedule
 
 
@@ -28,11 +34,13 @@ def test_greedy_assignments_never_precede_generated_service_readiness(offsets: l
     technician_rates=st.lists(st.integers(min_value=1, max_value=10_000), min_size=4, max_size=4),
     travel_rate=st.integers(min_value=0, max_value=2_000),
     overtime_basis_points=st.integers(min_value=0, max_value=30_000),
+    labor_mode=st.sampled_from([LaborCostMode.occupied_minutes, LaborCostMode.paid_shift]),
 )
 def test_generated_integer_cost_policies_always_reconcile(
     technician_rates: list[int],
     travel_rate: int,
     overtime_basis_points: int,
+    labor_mode: LaborCostMode,
 ):
     scenario = get_fixture("main")
     for technician, rate in zip(scenario.technicians, technician_rates, strict=True):
@@ -44,12 +52,14 @@ def test_generated_integer_cost_policies_always_reconcile(
         DecisionCostPolicy(
             travel_cost_per_minute_cents=travel_rate,
             overtime_premium_basis_points=overtime_basis_points,
+            labor_cost_mode=labor_mode,
         ),
     )
     assert breakdown.cash_operating_cost_cents == (
-        breakdown.labor_cost_cents
+        breakdown.regular_labor_cost_cents
+        + breakdown.overtime_base_cost_cents
+        + breakdown.overtime_premium_cost_cents
         + breakdown.travel_cost_cents
-        + breakdown.overtime_cost_cents
         + breakdown.outsourcing_cost_cents
     )
     assert breakdown.service_failure_loss_cents == (breakdown.sla_penalty_cents + breakdown.unserved_revenue_cents)

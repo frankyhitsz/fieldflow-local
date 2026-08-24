@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.5.2 — unreleased
+## 0.5.3 — unreleased
+
+- Corrected paid-shift overtime cash cost by separating regular labor, overtime base wage and overtime premium.
+- Added explicit capacity cost units; infeasible options now expose diagnostics without formal benefit, impact or payback claims.
+- Split emergency occurrence from emergency-caused harm and introduced keyed common random scenarios for paired plan comparison.
+- Reworked A-run requests as a discriminated union, added truthful 200/201/202 replay status and explicit retry attempts that preserve failed records.
+- Attested published schedules and reused full frozen-plan integrity checks for analysis, reports and historical activation.
+- Persisted complete capacity counterfactual routes as separate artifacts and made post-lock manual-reassignment context changes terminal.
+
+## 0.5.2
 
 - Replaced the ambiguous full-day decision scope with explicit ex-ante, actual, remaining-forecast, and combined scopes; only ex-ante frozen-plan analysis is currently enabled.
 - Bound every persisted analysis to the current execution watermark, as-of time, execution-context hash, algorithm version, and build SHA.

@@ -1,5 +1,5 @@
 import type {
-  CapacityAnalysis, Comparison, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
+  CapacityAnalysis, CapacityCounterfactualArtifact, Comparison, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
   ExecutionEvent, ExecutionResult, ManualReassignmentResult, StrategyProfile, StrategyWeights, Technician, WorkOrder,
 } from './types'
 
@@ -77,7 +77,18 @@ export const api = {
   executeWorkOrder: (scenarioId: string, orderId: string, action: 'start' | 'complete', technicianId: string, occurredAt: number, expectedRevision: number, idempotencyKey: string, options?: { earlyStartOverrideReason?: string; estimatedRemainingMinutes?: number; note?: string }) => request<ExecutionResult>(`/api/scenarios/${scenarioId}/work-orders/${orderId}/${action}`, { method: 'POST', body: JSON.stringify({ technician_id: technicianId, occurred_at: occurredAt, expected_revision: expectedRevision, idempotency_key: idempotencyKey, early_start_override_reason: options?.earlyStartOverrideReason || null, estimated_remaining_minutes: action === 'start' ? options?.estimatedRemainingMinutes ?? null : null, note: options?.note || '' }) }),
   executionEvents: (scenarioId: string) => request<ExecutionEvent[]>(`/api/scenarios/${scenarioId}/execution-events`),
   analysisRuns: (scenarioId: string, versionId: string) => request<DecisionAnalysisRun[]>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`),
-  createDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, versionId: string, analysisType: 'COST' | 'CAPACITY' | 'RISK', options?: { referenceMode?: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'; seed?: number; trials?: number; horizonDays?: number }) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, analysis_scope: 'EX_ANTE_FROZEN_PLAN', analysis_horizon: { days: options?.horizonDays ?? 1, workdays_per_month: 22, currency: 'CNY' }, capacity_request: { reference_mode: options?.referenceMode || 'SELECTED_PLAN_DELTA' }, risk_request: { seed: options?.seed ?? null, trials: options?.trials ?? 500 } }) }),
+  createDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, versionId: string, analysisType: 'COST' | 'CAPACITY' | 'RISK', options?: { referenceMode?: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'; seed?: number; trials?: number; horizonDays?: number }) => {
+    const horizon = { days: options?.horizonDays ?? 1, workdays_per_month: 22, currency: 'CNY' }
+    const parameters = analysisType === 'COST'
+      ? { analysis_horizon: horizon }
+      : analysisType === 'CAPACITY'
+        ? { reference_mode: options?.referenceMode || 'SELECTED_PLAN_DELTA', analysis_horizon: horizon }
+        : { seed: options?.seed ?? null, trials: options?.trials ?? 500 }
+    return request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, analysis_scope: 'EX_ANTE_FROZEN_PLAN', request: parameters }) })
+  },
+  retryDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/retry`, { method: 'POST' }),
+  decisionAnalysisArtifacts: (scenarioId: string, analysisId: string) => request<CapacityCounterfactualArtifact[]>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts`),
+  decisionAnalysisArtifact: (scenarioId: string, analysisId: string, artifactId: string) => request<CapacityCounterfactualArtifact>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts/${artifactId}`),
   createTechnician: (scenarioId: string, technician: Technician) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians`, { method: 'POST', body: JSON.stringify(technician) }),
   updateTechnician: (scenarioId: string, technicianId: string, technician: Partial<Technician>) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians/${technicianId}`, { method: 'PUT', body: JSON.stringify(technician) }),
 }

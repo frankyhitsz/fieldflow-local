@@ -93,7 +93,9 @@ export type PlanVersion = {
   coverage_status: 'CURRENT_AND_COMPLETE' | 'PARTIAL_NEW_DEMAND' | 'STALE_DATA_CHANGED'
   selected: Schedule
   artifacts: { id: string; role: 'baseline' | 'selected' | 'candidate'; strategy: string; schedule: Schedule }[]
-  candidate_id: string | null; scenario_snapshot_hash: string; source_plan_snapshot_hash: string | null
+  candidate_id: string | null; scenario_snapshot_hash: string; published_schedule_hash: string
+  publication_verification_policy_version: string; publication_verification_report_hash: string
+  source_plan_snapshot_hash: string | null
 }
 
 export type RollbackPreview = {
@@ -134,6 +136,7 @@ export type StrategyExperiment = {
 }
 
 export type CostBreakdown = {
+  regular_labor_cost_cents: number; overtime_base_cost_cents: number; overtime_premium_cost_cents: number
   labor_cost_cents: number; travel_cost_cents: number; overtime_cost_cents: number
   sla_penalty_cents: number; unserved_revenue_cents: number; outsourcing_cost_cents: number
   cash_operating_cost_cents: number; service_failure_loss_cents: number; total_economic_impact_cents: number
@@ -163,14 +166,19 @@ export type CapacityOption = {
   option_id: 'add_technician' | 'add_skill' | 'extend_shift' | 'allow_overtime' | 'outsource_unserved' | 'relocate_one_technician_start'
   name: string; assumption: string; option_applicable: boolean; schedule_feasible: boolean; feasible: boolean
   violations: CapacityViolation[]; changed_inputs: Record<string, unknown>; placement_mode: 'TAIL_APPEND_ONLY'
-  completion_rate: number; sla_on_time_rate: number; unassigned_count: number
-  travel_minutes: number; overtime_minutes: number
-  completion_improvement_percentage_points: number; sla_improvement_percentage_points: number
-  unassigned_delta: number; travel_delta_minutes: number; overtime_delta_minutes: number
-  fixed_capacity_cost_cents: number; marginal_cost_cents: number; projected_total_cost_cents: number
-  fixed_cost_cadence: CostCadence; one_time_investment_cents: number; daily_operating_delta_cents: number
-  horizon_total_impact_cents: number; break_even_days: number | null
-  schedule_signature: string
+  completion_rate: number | null; sla_on_time_rate: number | null; unassigned_count: number | null
+  travel_minutes: number | null; overtime_minutes: number | null
+  completion_improvement_percentage_points: number | null; sla_improvement_percentage_points: number | null
+  unassigned_delta: number | null; travel_delta_minutes: number | null; overtime_delta_minutes: number | null
+  fixed_capacity_cost_cents: number; marginal_cost_cents: number | null; projected_total_cost_cents: number | null
+  fixed_cost_cadence: CostCadence; one_time_investment_cents: number; daily_operating_delta_cents: number | null
+  cost_unit_type: 'INVESTMENT' | 'PLAN_DAY' | 'TECHNICIAN_SHIFT' | 'WORK_ORDER' | 'WORK_MONTH'
+  cost_units_per_day: number; affected_entity_ids: string[]
+  horizon_total_impact_cents: number | null; economic_impact_offset_days: number | null
+  cash_payback_days: number | null; break_even_days: number | null
+  schedule_signature: string; diagnostic_metrics: Record<string, number>
+  diagnostic_schedule: Schedule | null; verification_report: { valid: boolean; violations: CapacityViolation[] } | null
+  route_diff: Record<string, unknown>[]; artifact_id: string | null
 }
 
 export type CapacityAnalysis = AnalysisContextFields & {
@@ -190,6 +198,7 @@ export type RiskSimulation = AnalysisContextFields & {
   schedule_signature: string; travel_model_fingerprint: string
   execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE' | 'EARLIEST_FEASIBLE_EXECUTION'; execution_policy_version: string
   simulation_policy_version: string; analysis_code_version: string; simulation_input_hash: string; seed: number; trials: number
+  simulation_scenario_set_hash: string
   expected_sla_on_time_rate: number; sla_rate_ci_low: number; sla_rate_ci_high: number
   monte_carlo_mean_ci_low: number; monte_carlo_mean_ci_high: number
   full_day_total_late_minutes_p50: number; full_day_total_late_minutes_p90: number; full_day_total_late_minutes_p95: number
@@ -197,6 +206,10 @@ export type RiskSimulation = AnalysisContextFields & {
   expected_overtime_minutes: number; additional_disruption_probability: number
   absence_disruption_probability: number; no_show_disruption_probability: number
   window_failure_probability: number; overtime_failure_probability: number; emergency_capacity_disruption_probability: number
+  emergency_event_probability: number; emergency_caused_failure_probability: number
+  emergency_failure_given_event_probability: number; emergency_caused_window_failure_probability: number
+  emergency_caused_overtime_probability: number; emergency_caused_unserved_probability: number
+  emergency_caused_sla_degradation_probability: number
   baseline_unserved_orders: number; expected_total_unserved_orders: number
   plan_failure_probability: number; expected_unserved_orders: number
   assumptions: string[]
@@ -210,6 +223,14 @@ export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimula
   active_booking_ids: string[]; travel_model_fingerprint: string
   policy_version: string; policy_snapshot: Record<string, unknown>; code_version: string
   algorithm_version: string; build_sha: string; input_hash: string
+  request_snapshot: Record<string, unknown>; logical_analysis_id: string
+  retry_of_analysis_id: string | null; attempt_number: number
   status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; result: T | null
   error: Record<string, unknown> | null; created_at: string; finished_at: string | null
+}
+
+export type CapacityCounterfactualArtifact = {
+  id: string; scenario_id: string; analysis_run_id: string; option_id: CapacityOption['option_id']
+  schedule: Schedule; verification_report: { valid: boolean; violations: CapacityViolation[] }
+  route_diff: Record<string, unknown>[]; changed_inputs: Record<string, unknown>; created_at: string
 }

@@ -1218,6 +1218,66 @@ def test_concurrent_manual_reassignment_uses_one_lock_run_and_plan(monkeypatch, 
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
 
 
+def test_manual_reassignment_context_change_becomes_replayable_terminal_failure(monkeypatch, tmp_path):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "manual-context-terminal.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        payload = _manual_reassignment_payload(client, "manual-context-terminal-001")
+        store = main_module.require_store()
+        original_update = store.update_command_record
+        crashed = False
+
+        def crash_before_replan_created(*args, **kwargs):
+            nonlocal crashed
+            if not crashed and kwargs.get("status") == "REPLAN_CREATED":
+                crashed = True
+                raise SimulatedProcessExit("after lock")
+            return original_update(*args, **kwargs)
+
+        monkeypatch.setattr(store, "update_command_record", crash_before_replan_created)
+        with pytest.raises(SimulatedProcessExit):
+            main_module.manual_reassignment(
+                "main",
+                main_module.ManualReassignmentRequest.model_validate(payload),
+            )
+        monkeypatch.setattr(store, "update_command_record", original_update)
+
+        scenario = client.get("/api/scenarios/main").json()
+        order = next(item for item in scenario["work_orders"] if item["id"] != payload["work_order_id"])
+        changed = client.put(
+            f"/api/scenarios/main/work-orders/{order['id']}",
+            json={"note": "改派锁定之后的新业务变更"},
+        )
+        assert changed.status_code == 200
+
+        first = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        replay = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        assert first.status_code == replay.status_code == 409
+        assert first.json() == replay.json()
+        assert first.json()["detail"]["code"] == "MANUAL_REASSIGNMENT_CONTEXT_CHANGED"
+        command = store.get_command_record(
+            "main:manual-reassignment",
+            payload["idempotency_key"],
+            main_module.content_hash(
+                {"scenario_id": "main", "request": main_module.ManualReassignmentRequest.model_validate(payload)}
+            ),
+        )
+        assert command["status"] == "FAILED_CONTEXT_CHANGED"
+        assert command["payload"]["failed_at"]
+
+        new_payload = {
+            **payload,
+            "expected_revision": changed.json()["revision"],
+            "idempotency_key": "manual-context-terminal-002",
+        }
+        assert client.post("/api/scenarios/main/manual-reassignment", json=new_payload).status_code == 200
+
+
 def test_plan_payload_is_not_rewritten_when_applicability_changes(monkeypatch, tmp_path):
     database = tmp_path / "plan-applicability.db"
     monkeypatch.setenv("FIELDFLOW_DB", str(database))
@@ -1339,7 +1399,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 

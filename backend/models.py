@@ -4,7 +4,7 @@ from datetime import date
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
 DisplayName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
@@ -87,6 +87,14 @@ class CostCadence(str, Enum):
     per_shift = "PER_SHIFT"
     per_order = "PER_ORDER"
     per_month = "PER_MONTH"
+
+
+class CostUnitType(str, Enum):
+    investment = "INVESTMENT"
+    plan_day = "PLAN_DAY"
+    technician_shift = "TECHNICIAN_SHIFT"
+    work_order = "WORK_ORDER"
+    work_month = "WORK_MONTH"
 
 
 class LaborCostMode(str, Enum):
@@ -598,6 +606,9 @@ class PlanVersion(BaseModel):
     artifacts: list[ScheduleArtifact] = Field(default_factory=list)
     candidate_id: str | None = None
     scenario_snapshot_hash: str = ""
+    published_schedule_hash: str = ""
+    publication_verification_policy_version: str = ""
+    publication_verification_report_hash: str = ""
     source_plan_snapshot_hash: str | None = None
     coverage_status: PlanCoverageStatus = PlanCoverageStatus.current_and_complete
 
@@ -817,8 +828,15 @@ class SkillInvestmentTarget(BaseModel):
 
 
 class PlanCostBreakdown(BaseModel):
+    regular_labor_cost_cents: int = Field(default=0, ge=0)
+    overtime_base_cost_cents: int = Field(default=0, ge=0)
+    overtime_premium_cost_cents: int = Field(default=0, ge=0)
+    # Compatibility alias of regular_labor_cost_cents. In OCCUPIED_MINUTES
+    # mode this already contains the base wage for overtime minutes.
     labor_cost_cents: int = Field(ge=0)
     travel_cost_cents: int = Field(ge=0)
+    # Compatibility alias of overtime_premium_cost_cents; it never includes
+    # the overtime base wage.
     overtime_cost_cents: int = Field(ge=0)
     sla_penalty_cents: int = Field(ge=0)
     unserved_revenue_cents: int = Field(ge=0)
@@ -829,6 +847,17 @@ class PlanCostBreakdown(BaseModel):
     # Kept for clients created before the cost terminology was corrected.
     total_cost_cents: int = Field(ge=0)
     technician_cost_cents: dict[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_labor_components(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        migrated.setdefault("regular_labor_cost_cents", migrated.get("labor_cost_cents", 0))
+        migrated.setdefault("overtime_base_cost_cents", 0)
+        migrated.setdefault("overtime_premium_cost_cents", migrated.get("overtime_cost_cents", 0))
+        return migrated
 
 
 class CostAnalysis(BaseModel):
@@ -865,9 +894,10 @@ CapacityOptionId = Literal[
 ]
 
 
-class CapacityAnalysisRequest(BaseModel):
+class CapacityAnalysisParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     option_ids: list[CapacityOptionId] = Field(default_factory=list, max_length=6)
-    analysis_scope: DecisionAnalysisScope | None = None
     reference_mode: CapacityReferenceMode = CapacityReferenceMode.selected_plan_delta
     placement_mode: CapacityPlacementMode = CapacityPlacementMode.tail_append_only
     cost_policy: DecisionCostPolicy = Field(default_factory=DecisionCostPolicy)
@@ -889,10 +919,46 @@ class CapacityAnalysisRequest(BaseModel):
         return migrated
 
     @model_validator(mode="after")
-    def validate_options(self) -> CapacityAnalysisRequest:
+    def validate_options(self) -> CapacityAnalysisParameters:
         if len(set(self.option_ids)) != len(self.option_ids):
             raise ValueError("容量方案不能重复")
+        selected = self.option_ids or [
+            "add_technician",
+            "add_skill",
+            "extend_shift",
+            "allow_overtime",
+            "outsource_unserved",
+            "relocate_one_technician_start",
+        ]
+        cadence_by_option = {
+            "add_technician": self.capacity_policy.add_technician_cost_cadence,
+            "add_skill": self.capacity_policy.add_skill_cost_cadence,
+            "extend_shift": self.capacity_policy.extend_shift_cost_cadence,
+            "allow_overtime": self.capacity_policy.allow_overtime_cost_cadence,
+            "outsource_unserved": self.capacity_policy.outsource_unserved_cost_cadence,
+            "relocate_one_technician_start": self.capacity_policy.relocate_one_technician_start_cost_cadence,
+        }
+        allowed = {
+            "add_technician": {CostCadence.one_time, CostCadence.per_day, CostCadence.per_shift, CostCadence.per_month},
+            "add_skill": {CostCadence.one_time, CostCadence.per_order},
+            "extend_shift": {CostCadence.one_time, CostCadence.per_day, CostCadence.per_shift},
+            "allow_overtime": {CostCadence.one_time, CostCadence.per_day, CostCadence.per_shift},
+            "outsource_unserved": {CostCadence.one_time, CostCadence.per_day, CostCadence.per_order},
+            "relocate_one_technician_start": {
+                CostCadence.one_time,
+                CostCadence.per_day,
+                CostCadence.per_shift,
+                CostCadence.per_month,
+            },
+        }
+        invalid = [item for item in selected if cadence_by_option[item] not in allowed[item]]
+        if invalid:
+            raise ValueError(f"容量成本频率无法定义计量单位: {', '.join(invalid)}")
         return self
+
+
+class CapacityAnalysisRequest(CapacityAnalysisParameters):
+    analysis_scope: DecisionAnalysisScope | None = None
 
 
 class CapacityViolation(BaseModel):
@@ -919,25 +985,37 @@ class CapacityOptionResult(BaseModel):
     # Compatibility alias: true only when the option applies and the full
     # counterfactual schedule passes verification.
     feasible: bool
-    completion_rate: float = Field(ge=0, le=1)
-    sla_on_time_rate: float = Field(ge=0, le=1)
-    unassigned_count: int = Field(ge=0)
-    travel_minutes: int = Field(ge=0)
-    overtime_minutes: int = Field(ge=0)
-    completion_improvement_percentage_points: float
-    sla_improvement_percentage_points: float
-    unassigned_delta: int
-    travel_delta_minutes: int
-    overtime_delta_minutes: int
+    completion_rate: float | None = Field(default=None, ge=0, le=1)
+    sla_on_time_rate: float | None = Field(default=None, ge=0, le=1)
+    unassigned_count: int | None = Field(default=None, ge=0)
+    travel_minutes: int | None = Field(default=None, ge=0)
+    overtime_minutes: int | None = Field(default=None, ge=0)
+    completion_improvement_percentage_points: float | None = None
+    sla_improvement_percentage_points: float | None = None
+    unassigned_delta: int | None = None
+    travel_delta_minutes: int | None = None
+    overtime_delta_minutes: int | None = None
     fixed_capacity_cost_cents: int = Field(ge=0)
     fixed_cost_cadence: CostCadence = CostCadence.per_day
+    cost_unit_type: CostUnitType = CostUnitType.plan_day
+    cost_units_per_day: int = Field(default=1, ge=1)
+    affected_entity_ids: list[str] = Field(default_factory=list)
     one_time_investment_cents: int = Field(default=0, ge=0)
-    daily_operating_delta_cents: int = 0
-    horizon_total_impact_cents: int = 0
+    daily_operating_delta_cents: int | None = None
+    horizon_total_impact_cents: int | None = None
+    economic_impact_offset_days: float | None = Field(default=None, ge=0)
+    cash_payback_days: float | None = Field(default=None, ge=0)
+    # Compatibility alias of economic_impact_offset_days. It is not a cash
+    # payback claim.
     break_even_days: float | None = Field(default=None, ge=0)
-    marginal_cost_cents: int
-    projected_total_cost_cents: int = Field(ge=0)
+    marginal_cost_cents: int | None = None
+    projected_total_cost_cents: int | None = Field(default=None, ge=0)
     schedule_signature: str
+    diagnostic_metrics: dict[str, float | int] = Field(default_factory=dict)
+    diagnostic_schedule: ScheduleResult | None = None
+    verification_report: CapacityVerificationReport | None = None
+    route_diff: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_id: str | None = None
 
 
 class CapacityAnalysis(BaseModel):
@@ -972,8 +1050,9 @@ class CapacityAnalysis(BaseModel):
     options: list[CapacityOptionResult]
 
 
-class RiskSimulationRequest(BaseModel):
-    analysis_scope: DecisionAnalysisScope | None = None
+class RiskSimulationParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     seed: int | None = None
     trials: int = Field(default=500, ge=50, le=5_000)
     travel_delay_max_percent: int = Field(default=35, ge=0, le=300)
@@ -982,6 +1061,10 @@ class RiskSimulationRequest(BaseModel):
     emergency_order_basis_points: int = Field(default=1_200, ge=0, le=10_000)
     customer_no_show_basis_points: int = Field(default=400, ge=0, le=10_000)
     execution_policy: RiskExecutionPolicy = RiskExecutionPolicy.follow_published_schedule
+
+
+class RiskSimulationRequest(RiskSimulationParameters):
+    analysis_scope: DecisionAnalysisScope | None = None
 
 
 class RiskSimulationResult(BaseModel):
@@ -998,11 +1081,12 @@ class RiskSimulationResult(BaseModel):
     travel_model_fingerprint: str
     execution_policy: RiskExecutionPolicy
     execution_policy_version: str = "FIELD_SERVICE_RISK_EXECUTION_V2"
-    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V2"
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V3"
     analysis_code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
     simulation_input_hash: str
+    simulation_scenario_set_hash: str = "legacy-unknown"
     seed: int
     trials: int
     expected_sla_on_time_rate: float = Field(ge=0, le=1)
@@ -1022,6 +1106,14 @@ class RiskSimulationResult(BaseModel):
     no_show_disruption_probability: float = Field(default=0, ge=0, le=1)
     window_failure_probability: float = Field(default=0, ge=0, le=1)
     overtime_failure_probability: float = Field(default=0, ge=0, le=1)
+    emergency_event_probability: float = Field(default=0, ge=0, le=1)
+    emergency_caused_failure_probability: float = Field(default=0, ge=0, le=1)
+    emergency_failure_given_event_probability: float = Field(default=0, ge=0, le=1)
+    emergency_caused_window_failure_probability: float = Field(default=0, ge=0, le=1)
+    emergency_caused_overtime_probability: float = Field(default=0, ge=0, le=1)
+    emergency_caused_unserved_probability: float = Field(default=0, ge=0, le=1)
+    emergency_caused_sla_degradation_probability: float = Field(default=0, ge=0, le=1)
+    # Compatibility alias of emergency_caused_failure_probability.
     emergency_capacity_disruption_probability: float = Field(default=0, ge=0, le=1)
     baseline_unserved_orders: int = Field(ge=0)
     expected_total_unserved_orders: float = Field(ge=0)
@@ -1031,13 +1123,41 @@ class RiskSimulationResult(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
 
 
-class DecisionAnalysisRunRequest(BaseModel):
-    analysis_type: Literal["COST", "CAPACITY", "RISK"]
-    analysis_scope: DecisionAnalysisScope | None = None
-    analysis_horizon: AnalysisHorizon = Field(default_factory=AnalysisHorizon)
+class CostAnalysisParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     cost_policy: DecisionCostPolicy = Field(default_factory=DecisionCostPolicy)
-    capacity_request: CapacityAnalysisRequest = Field(default_factory=CapacityAnalysisRequest)
-    risk_request: RiskSimulationRequest = Field(default_factory=RiskSimulationRequest)
+    analysis_horizon: AnalysisHorizon = Field(default_factory=AnalysisHorizon)
+
+
+class CostDecisionAnalysisRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_type: Literal["COST"]
+    analysis_scope: DecisionAnalysisScope | None = None
+    request: CostAnalysisParameters = Field(default_factory=CostAnalysisParameters)
+
+
+class CapacityDecisionAnalysisRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_type: Literal["CAPACITY"]
+    analysis_scope: DecisionAnalysisScope | None = None
+    request: CapacityAnalysisParameters = Field(default_factory=CapacityAnalysisParameters)
+
+
+class RiskDecisionAnalysisRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_type: Literal["RISK"]
+    analysis_scope: DecisionAnalysisScope | None = None
+    request: RiskSimulationParameters = Field(default_factory=RiskSimulationParameters)
+
+
+DecisionAnalysisRunRequest = Annotated[
+    CostDecisionAnalysisRunRequest | CapacityDecisionAnalysisRunRequest | RiskDecisionAnalysisRunRequest,
+    Field(discriminator="analysis_type"),
+]
 
 
 class DecisionAnalysisContext(BaseModel):
@@ -1071,6 +1191,10 @@ class DecisionAnalysisRun(BaseModel):
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
     input_hash: str
+    request_snapshot: dict[str, Any] = Field(default_factory=dict)
+    logical_analysis_id: str = ""
+    retry_of_analysis_id: str | None = None
+    attempt_number: int = Field(default=1, ge=1)
     status: Literal["RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"] = "RUNNING"
     result: CostAnalysis | CapacityAnalysis | RiskSimulationResult | None = None
     error: dict[str, Any] | None = None
@@ -1085,7 +1209,22 @@ class DecisionAnalysisRun(BaseModel):
         migrated = dict(value)
         if "current_execution_watermark" not in migrated:
             migrated["current_execution_watermark"] = migrated.pop("execution_watermark", None) or 0
+        migrated.setdefault("request_snapshot", {})
+        migrated.setdefault("logical_analysis_id", migrated.get("id", ""))
+        migrated.setdefault("attempt_number", 1)
         return migrated
+
+
+class CapacityCounterfactualArtifact(BaseModel):
+    id: str
+    scenario_id: str
+    analysis_run_id: str
+    option_id: CapacityOptionId
+    schedule: ScheduleResult
+    verification_report: CapacityVerificationReport
+    route_diff: list[dict[str, Any]] = Field(default_factory=list)
+    changed_inputs: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
 
 
 class VerificationIssue(BaseModel):

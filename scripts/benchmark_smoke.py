@@ -120,13 +120,31 @@ assert risk.sla_rate_ci_low <= risk.expected_sla_on_time_rate <= risk.sla_rate_c
 
 delayed_plan = plan.model_copy(deep=True)
 assert delayed_plan.scenario_snapshot is not None
-delayed_assignment = delayed_plan.selected.assignments[0]
+delayed_assignment = next(item for item in delayed_plan.selected.assignments if item.work_order_id == "WO-1035")
 delayed_order = next(
     item for item in delayed_plan.scenario_snapshot.work_orders if item.id == delayed_assignment.work_order_id
 )
-delayed_assignment.start_time = delayed_order.sla_deadline
-delayed_assignment.finish_time = delayed_assignment.start_time + delayed_order.service_duration
+delayed_assignment.start_time += 20
+delayed_assignment.finish_time += 20
 delayed_assignment.sla_late_minutes = max(0, delayed_assignment.finish_time - delayed_order.sla_deadline)
+delayed_technician = next(
+    item for item in delayed_plan.scenario_snapshot.technicians if item.id == delayed_assignment.technician_id
+)
+delayed_route = sorted(
+    (item for item in delayed_plan.selected.assignments if item.technician_id == delayed_technician.id),
+    key=lambda item: item.sequence,
+)
+delayed_orders = {item.id: item for item in delayed_plan.scenario_snapshot.work_orders}
+provider = EuclideanTravelTimeProvider()
+start_index = delayed_route.index(delayed_assignment)
+for previous, current in zip(delayed_route[start_index:], delayed_route[start_index + 1 :], strict=False):
+    previous_order = delayed_orders[previous.work_order_id]
+    current_order = delayed_orders[current.work_order_id]
+    current.travel_minutes = provider.minutes(previous_order.location, current_order.location, previous.finish_time)
+    current.arrival_time = previous.finish_time + current.travel_minutes
+    current.start_time = max(current.start_time, current.arrival_time, current_order.window_start)
+    current.finish_time = current.start_time + current_order.service_duration
+    current.sla_late_minutes = max(0, current.finish_time - current_order.sla_deadline)
 delayed_plan.selected.kpis = calculate_kpis(
     delayed_plan.scenario_snapshot,
     delayed_plan.selected.assignments,

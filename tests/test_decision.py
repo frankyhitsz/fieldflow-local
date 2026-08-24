@@ -14,6 +14,7 @@ from backend.decision import (
     cost_analysis,
     schedule_signature,
     simulate_plan_risk,
+    validate_frozen_plan_integrity,
     verify_counterfactual_schedule,
 )
 from backend.fixtures import get_fixture
@@ -22,6 +23,8 @@ from backend.models import (
     AnalysisHorizon,
     CapacityAnalysisRequest,
     CapacityReferenceMode,
+    CapacityVerificationReport,
+    CapacityViolation,
     CostCadence,
     DecisionAnalysisContext,
     DecisionAnalysisScope,
@@ -66,17 +69,18 @@ def test_cost_model_uses_integer_cents_and_reconciles_total():
     assert scenario is not None
     breakdown = analyze_plan_cost(scenario, plan.selected)
     components = (
-        breakdown.labor_cost_cents,
+        breakdown.regular_labor_cost_cents,
+        breakdown.overtime_base_cost_cents,
+        breakdown.overtime_premium_cost_cents,
         breakdown.travel_cost_cents,
-        breakdown.overtime_cost_cents,
         breakdown.sla_penalty_cents,
         breakdown.unserved_revenue_cents,
         breakdown.outsourcing_cost_cents,
     )
     assert all(isinstance(item, int) and item >= 0 for item in components)
     assert breakdown.total_cost_cents == sum(components)
-    assert breakdown.cash_operating_cost_cents == sum(components[index] for index in (0, 1, 2, 5))
-    assert breakdown.service_failure_loss_cents == components[3] + components[4]
+    assert breakdown.cash_operating_cost_cents == sum(components[index] for index in (0, 1, 2, 3, 6))
+    assert breakdown.service_failure_loss_cents == components[4] + components[5]
     assert breakdown.total_economic_impact_cents == breakdown.total_cost_cents
     expected_labor = sum(
         kpi.occupied_minutes
@@ -84,6 +88,98 @@ def test_cost_model_uses_integer_cents_and_reconciles_total():
         for kpi in plan.selected.kpis.technician
     )
     assert breakdown.labor_cost_cents == expected_labor
+    assert breakdown.regular_labor_cost_cents == breakdown.labor_cost_cents
+    assert breakdown.overtime_premium_cost_cents == breakdown.overtime_cost_cents
+    assert breakdown.overtime_base_cost_cents == 0
+
+
+def test_occupied_minutes_overtime_base_is_already_in_labor():
+    plan = _plan()
+    result = analyze_plan_cost(
+        plan.scenario_snapshot,
+        plan.selected,
+        DecisionCostPolicy(labor_cost_mode=LaborCostMode.occupied_minutes),
+    )
+    assert plan.selected.kpis.total_overtime_minutes > 0
+    assert result.overtime_base_cost_cents == 0
+    assert result.regular_labor_cost_cents == result.labor_cost_cents
+    assert result.overtime_premium_cost_cents == result.overtime_cost_cents
+
+
+def test_paid_shift_includes_overtime_base_wage():
+    plan = _plan()
+    result = analyze_plan_cost(
+        plan.scenario_snapshot,
+        plan.selected,
+        DecisionCostPolicy(labor_cost_mode=LaborCostMode.paid_shift),
+    )
+    technicians = {item.id: item for item in plan.scenario_snapshot.technicians}
+    expected = sum(
+        item.overtime_minutes * technicians[item.technician_id].cost_per_minute_cents
+        for item in plan.selected.kpis.technician
+    )
+    assert expected > 0
+    assert result.overtime_base_cost_cents == expected
+
+
+def test_paid_shift_with_50_percent_premium_pays_150_percent_overtime():
+    plan = _plan()
+    result = analyze_plan_cost(
+        plan.scenario_snapshot,
+        plan.selected,
+        DecisionCostPolicy(
+            labor_cost_mode=LaborCostMode.paid_shift,
+            overtime_premium_basis_points=5_000,
+        ),
+    )
+    assert result.overtime_premium_cost_cents == result.overtime_base_cost_cents // 2
+    assert result.overtime_base_cost_cents + result.overtime_premium_cost_cents == (
+        result.overtime_base_cost_cents * 3 // 2
+    )
+
+
+def test_no_overtime_same_result_for_both_overtime_components():
+    plan = _plan()
+    without_overtime = plan.selected.model_copy(deep=True)
+    without_overtime.kpis.total_overtime_minutes = 0
+    for item in without_overtime.kpis.technician:
+        item.overtime_minutes = 0
+    for mode in (LaborCostMode.occupied_minutes, LaborCostMode.paid_shift):
+        result = analyze_plan_cost(
+            plan.scenario_snapshot,
+            without_overtime,
+            DecisionCostPolicy(labor_cost_mode=mode),
+        )
+        assert result.overtime_base_cost_cents == 0
+        assert result.overtime_premium_cost_cents == 0
+
+
+@pytest.mark.parametrize("mode", [LaborCostMode.occupied_minutes, LaborCostMode.paid_shift])
+def test_cash_operating_cost_reconciles_for_all_labor_modes(mode):
+    plan = _plan()
+    result = analyze_plan_cost(
+        plan.scenario_snapshot,
+        plan.selected,
+        DecisionCostPolicy(labor_cost_mode=mode),
+    )
+    assert result.cash_operating_cost_cents == (
+        result.regular_labor_cost_cents
+        + result.overtime_base_cost_cents
+        + result.overtime_premium_cost_cents
+        + result.travel_cost_cents
+        + result.outsourcing_cost_cents
+    )
+
+
+def test_salaried_allocation_remains_explicitly_unsupported():
+    plan = _plan()
+    with pytest.raises(DecisionAnalysisError) as caught:
+        analyze_plan_cost(
+            plan.scenario_snapshot,
+            plan.selected,
+            DecisionCostPolicy(labor_cost_mode=LaborCostMode.salaried_allocation),
+        )
+    assert caught.value.code == "LABOR_COST_MODE_NOT_SUPPORTED"
 
 
 def test_capacity_analysis_declares_reference_mode_and_selected_plan_signature():
@@ -244,6 +340,23 @@ def test_decision_schedule_hash_covers_kpi_travel_and_evidence():
     assert all(schedule_signature(item.selected) != original_signature for item in variants)
 
 
+def test_frozen_plan_integrity_detects_missing_coverage_even_without_legacy_schedule_hash():
+    plan = _plan()
+    plan.published_schedule_hash = ""
+    removed = plan.selected.assignments.pop()
+    plan.selected.kpis = calculate_kpis(
+        plan.scenario_snapshot,
+        plan.selected.assignments,
+        plan.selected.unassigned,
+    )
+    with pytest.raises(DecisionAnalysisError) as caught:
+        validate_frozen_plan_integrity(plan)
+    assert caught.value.code == "FROZEN_PLAN_INTEGRITY_FAILED"
+    assert removed.work_order_id in {
+        item["work_order_id"] for item in caught.value.details["violations"] if item["work_order_id"]
+    }
+
+
 def test_build_sha_is_part_of_canonical_decision_input_hash(monkeypatch):
     plan = _plan()
     provider = EuclideanTravelTimeProvider()
@@ -376,6 +489,8 @@ def test_risk_simulation_is_seeded_and_percentiles_are_monotonic():
     assert first.full_day_total_late_minutes_p95 == first.late_minutes_p95
     assert first.monte_carlo_mean_ci_low == first.sla_rate_ci_low
     assert first.monte_carlo_mean_ci_high == first.sla_rate_ci_high
+    assert first.emergency_capacity_disruption_probability == first.emergency_caused_failure_probability
+    assert first.emergency_caused_failure_probability <= first.emergency_event_probability
     for probability in (
         first.absence_disruption_probability,
         first.no_show_disruption_probability,
@@ -386,13 +501,179 @@ def test_risk_simulation_is_seeded_and_percentiles_are_monotonic():
         assert 0 <= probability <= 1
 
 
+def test_emergency_event_without_business_harm_is_not_a_disruption():
+    plan = _plan()
+    for technician in plan.scenario_snapshot.technicians:
+        technician.shift_start = 0
+        technician.shift_end = 1800
+        technician.overtime_limit = 240
+        first = min(
+            (item for item in plan.selected.assignments if item.technician_id == technician.id),
+            key=lambda item: item.sequence,
+            default=None,
+        )
+        if first:
+            order = next(item for item in plan.scenario_snapshot.work_orders if item.id == first.work_order_id)
+            first.travel_minutes = EuclideanTravelTimeProvider().minutes(
+                technician.start_location,
+                order.location,
+                technician.shift_start,
+            )
+            first.arrival_time = technician.shift_start + first.travel_minutes
+    plan.scenario_snapshot_hash = content_hash(plan.scenario_snapshot)
+    plan.selected.scenario_snapshot_hash = plan.scenario_snapshot_hash
+    plan.selected.kpis = calculate_kpis(
+        plan.scenario_snapshot,
+        plan.selected.assignments,
+        plan.selected.unassigned,
+    )
+    result = simulate_plan_risk(
+        plan,
+        RiskSimulationRequest(
+            seed=73,
+            trials=50,
+            travel_delay_max_percent=0,
+            service_duration_jitter_percent=0,
+            technician_absence_basis_points=0,
+            emergency_order_basis_points=10_000,
+            customer_no_show_basis_points=0,
+        ),
+    )
+    assert result.emergency_event_probability == 1
+    assert result.emergency_caused_failure_probability == 0
+    assert result.additional_disruption_probability == 0
+
+
+def test_two_plans_share_keyed_risk_scenario_set_for_paired_comparison():
+    first = _plan()
+    second = first.model_copy(deep=True)
+    second.id = "PV-risk-second"
+    second.number = 2
+    second.selected.assignments[0].evidence["comparison_note"] = "different frozen plan"
+    request = RiskSimulationRequest(seed=19, trials=50)
+    first_result = simulate_plan_risk(first, request)
+    second_result = simulate_plan_risk(second, request)
+    assert first_result.simulation_scenario_set_hash == second_result.simulation_scenario_set_hash
+    assert first_result.simulation_input_hash != second_result.simulation_input_hash
+
+
+def test_capacity_per_shift_cost_multiplies_affected_technicians_and_days():
+    plan = _plan()
+    result = capacity_analysis(
+        plan,
+        CapacityAnalysisRequest.model_validate(
+            {
+                "option_ids": ["extend_shift"],
+                "analysis_horizon": {"days": 5},
+                "capacity_policy": {
+                    "extend_shift_fixed_cost_cents": 1_000,
+                    "extend_shift_cost_cadence": "PER_SHIFT",
+                },
+            }
+        ),
+    ).options[0]
+    assert result.cost_unit_type.value == "TECHNICIAN_SHIFT"
+    assert result.cost_units_per_day == len(result.affected_entity_ids)
+    assert result.cost_units_per_day > 1
+    assert result.horizon_total_impact_cents == (
+        result.daily_operating_delta_cents * 5 + 1_000 * result.cost_units_per_day * 5
+    )
+
+
+def test_capacity_per_order_cost_uses_targeted_work_orders():
+    plan = _plan()
+    result = capacity_analysis(
+        plan,
+        CapacityAnalysisRequest.model_validate(
+            {
+                "option_ids": ["outsource_unserved"],
+                "analysis_horizon": {"days": 3},
+                "capacity_policy": {
+                    "outsource_unserved_fixed_cost_cents": 2_000,
+                    "outsource_unserved_cost_cadence": "PER_ORDER",
+                },
+            }
+        ),
+    ).options[0]
+    assert result.cost_unit_type.value == "WORK_ORDER"
+    assert result.cost_units_per_day == len(result.affected_entity_ids)
+    assert result.horizon_total_impact_cents == (
+        result.daily_operating_delta_cents * 3 + 2_000 * result.cost_units_per_day * 3
+    )
+
+
+def test_capacity_rejects_cadence_without_defined_units():
+    with pytest.raises(ValueError, match="计量单位"):
+        CapacityAnalysisRequest.model_validate(
+            {
+                "option_ids": ["add_skill"],
+                "capacity_policy": {"add_skill_cost_cadence": "PER_SHIFT"},
+            }
+        )
+
+
+def test_infeasible_capacity_option_has_only_diagnostic_metrics(monkeypatch):
+    report = CapacityVerificationReport(
+        valid=False,
+        violations=[CapacityViolation(code="FORCED_INVALID", message="强制验证失败")],
+    )
+    original = verify_counterfactual_schedule
+
+    def forced_invalid(*args, **kwargs):
+        if kwargs.get("allow_started_first"):
+            return original(*args, **kwargs)
+        return report
+
+    monkeypatch.setattr("backend.decision.verify_counterfactual_schedule", forced_invalid)
+    result = capacity_analysis(_plan(), CapacityAnalysisRequest(option_ids=["extend_shift"])).options[0]
+    assert result.feasible is False
+    assert result.completion_rate is None
+    assert result.daily_operating_delta_cents is None
+    assert result.horizon_total_impact_cents is None
+    assert result.economic_impact_offset_days is None
+    assert result.cash_payback_days is None
+    assert result.marginal_cost_cents is None
+    assert result.diagnostic_metrics["completion_rate"] >= 0
+    assert result.verification_report == report
+
+
+def test_cost_analysis_input_hash_changes_with_labor_mode():
+    occupied = cost_analysis(
+        _plan(),
+        policy=DecisionCostPolicy(labor_cost_mode=LaborCostMode.occupied_minutes),
+    )
+    paid = cost_analysis(
+        _plan(),
+        policy=DecisionCostPolicy(labor_cost_mode=LaborCostMode.paid_shift),
+    )
+    assert occupied.analysis_input_hash != paid.analysis_input_hash
+
+
 def test_risk_simulation_respects_published_start_time_and_explicit_earliest_mode():
     plan = _plan()
-    assignment = plan.selected.assignments[0]
+    assignment = next(item for item in plan.selected.assignments if item.work_order_id == "WO-1035")
+    assignment.start_time += 20
+    assignment.finish_time += 20
     order = next(item for item in plan.scenario_snapshot.work_orders if item.id == assignment.work_order_id)
-    assignment.start_time = order.sla_deadline
-    assignment.finish_time = assignment.start_time + order.service_duration
     assignment.sla_late_minutes = max(0, assignment.finish_time - order.sla_deadline)
+    technician = next(item for item in plan.scenario_snapshot.technicians if item.id == assignment.technician_id)
+    route = sorted(
+        (item for item in plan.selected.assignments if item.technician_id == technician.id),
+        key=lambda item: item.sequence,
+    )
+    orders = {item.id: item for item in plan.scenario_snapshot.work_orders}
+    for previous, current in zip(route[route.index(assignment) :], route[route.index(assignment) + 1 :], strict=False):
+        current_order = orders[current.work_order_id]
+        previous_order = orders[previous.work_order_id]
+        current.travel_minutes = EuclideanTravelTimeProvider().minutes(
+            previous_order.location,
+            current_order.location,
+            previous.finish_time,
+        )
+        current.arrival_time = previous.finish_time + current.travel_minutes
+        current.start_time = max(current.start_time, current.arrival_time, current_order.window_start)
+        current.finish_time = current.start_time + current_order.service_duration
+        current.sla_late_minutes = max(0, current.finish_time - current_order.sla_deadline)
     plan.selected.kpis = calculate_kpis(
         plan.scenario_snapshot,
         plan.selected.assignments,
@@ -455,6 +736,39 @@ def test_decision_endpoints_use_frozen_plan_without_consuming_versions(monkeypat
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
 
 
+def test_published_plan_integrity_is_attested_and_checked_by_analysis_report_and_activation(monkeypatch, tmp_path):
+    database = tmp_path / "published-integrity.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        plan = client.get("/api/scenarios/main/plan-versions").json()[0]
+        assert plan["published_schedule_hash"]
+        assert plan["publication_verification_policy_version"] == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V1"
+        assert plan["publication_verification_report_hash"]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = json.loads(
+                connection.execute("SELECT payload FROM plan_versions WHERE id=?", (plan["id"],)).fetchone()[0]
+            )
+            payload["selected"]["assignments"][0]["evidence"]["tampered_note"] = "changed after publication"
+            connection.execute(
+                "UPDATE plan_versions SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), plan["id"]),
+            )
+        cost = client.get(f"/api/scenarios/main/plan-versions/{plan['id']}/cost-analysis")
+        report = client.get(f"/api/scenarios/main/plan-versions/{plan['id']}/report")
+        activation = client.post(
+            f"/api/scenarios/main/plan-versions/{plan['id']}/activate",
+            json={"expected_revision": 0, "idempotency_key": "integrity-activation-001"},
+        )
+        assert cost.status_code == report.status_code == activation.status_code == 409
+        assert {response.json()["detail"]["code"] for response in (cost, report, activation)} == {
+            "PUBLISHED_SCHEDULE_HASH_MISMATCH"
+        }
+
+
 def test_decision_analysis_runs_are_persisted_deduplicated_and_separately_numbered(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "decision-runs.db"))
     import backend.main as main_module
@@ -469,21 +783,25 @@ def test_decision_analysis_runs_are_persisted_deduplicated_and_separately_number
         cost_replay = client.post(endpoint, json={"analysis_type": "COST"})
         risk = client.post(
             endpoint,
-            json={"analysis_type": "RISK", "risk_request": {"seed": 7, "trials": 50}},
+            json={"analysis_type": "RISK", "request": {"seed": 7, "trials": 50}},
         )
         selected_capacity = client.post(endpoint, json={"analysis_type": "CAPACITY"})
         controlled_capacity = client.post(
             endpoint,
             json={
                 "analysis_type": "CAPACITY",
-                "capacity_request": {"reference_mode": "CONTROLLED_REOPTIMIZATION"},
+                "request": {"reference_mode": "CONTROLLED_REOPTIMIZATION"},
             },
         )
 
-        assert all(
-            response.status_code == 201
-            for response in (cost, cost_replay, risk, selected_capacity, controlled_capacity)
+        assert (
+            cost.status_code
+            == risk.status_code
+            == selected_capacity.status_code
+            == controlled_capacity.status_code
+            == 201
         )
+        assert cost_replay.status_code == 200
         assert cost_replay.json()["id"] == cost.json()["id"]
         assert cost_replay.json()["number"] == 1
         assert [risk.json()["number"], selected_capacity.json()["number"], controlled_capacity.json()["number"]] == [
@@ -522,13 +840,106 @@ def test_failed_decision_analysis_is_persisted_and_deduplicated(monkeypatch, tmp
         endpoint = f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs"
         first = client.post(endpoint, json={"analysis_type": "COST"})
         replay = client.post(endpoint, json={"analysis_type": "COST"})
-        assert first.status_code == replay.status_code == 201
+        assert first.status_code == 201
+        assert replay.status_code == 409
+        assert replay.json()["detail"]["code"] == "ANALYSIS_EXPLICIT_RETRY_REQUIRED"
         assert first.json()["status"] == "FAILED"
         assert first.json()["error"]["code"] == "SCHEDULE_KPI_INTEGRITY_FAILED"
-        assert replay.json()["id"] == first.json()["id"]
+        assert replay.json()["detail"]["analysis_id"] == first.json()["id"]
         assert [item["number"] for item in client.get(endpoint).json()] == [1]
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
         assert client.get("/api/scenarios/main").json()["revision"] == 0
+
+        retry = client.post(f"/api/scenarios/main/analysis-runs/{first.json()['id']}/retry")
+        assert retry.status_code == 201
+        retry_body = retry.json()
+        assert retry_body["id"] != first.json()["id"]
+        assert retry_body["retry_of_analysis_id"] == first.json()["id"]
+        assert retry_body["logical_analysis_id"] == first.json()["logical_analysis_id"]
+        assert retry_body["attempt_number"] == 2
+        assert retry_body["status"] == "FAILED"
+        assert client.get(endpoint).json()[0]["status"] == "FAILED"
+
+
+def test_analysis_run_request_is_discriminated_and_rejects_silent_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "decision-discriminator.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        endpoint = f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs"
+        invalid = client.post(
+            endpoint,
+            json={
+                "analysis_type": "COST",
+                "request": {"analysis_horizon": {"days": 2}},
+                "risk_request": {"trials": 50},
+            },
+        )
+        assert invalid.status_code == 422
+        valid = client.post(
+            endpoint,
+            json={"analysis_type": "COST", "request": {"analysis_horizon": {"days": 2}}},
+        )
+        assert valid.status_code == 201
+        assert valid.json()["result"]["analysis_horizon"]["days"] == 2
+
+
+def test_analysis_run_replay_status_codes_are_truthful(monkeypatch, tmp_path):
+    database = tmp_path / "decision-status.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        endpoint = f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs"
+        completed = client.post(endpoint, json={"analysis_type": "COST"})
+        assert completed.status_code == 201
+        assert client.post(endpoint, json={"analysis_type": "COST"}).status_code == 200
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = completed.json()
+            payload["status"] = "RUNNING"
+            payload["result"] = None
+            payload["finished_at"] = None
+            connection.execute(
+                "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), payload["id"]),
+            )
+        replay = client.post(endpoint, json={"analysis_type": "COST"})
+        assert replay.status_code == 202
+        assert replay.json()["status"] == "RUNNING"
+
+
+def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "decision-artifacts.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        run = client.post(
+            f"/api/scenarios/main/plan-versions/{version['id']}/analysis-runs",
+            json={"analysis_type": "CAPACITY"},
+        )
+        assert run.status_code == 201
+        body = run.json()
+        assert body["status"] == "COMPLETED"
+        assert all(option["artifact_id"] for option in body["result"]["options"])
+        assert all(option["diagnostic_schedule"] is None for option in body["result"]["options"])
+        artifacts = client.get(f"/api/scenarios/main/analysis-runs/{body['id']}/artifacts")
+        assert artifacts.status_code == 200
+        assert len(artifacts.json()) == 6
+        artifact = artifacts.json()[0]
+        assert artifact["schedule"]["assignments"] is not None
+        assert artifact["verification_report"]["violations"] is not None
+        detail = client.get(f"/api/scenarios/main/analysis-runs/{body['id']}/artifacts/{artifact['id']}")
+        assert detail.status_code == 200
+        assert detail.json() == artifact
 
 
 def test_direct_decision_endpoints_are_deprecated_in_openapi(monkeypatch, tmp_path):
@@ -676,7 +1087,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -694,3 +1105,40 @@ def test_legacy_technician_cost_input_remains_compatible():
     update = TechnicianUpdate.model_validate({"cost_per_minute": 2.25})
     assert technician.cost_per_minute_cents == 175
     assert update.cost_per_minute_cents == 225
+
+
+def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp_path):
+    database = tmp_path / "analysis-attempt-migration.db"
+    Store(database)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("DROP TABLE decision_analysis_artifacts")
+        connection.execute("DROP TABLE decision_analysis_runs")
+        connection.execute(
+            """
+            CREATE TABLE decision_analysis_runs (
+                id TEXT PRIMARY KEY,
+                scenario_id TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                plan_version_id TEXT NOT NULL,
+                analysis_type TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(scenario_id, number),
+                UNIQUE(plan_version_id, analysis_type, input_hash)
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version=14")
+
+    Store(database)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_analysis_runs'"
+        ).fetchone()[0]
+        assert "UNIQUE(plan_version_id, analysis_type, input_hash)" not in table_sql
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
+        ).fetchone()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16

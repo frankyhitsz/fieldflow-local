@@ -4,62 +4,54 @@
 
 ## 本轮目标
 
-复核新版 `pro-plan.md`，完成 v0.5.2 的经营分析可信性工作包，记录需要后续领域模型或仓库治理授权的项目；经过三轮独立审计、整套本地验证和 Linux CI 后提交。
+完成 `pro-plan.md` 的 v0.5.3 决策正确性工作包 FF-1001～FF-1010。修复必须覆盖模型、迁移、接口、界面和故障注入；经过三轮独立审计与整套验证后再提交。
 
-## 第一轮：分析语义与反事实正确性
+## 第一轮：数字口径与反事实证据
 
-- [x] 以 `EX_ANTE_FROZEN_PLAN` 替代含糊的 `FULL_DAY_PLAN`；执行后必须显式选择，并持久化水位、时点和执行上下文。
-- [x] 为未实现的 actual、remaining forecast 和 combined 范围返回稳定错误。
-- [x] 完整哈希权威 Schedule；校验场景、排程快照、政策、旅行模型、服务时长、SLA 和重算 KPI。
-- [x] 保存算法版本和 build SHA，CI 使用提交 SHA，本地使用后端源码哈希。
-- [x] 容量尾部追加计算真实 Depot 返程，并用独立 Verifier 复核完整反事实。
-- [x] 修复不适用容量选项仍计固定投入的边界错误。
+- [x] 拆分正常人工、加班基础工资和加班溢价，修正 `PAID_SHIFT` 少算加班基础工资的问题。
+- [x] 对 `OCCUPIED_MINUTES`、`PAID_SHIFT` 和随机整数政策验证现金成本恒等式；`SALARIED_ALLOCATION` 继续稳定拒绝。
+- [x] 容量成本增加单位类型、每日单位数和受影响实体；修正 `PER_SHIFT` 未乘技师数量的问题，拒绝无定义单位的 cadence。
+- [x] 不可执行容量方案的正式 KPI、周期影响和抵消天数改为 null，仅保留诊断指标和违规。
+- [x] 合成技师使用确定性保留 ID 并检查冲突；反事实场景重新走 Pydantic 聚合校验。
+- [x] 突发事件发生与实际致损分开统计；共同随机量按 seed、trial、事件和实体派生并保存场景集哈希。
 
-## 第二轮：恢复、成本与页面流程
+## 第二轮：A-run、冻结计划和 Saga
 
-- [x] 人工改派增加 `LOCK_COMMITTED`、`REPLAN_CREATED`、`PLAN_PUBLISHED` 阶段和稳定 Run ID。
-- [x] 在三个持久阶段注入进程终止；重启后 Lock、D、Run、V 不重复，不同请求复用键返回 409。
-- [x] A 运行增加 `RUNNING / COMPLETED / FAILED / INTERRUPTED`，失败结果可审计并按完整输入去重。
-- [x] 新增分析周期、成本频率、人工模式、一次性投入、日运营变化、周期影响和盈亏平衡字段。
-- [x] 新技师改为显式或保守 archetype；补技能绑定可解锁的未服务需求；尾部追加能力在接口和页面明确命名。
-- [x] 风险指标拆分 Monte Carlo 均值抽样区间、全日总迟到分位和五类扰动概率。
-- [x] 运营复盘首屏只 GET 已有 A；显式按钮才创建，成本与风险部分成功不互相遮蔽。
-- [x] 三个同步分析接口标记 deprecated；正式 UI 仅使用 A-run。
+- [x] A-run 请求改为 COST/CAPACITY/RISK 判别联合，重复或无关参数返回 422，不再静默覆盖。
+- [x] 新分析返回 201、运行中复用返回 202、终态复用返回 200。
+- [x] 失败或中断 A 可显式 retry；新 attempt 保存 logical ID、来源 A、attempt 序号和原始请求，原记录不改写。
+- [x] 容量 A 的每个选项保存规范化路线、完整校验报告、路线差异和输入变化 Artifact，并提供列表和详情接口。
+- [x] 新 V 保存发布排程哈希、校验政策和报告哈希；分析、报告和历史激活共用冻结计划完整性检查。
+- [x] 人工改派锁定后数据变化进入不可覆盖的 `FAILED_CONTEXT_CHANGED`；同 key 稳定重放，新 key 可重新发起。
+- [x] Schema 升至 v16，移除阻止 retry 的输入唯一约束并增加反事实 Artifact 表；旧库迁移前保留时间戳备份。
 
-## 第三轮：属性、兼容和交付审计
+## 第三轮：界面、边界与交付审计
 
-- [x] 增加 KPI/旅行/证据/build SHA 哈希、损坏方案、成本周期、付费班次和风险标签测试。
-- [x] 增加随机加班容量、完整可行性与一次性成本周期属性测试。
-- [x] Schema 升至 v14，v1–v13 迁移矩阵和备份路径断言同步更新。
-- [x] OpenAPI 快照、前端类型、README、架构、指标、逐项复核和 Changelog 更新到 v0.5.2。
-- [x] Benchmark smoke 改用完整排程一致性校验，并检查容量违规和风险新字段；仍明确不称正式性能 Benchmark。
-- [x] 本机可运行门禁与 Linux CI 合并覆盖完整 `make verify`；本机受网络/浏览器沙箱阻止的两项已由 CI 通过。
-- [x] 代码提交 `6c7110c` 已推送；Actions `32722664748` 的 `python-compat` 与 `fieldflow` 均通过。
+- [x] 运营复盘分列正常人工、加班基础工资和溢价；突发事件与实际致损使用不同标签。
+- [x] 不可执行容量行用 `—` 隐藏正式数字，可展开全部违规；“回本”改为“经济影响抵消天数”。
+- [x] 失败和中断 A 在页面提供显式重试按钮，并说明原记录会保留。
+- [x] 补充成本、容量单位、无效方案、共同随机场景、冻结损坏、状态码、retry、Artifact 和 Saga 终态测试。
+- [x] 更新 OpenAPI 快照并完成 Ruff、Pyright、TypeScript、后端、React、构建、Demo、Benchmark 和依赖审计；Playwright API 流程通过，本机 Chromium 其余用例受系统 SIGTRAP 阻止，等待 Linux CI 补证。
+- [ ] 提交、推送并确认 GitHub Actions 最新提交全部通过。
 
-## 明确保留的后续范围
+## 后续版本范围
 
-- [ ] 实际已发生成本、剩余预测和 actual-plus-forecast 需要正式执行投影。
-- [ ] A/Run 的独立 worker、取消、进度和 Outbox 属于 v0.6.0 运行时。
-- [ ] 单一 D 拆分、稳定 Location ID、显式迁移 CLI、PlanVersion 兼容字段清理和生成式 OpenAPI 客户端需要版本化迁移。
-- [ ] 固定承诺间隙插入、组合容量、敏感性、风险校准、Booking、收件箱、资产、周期维护、库存和 Crew 需要新领域数据与验收。
-- [ ] Python 传递依赖统一锁文件需要选定跨平台锁定工具；不以本机 `pip freeze` 代替。
-- [ ] LICENSE 和 GitHub 分支保护等待所有者选择与额外治理授权。
+- [ ] v0.6.0：持久 Job Queue、Outbox、进度、取消、启动对账和显式迁移 CLI。
+- [ ] v0.7.0：Booking、调度收件箱、技师端流程、资产、周期维护、库存和 Crew。
+- [ ] v0.8.0：incurred/remaining/combined 分析、组合容量、敏感性、风险校准和多日模型。
+- [ ] v1.0.0：正式 Benchmark、依赖锁、许可证选择和 GitHub 分支治理。
 
 ## 当前验证
 
 ```text
 make lint                         通过
-React 组件                        8 passed
-生产构建                          通过
-后端与接口                        156 passed，coverage 88.92%
-决策/属性/并发改派最终专项         35 passed
-人工改派三阶段故障注入            3 passed
-Playwright API 生命周期           1 passed
-Demo check                       通过
-Benchmark smoke                  通过
+Python 依赖审计                  无已知漏洞
 npm production audit             0 vulnerabilities
-pip-audit                        本机两次连接 PyPI 被重置；Linux CI success
-Playwright 页面流程              本机 Chromium 受沙箱 SIGTRAP 阻止；Linux CI 5 tests success
-GitHub Actions 32722664748       python-compat success；fieldflow success
-Linux 在线补证                   pip-audit success；Playwright 5 tests success
+后端、接口与属性测试              179 passed；coverage 89.31%
+React 组件                        10 passed
+生产构建                          通过
+Demo check                       通过
+Benchmark smoke                  通过（严格完整性检查暴露的无效延迟 Fixture 已修正）
+Playwright API 生命周期           1 passed
+Playwright 浏览器页面             本机 Chromium 启动后被系统 SIGTRAP 终止；非断言失败，等待 Linux CI
 ```

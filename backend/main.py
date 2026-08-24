@@ -17,6 +17,7 @@ from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, R
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import TypeAdapter
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ._version import __version__
@@ -27,6 +28,7 @@ from .decision import (
     cost_analysis,
     schedule_signature,
     simulate_plan_risk,
+    validate_frozen_plan_integrity,
 )
 from .execution import execution_context_for_planning
 from .fixtures import get_fixture
@@ -35,6 +37,7 @@ from .models import (
     ActivatePlanRequest,
     CapacityAnalysis,
     CapacityAnalysisRequest,
+    CapacityCounterfactualArtifact,
     CloneScenarioRequest,
     Comparison,
     CostAnalysis,
@@ -1005,7 +1008,7 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
         raise HTTPException(409, str(error)) from error
     if existing and existing["status"] in {"COMPLETED", "FAILED_AFTER_LOCK"}:
         return ManualReassignmentResult.model_validate(existing["payload"]["result"])
-    if existing and existing["status"] == "FAILED":
+    if existing and existing["status"] in {"FAILED", "FAILED_CONTEXT_CHANGED"}:
         payload = existing["payload"]
         raise HTTPException(int(payload.get("http_status", 409)), detail=payload.get("detail", payload))
     if not existing:
@@ -1139,14 +1142,31 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
             for item in current.locked_assignments
         )
         if not exact_lock or current.revision != lock_revision:
+            detail = {
+                "code": "MANUAL_REASSIGNMENT_CONTEXT_CHANGED",
+                "message": "锁定提交后的业务数据又发生变化，不能静默恢复原重排",
+                "lock_revision": lock_revision,
+                "current_revision": current.revision,
+            }
+            require_store().update_command_record(
+                namespace,
+                request.idempotency_key,
+                fingerprint,
+                status="FAILED_CONTEXT_CHANGED",
+                resource_type="work_order",
+                resource_id=request.work_order_id,
+                publication_key=publication_key,
+                payload={
+                    **payload,
+                    "phase": "FAILED_CONTEXT_CHANGED",
+                    "http_status": 409,
+                    "detail": detail,
+                    "failed_at": _now(),
+                },
+            )
             raise HTTPException(
                 409,
-                detail={
-                    "code": "MANUAL_REASSIGNMENT_CONTEXT_CHANGED",
-                    "message": "锁定提交后的业务数据又发生变化，不能静默恢复原重排",
-                    "lock_revision": lock_revision,
-                    "current_revision": current.revision,
-                },
+                detail=detail,
             )
         if not payload.get("run_id") or not payload.get("run_started_at"):
             payload.update(
@@ -1858,6 +1878,13 @@ def raise_decision_analysis_http(error: DecisionAnalysisError) -> NoReturn:
     ) from error
 
 
+def require_frozen_plan_integrity(plan: PlanVersion) -> None:
+    try:
+        validate_frozen_plan_integrity(plan, require_store().travel_provider)
+    except DecisionAnalysisError as error:
+        raise_decision_analysis_http(error)
+
+
 @router.get(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/cost-analysis",
     response_model=CostAnalysis,
@@ -1931,45 +1958,64 @@ def post_risk_simulation(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/analysis-runs",
     response_model=DecisionAnalysisRun,
     status_code=201,
+    responses={
+        200: {"description": "已完成分析的幂等重放"},
+        202: {"description": "相同输入的分析仍在运行"},
+        409: {"description": "失败或中断记录需要显式重试，或冻结输入冲突"},
+    },
 )
 def create_decision_analysis_run(
     scenario_id: str,
     version_id: str,
     request: DecisionAnalysisRunRequest,
+    response: Response,
 ) -> DecisionAnalysisRun:
     require_scenario(scenario_id)
     plan = require_store().get_plan_version(scenario_id, version_id)
     if not plan:
         raise HTTPException(404, "方案版本不存在")
+    return execute_decision_analysis_run(scenario_id, plan, request, response)
+
+
+def execute_decision_analysis_run(
+    scenario_id: str,
+    plan: PlanVersion,
+    request: DecisionAnalysisRunRequest,
+    response: Response,
+    *,
+    retry_of: DecisionAnalysisRun | None = None,
+) -> DecisionAnalysisRun:
     context = resolve_decision_analysis_context(scenario_id, plan, request.analysis_scope)
     provider = require_store().travel_provider
-    capacity_request = request.capacity_request.model_copy(
-        update={
-            "analysis_scope": context.analysis_scope,
-            "analysis_horizon": request.analysis_horizon,
-        }
-    )
-    risk_request = request.risk_request.model_copy(update={"analysis_scope": context.analysis_scope})
     if request.analysis_type == "COST":
+        cost_parameters = request.request
         authoritative_request: object = {
-            "policy": request.cost_policy,
-            "analysis_horizon": request.analysis_horizon,
+            "policy": cost_parameters.cost_policy,
+            "analysis_horizon": cost_parameters.analysis_horizon,
         }
-        policy_version = request.cost_policy.policy_version
+        policy_version = cost_parameters.cost_policy.policy_version
         policy_snapshot = {
-            "cost_policy": request.cost_policy.model_dump(mode="json"),
-            "analysis_horizon": request.analysis_horizon.model_dump(mode="json"),
+            "cost_policy": cost_parameters.cost_policy.model_dump(mode="json"),
+            "analysis_horizon": cost_parameters.analysis_horizon.model_dump(mode="json"),
         }
     elif request.analysis_type == "CAPACITY":
+        capacity_parameters = request.request
+        capacity_request = CapacityAnalysisRequest.model_validate(
+            {**capacity_parameters.model_dump(mode="json"), "analysis_scope": context.analysis_scope}
+        )
         authoritative_request = capacity_request
         policy_version = capacity_request.capacity_policy.policy_version
         policy_snapshot = capacity_request.model_dump(mode="json")
     else:
+        risk_parameters = request.request
+        risk_request = RiskSimulationRequest.model_validate(
+            {**risk_parameters.model_dump(mode="json"), "analysis_scope": context.analysis_scope}
+        )
         resolved_seed = (
             plan.scenario_snapshot.seed if risk_request.seed is None and plan.scenario_snapshot else risk_request.seed
         )
         authoritative_request = {"request": risk_request, "resolved_seed": resolved_seed}
-        policy_version = "FIELD_SERVICE_SIMULATION_V2"
+        policy_version = "FIELD_SERVICE_SIMULATION_V3"
         policy_snapshot = risk_request.model_dump(mode="json")
     input_hash = canonical_decision_input_hash(
         plan,
@@ -2001,25 +2047,68 @@ def create_decision_analysis_run(
             algorithm_version=DECISION_ALGORITHM_VERSION,
             build_sha=decision_build_sha(),
             input_hash=input_hash,
+            request_snapshot=request.model_dump(mode="json"),
+            logical_analysis_id=retry_of.logical_analysis_id if retry_of else "",
+            retry_of_analysis_id=retry_of.id if retry_of else None,
+            attempt_number=(retry_of.attempt_number + 1) if retry_of else 1,
             status="RUNNING",
             created_at=_now(),
-        )
+        ),
+        force_new=retry_of is not None,
     )
+    if created:
+        response.status_code = status.HTTP_201_CREATED
+    elif reserved.status == "RUNNING":
+        response.status_code = status.HTTP_202_ACCEPTED
+    elif reserved.status in {"FAILED", "INTERRUPTED"}:
+        raise HTTPException(
+            409,
+            {
+                "code": "ANALYSIS_EXPLICIT_RETRY_REQUIRED",
+                "message": "相同输入已有失败或中断记录；请显式重试并保留原 A 记录",
+                "analysis_id": reserved.id,
+                "analysis_number": reserved.number,
+                "analysis_status": reserved.status,
+                "retry_endpoint": f"/api/scenarios/{scenario_id}/analysis-runs/{reserved.id}/retry",
+            },
+        )
+    else:
+        response.status_code = status.HTTP_200_OK
     if not created or reserved.status != "RUNNING":
         return reserved
+    artifacts: list[CapacityCounterfactualArtifact] = []
     try:
         if request.analysis_type == "COST":
             result = cost_analysis(
                 plan,
-                request.cost_policy,
+                cost_parameters.cost_policy,
                 provider,
                 context=context,
-                horizon=request.analysis_horizon,
+                horizon=cost_parameters.analysis_horizon,
             )
             result_hash = result.analysis_input_hash
         elif request.analysis_type == "CAPACITY":
             result = capacity_analysis(plan, capacity_request, provider, context=context)
             result_hash = result.analysis_input_hash
+            for option in result.options:
+                if option.diagnostic_schedule is None or option.verification_report is None:
+                    continue
+                artifact = CapacityCounterfactualArtifact(
+                    id=f"DAA-{reserved.id}-{option.option_id}",
+                    scenario_id=scenario_id,
+                    analysis_run_id=reserved.id,
+                    option_id=option.option_id,
+                    schedule=option.diagnostic_schedule,
+                    verification_report=option.verification_report,
+                    route_diff=option.route_diff,
+                    changed_inputs=option.changed_inputs,
+                    created_at=_now(),
+                )
+                artifacts.append(artifact)
+                option.artifact_id = artifact.id
+                option.diagnostic_schedule = None
+                option.verification_report = None
+                option.route_diff = []
         else:
             result = simulate_plan_risk(plan, risk_request, provider, context=context)
             result_hash = result.simulation_input_hash
@@ -2048,7 +2137,41 @@ def create_decision_analysis_run(
     completed.status = "COMPLETED"
     completed.result = result
     completed.finished_at = _now()
-    return require_store().finish_decision_analysis_run(completed)
+    return require_store().finish_decision_analysis_run(completed, artifacts=artifacts)
+
+
+@router.post(
+    "/api/scenarios/{scenario_id}/analysis-runs/{analysis_id}/retry",
+    response_model=DecisionAnalysisRun,
+    status_code=201,
+)
+def retry_decision_analysis_run(
+    scenario_id: str,
+    analysis_id: str,
+    response: Response,
+) -> DecisionAnalysisRun:
+    original = require_store().get_decision_analysis_run(scenario_id, analysis_id)
+    if not original:
+        raise HTTPException(404, "经营分析记录不存在")
+    if original.status not in {"FAILED", "INTERRUPTED"}:
+        raise HTTPException(
+            409,
+            {
+                "code": "ANALYSIS_RETRY_NOT_ALLOWED",
+                "message": "只有失败或中断的经营分析可以显式重试",
+                "analysis_status": original.status,
+            },
+        )
+    if not original.request_snapshot:
+        raise HTTPException(
+            409,
+            {"code": "ANALYSIS_REQUEST_SNAPSHOT_MISSING", "message": "旧分析缺少请求快照，无法安全重试"},
+        )
+    plan = require_store().get_plan_version(scenario_id, original.plan_version_id)
+    if not plan:
+        raise HTTPException(409, {"code": "ANALYSIS_PLAN_MISSING", "message": "原分析引用的方案已不存在"})
+    request = TypeAdapter(DecisionAnalysisRunRequest).validate_python(original.request_snapshot)
+    return execute_decision_analysis_run(scenario_id, plan, request, response, retry_of=original)
 
 
 @router.get(
@@ -2071,6 +2194,38 @@ def get_decision_analysis_run(scenario_id: str, analysis_id: str) -> DecisionAna
     if not run:
         raise HTTPException(404, "经营分析记录不存在")
     return run
+
+
+@router.get(
+    "/api/scenarios/{scenario_id}/analysis-runs/{analysis_id}/artifacts",
+    response_model=list[CapacityCounterfactualArtifact],
+)
+def list_decision_analysis_artifacts(
+    scenario_id: str,
+    analysis_id: str,
+) -> list[CapacityCounterfactualArtifact]:
+    run = require_store().get_decision_analysis_run(scenario_id, analysis_id)
+    if not run:
+        raise HTTPException(404, "经营分析记录不存在")
+    return require_store().list_decision_analysis_artifacts(scenario_id, run.id)
+
+
+@router.get(
+    "/api/scenarios/{scenario_id}/analysis-runs/{analysis_id}/artifacts/{artifact_id}",
+    response_model=CapacityCounterfactualArtifact,
+)
+def get_decision_analysis_artifact(
+    scenario_id: str,
+    analysis_id: str,
+    artifact_id: str,
+) -> CapacityCounterfactualArtifact:
+    run = require_store().get_decision_analysis_run(scenario_id, analysis_id)
+    if not run:
+        raise HTTPException(404, "经营分析记录不存在")
+    artifact = require_store().get_decision_analysis_artifact(scenario_id, run.id, artifact_id)
+    if not artifact:
+        raise HTTPException(404, "容量反事实证据不存在")
+    return artifact
 
 
 def schedule_change_rows(
@@ -2219,6 +2374,7 @@ def activate_plan_version(
     source = require_store().get_plan_version(scenario_id, version_id)
     if not source or not source.scenario_snapshot:
         raise HTTPException(404, "方案版本或业务快照不存在")
+    require_frozen_plan_integrity(source)
     current_fingerprint = content_hash(current.model_dump(exclude={"revision"}))
     source_fingerprint = content_hash(source.scenario_snapshot.model_dump(exclude={"revision"}))
     if current_fingerprint != source_fingerprint:
@@ -3061,6 +3217,7 @@ def version_report(scenario_id: str, version_id: str) -> HTMLResponse:
     plan = require_store().get_plan_version(scenario_id, version_id)
     if not plan or not plan.scenario_snapshot:
         raise HTTPException(404, "方案报告不存在")
+    require_frozen_plan_integrity(plan)
     safe_scenario_id = safe_filename_component(scenario_id)
     return HTMLResponse(
         build_report(plan.scenario_snapshot, plan.selected),
@@ -3086,6 +3243,8 @@ def report(scenario_id: str, schedule_id: str | None = None) -> HTMLResponse:
         result = plan.selected if plan else None
     if not result or result.scenario_id != scenario_id:
         raise HTTPException(404, "当前没有可导出的方案")
+    if plan:
+        require_frozen_plan_integrity(plan)
     snapshot = plan.scenario_snapshot if plan and plan.scenario_snapshot else scenario
     safe_scenario_id = safe_filename_component(scenario_id)
     return HTMLResponse(
