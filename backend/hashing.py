@@ -10,9 +10,15 @@ from pydantic import BaseModel
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
+        return _jsonable(value.model_dump(mode="json"))
     if isinstance(value, Enum):
         return value.value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, set):
+        return sorted((_jsonable(item) for item in value), key=repr)
     return value
 
 

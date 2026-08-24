@@ -20,6 +20,7 @@ const pct = (value: number) => `${Math.round(value * 100)}%`
 const priorityLabel = { urgent: '紧急', high: '高', normal: '普通', low: '低' }
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
+const commandKey = (action: string) => `${action}:${crypto.randomUUID()}`
 const solverStatusLabel: Record<Schedule['solver_status'], string> = {
   OPTIMAL: '已证明最优', FEASIBLE: '已找到可行解', TIME_LIMIT_FEASIBLE: '限时内可行',
   TIME_LIMIT_NO_SOLUTION: '限时内无解', INFEASIBLE: '已证明无解', NO_SOLUTION: '未找到方案',
@@ -218,17 +219,21 @@ function CompareDrawer({ data, onClose }: { data: Comparison; onClose: () => voi
     ['加班分钟', data.before.kpis.total_overtime_minutes, data.after.kpis.total_overtime_minutes, data.delta.overtime_minutes],
     ['未分配', data.before.kpis.unassigned_count, data.after.kpis.unassigned_count, data.delta.unassigned_count],
   ]
-  const tradeoffs = [
+  const tradeoffs = data.comparable ? [
     Number(data.delta.unassigned_count) < 0 ? `多完成 ${-Number(data.delta.unassigned_count)} 单` : Number(data.delta.unassigned_count) > 0 ? `少完成 ${data.delta.unassigned_count} 单` : '',
     Number(data.delta.sla_late_count) > 0 ? `SLA 超时增加 ${data.delta.sla_late_count} 单` : Number(data.delta.sla_late_count) < 0 ? `SLA 超时减少 ${-Number(data.delta.sla_late_count)} 单` : '',
     Number(data.delta.overtime_minutes) > 0 ? `加班增加 ${data.delta.overtime_minutes} 分钟` : Number(data.delta.overtime_minutes) < 0 ? `加班减少 ${-Number(data.delta.overtime_minutes)} 分钟` : '',
-  ].filter(Boolean)
+  ].filter(Boolean) : []
+  const objectiveReduction = data.comparable && data.delta.objective != null && data.before.objective !== 0
+    ? Math.round((1 - data.after.objective / data.before.objective) * 100)
+    : undefined
   return <div className="modal-backdrop" onMouseDown={onClose}><section className="compare-modal" role="dialog" aria-modal="true" aria-labelledby="compare-title" onMouseDown={e => e.stopPropagation()}>
     <div className="compare-head"><div><span className="eyebrow">BEFORE / AFTER</span><h2 id="compare-title">方案对比</h2><p>V{String(data.before.version).padStart(3, '0')} 与 V{String(data.after.version).padStart(3, '0')} · {kindLabel[data.after.kind]}</p></div><button className="icon-btn" onClick={onClose} aria-label="关闭方案对比"><X /></button></div>
     <div className="compare-status"><SolverBadge schedule={data.after} /><span>{data.after.solver_note}</span></div>
-    <table className="compare-table"><thead><tr><th>指标</th><th>人工基线</th><th>当前方案</th><th>变化</th></tr></thead><tbody>{rows.map(([label, before, after, delta]) => <tr key={String(label)}><td>{label}</td><td>{before}</td><td><b>{after}</b></td><td className={delta == null ? '' : Number(delta) <= 0 ? 'good' : 'bad'}>{delta == null ? '—' : `${Number(delta) > 0 ? '+' : ''}${delta}`}</td></tr>)}</tbody></table>
+    {!data.comparable && <div className="compare-warning"><AlertTriangle size={17} /><div><b>两版使用的业务数据不同，不能直接判断方案优劣</b><span>共同工单 {data.common_work_order_count} 个；新增 {data.added_work_orders.length} 个，移除 {data.removed_work_orders.length} 个，修改 {data.modified_work_orders.length} 个。下表只展示原始数值变化。</span></div></div>}
+    <table className="compare-table"><thead><tr><th>指标</th><th>方案 A</th><th>方案 B</th><th>变化</th></tr></thead><tbody>{rows.map(([label, before, after, delta]) => <tr key={String(label)}><td>{label}</td><td>{before}</td><td><b>{after}</b></td><td className={delta == null || !data.comparable ? '' : Number(delta) <= 0 ? 'good' : 'bad'}>{delta == null ? '—' : `${Number(delta) > 0 ? '+' : ''}${delta}`}</td></tr>)}</tbody></table>
     {tradeoffs.length > 0 && <p className="compare-explain"><b>变化：</b>{tradeoffs.join('；')}。“计算用时”只指生成方案所花的时间。</p>}
-    <div className="compare-footer"><div><b>{data.changed_orders.length}</b><span>个工单安排发生变化</span></div><div><b>{data.after.kpis.stability_rate == null ? '—' : pct(data.after.kpis.stability_rate)}</b><span>重排稳定率</span></div><div><b>{data.delta.objective == null ? '—' : `${Math.round((1 - data.after.objective / data.before.objective) * 100)}%`}</b><span>{data.delta.objective == null ? '不同策略不比较目标值' : '目标值下降'}</span></div></div>
+    <div className="compare-footer"><div><b>{data.changed_orders.length}</b><span>个工单安排发生变化</span></div><div><b>{data.after.kpis.stability_rate == null ? '—' : pct(data.after.kpis.stability_rate)}</b><span>重排稳定率</span></div><div><b>{objectiveReduction == null ? '—' : `${objectiveReduction > 0 ? '+' : ''}${objectiveReduction}%`}</b><span>{!data.comparable ? '需求快照不同，不比较目标值' : data.delta.objective == null ? '不同策略不比较目标值' : data.before.objective === 0 ? '基准值为 0，不计算百分比' : '目标值降幅（正数为改善）'}</span></div></div>
   </section></div>
 }
 
@@ -322,6 +327,8 @@ export default function App() {
 
   if (!scenario) return <main className="boot-screen"><InkMark /><h1>FieldFlow</h1><p>{loadError || working || '正在打开调度台…'}</p>{loadError && <button onClick={() => window.location.reload()}>重新连接</button>}</main>
   const shownScenario = historicalScenario || scenario
+  const activePlan = plans.find(item => item.active)
+  const partialCoverage = !historicalScenario && activePlan?.coverage_status === 'PARTIAL_NEW_DEMAND'
 
   const invalidatePlan = (next: Scenario, message: string) => {
     setScenario(next); setSchedule(undefined); setBaseline(undefined); setHistoricalScenario(undefined); setSelectedId(undefined)
@@ -356,7 +363,7 @@ export default function App() {
       if (activeScenarioId.current !== next.id) return
       setWorkEditor(undefined)
       if (replan) {
-        const result = await api.replan(next.id, order.reported_at ?? 600, 'stable')
+        const result = await api.replan(next.id, order.reported_at ?? 600, 'stable', undefined, commandKey('replan'))
         if (activeScenarioId.current !== next.id) return
         const [fresh, planItems] = await Promise.all([api.scenario(next.id), api.planVersions(next.id)])
         if (activeScenarioId.current !== next.id) return
@@ -364,7 +371,19 @@ export default function App() {
         setScenarios(current => current.map(item => item.id === fresh.id ? fresh : item))
         setToast('突发工单已保存，局部重排完成')
       } else invalidatePlan(next, '工单已保存')
-    } catch (error) { setToast(error instanceof Error ? error.message : '工单保存失败') }
+    } catch (error) {
+      if (replan && order.is_emergency && !workEditor?.initial) {
+        try {
+          const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
+          if (activeScenarioId.current === scenario.id) {
+            const active = planItems.find(item => item.active)
+            setScenario(fresh); setPlans(planItems); setSchedule(active?.selected); setHistoricalScenario(undefined)
+            setScenarios(current => current.map(item => item.id === fresh.id ? fresh : item))
+          }
+        } catch { /* keep the original replanning error */ }
+      }
+      setToast(error instanceof Error ? error.message : '工单保存失败')
+    }
     finally { setWorking(undefined) }
   }
 
@@ -389,7 +408,7 @@ export default function App() {
   const runOptimize = async () => {
     setWorking('正在生成推荐方案')
     try {
-      const result = await api.optimize(scenario.id, strategy)
+      const result = await api.optimize(scenario.id, strategy, undefined, commandKey('optimize'))
       if (activeScenarioId.current !== scenario.id) return
       const planItems = await api.planVersions(scenario.id)
       if (activeScenarioId.current !== scenario.id) return
@@ -406,7 +425,7 @@ export default function App() {
   const runReplan = async () => {
     setWorking('正在保持已执行安排并局部重排')
     try {
-      const result = await api.replan(scenario.id, replanTime, 'stable')
+      const result = await api.replan(scenario.id, replanTime, 'stable', undefined, commandKey('replan'))
       if (activeScenarioId.current !== scenario.id) return
       const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
       if (activeScenarioId.current !== scenario.id) return
@@ -417,9 +436,9 @@ export default function App() {
 
   const dispatch = <>
     <section className="command-bar">
-      <div className="command-context"><GripVertical size={17} /><div><small>当前方案</small><strong>{schedule ? `${kindLabel[schedule.kind]} · V${String(schedule.version).padStart(3, '0')}` : `业务数据已更新 · D${String(scenario.revision).padStart(3, '0')}`}</strong></div></div>
+      <div className="command-context"><GripVertical size={17} /><div><small>{partialCoverage ? '最后发布方案' : '当前方案'}</small><strong>{schedule ? `${kindLabel[schedule.kind]} · V${String(schedule.version).padStart(3, '0')}${partialCoverage ? ' · 新需求未覆盖' : ''}` : `业务数据已更新 · D${String(scenario.revision).padStart(3, '0')}`}</strong></div></div>
       <div className="command-actions">
-        <button onClick={() => act('正在生成基线', () => api.baseline(scenario.id), '人工基线已生成')} disabled={!!working}><RefreshCw size={15} />生成基线</button>
+        <button onClick={() => act('正在生成基线', () => api.baseline(scenario.id, commandKey('baseline')), '人工基线已生成')} disabled={!!working}><RefreshCw size={15} />生成基线</button>
         <div className="strategy-select"><select aria-label="优化策略" value={strategy} onChange={e => setStrategy(e.target.value as Strategy)}><option value="balanced">均衡策略</option><option value="completion">完成率优先</option><option value="punctuality">准时优先</option><option value="low_travel">低行程</option><option value="low_overtime">低加班</option><option value="fair_workload">工作量公平</option></select><ChevronDown size={13} /></div>
         <button className="primary" onClick={runOptimize} disabled={!!working}><WandSparkles size={16} />生成推荐方案</button>
         <button className="emergency" onClick={() => setWorkEditor({ emergencyPreset: true })} disabled={!!working}><Zap size={15} />新增突发单</button>
@@ -431,7 +450,8 @@ export default function App() {
       {working && <div className="working"><RefreshCw size={14} />{working}</div>}
     </section>
     {!schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务数据已修改，现有方案不再适用</strong><span>生成基线或推荐方案后再开始派单。</span></div></div>}
-    {schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
+    {partialCoverage && schedule && <div className="stale-banner partial"><AlertTriangle size={16} /><div><strong>突发工单已保存，最后发布方案尚未覆盖全部需求</strong><span>V{String(schedule.version).padStart(3, '0')} 仍保留原承诺；请处理未计划工单后重新重排。</span></div></div>}
+    {!partialCoverage && schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
     <KpiStrip schedule={schedule} baseline={baseline} />
     <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
     <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / 3 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
@@ -442,22 +462,42 @@ export default function App() {
     <main className="main-content">
       <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务日 08:00–18:00</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}`, '_blank')}><FileText size={16} />导出报告</button></div></header>
       {view === 'dispatch' && dispatch}
-      {view === 'versions' && <VersionsView scenario={scenario} plans={plans} onOpen={async item => { setWorking('正在读取版本快照'); try { const detail = await api.planVersion(scenario.id, item.id); setSchedule(detail.selected); setHistoricalScenario(detail.active && detail.data_revision === scenario.revision ? undefined : detail.scenario_snapshot || undefined); setBaseline(detail.artifacts.find(artifactItem => artifactItem.role === 'baseline')?.schedule); setView('dispatch'); setToast(`已打开历史方案 V${String(item.number).padStart(3, '0')}`) } catch (error) { setToast(error instanceof Error ? error.message : '版本读取失败') } finally { setWorking(undefined) } }} onRestore={async item => {
-        setWorking('正在核对历史快照')
+      {view === 'versions' && <VersionsView scenario={scenario} plans={plans} onOpen={async item => { setWorking('正在读取版本快照'); try { const detail = await api.planVersion(scenario.id, item.id); setSchedule(detail.selected); setHistoricalScenario(detail.active && detail.data_revision === scenario.revision ? undefined : detail.scenario_snapshot || undefined); setBaseline(detail.artifacts.find(artifactItem => artifactItem.role === 'baseline')?.schedule); setView('dispatch'); setToast(`已打开历史方案 V${String(item.number).padStart(3, '0')}`) } catch (error) { setToast(error instanceof Error ? error.message : '版本读取失败') } finally { setWorking(undefined) } }} onActivate={async item => {
+        setWorking('正在核对并激活历史计划')
         try {
-          const detail = await api.planVersion(scenario.id, item.id)
-          const snapshot = detail.scenario_snapshot
-          if (!snapshot) throw new Error('该版本没有可恢复的数据快照')
-          const currentOrders = new Map(scenario.work_orders.map(order => [order.id, JSON.stringify(order)]))
-          const changedOrders = snapshot.work_orders.filter(order => currentOrders.get(order.id) !== JSON.stringify(order)).length + scenario.work_orders.filter(order => !snapshot.work_orders.some(old => old.id === order.id)).length
-          const message = `恢复 V${String(item.number).padStart(3, '0')} 将创建一个新版本。\n\n业务数据：${snapshot.technicians.length} 名技师、${snapshot.work_orders.length} 个工单、${snapshot.locked_assignments.length} 项锁定\n与当前相比约 ${changedOrders} 个工单记录发生变化。\n\n当前版本和后续历史都不会删除。`
+          const activated = await api.activatePlanVersion(scenario.id, item.id, scenario.revision, commandKey('activate'))
+          if (activeScenarioId.current !== scenario.id) return
+          const planItems = await api.planVersions(scenario.id)
+          if (activeScenarioId.current !== scenario.id) return
+          setPlans(planItems); setSchedule(activated.selected); setHistoricalScenario(undefined); setView('dispatch'); setToast(`已激活为 V${String(activated.number).padStart(3, '0')}`)
+        } catch (error) { setToast(error instanceof Error ? error.message : '历史计划无法激活') }
+        finally { setWorking(undefined) }
+      }} onClone={async item => {
+        const name = window.prompt('新场景名称', `${scenario.name} · V${String(item.number).padStart(3, '0')} 副本`)?.trim()
+        if (!name) return
+        setWorking('正在从历史快照克隆场景')
+        try {
+          const cloned = await api.clonePlanScenario(scenario.id, item.id, name, commandKey('clone'))
+          setScenarios(current => current.some(existing => existing.id === cloned.id) ? current : [...current, cloned])
+          await loadScenario(cloned.id); setView('dispatch'); setToast('历史快照已克隆为独立场景')
+        } catch (error) { setToast(error instanceof Error ? error.message : '场景克隆失败') }
+        finally { setWorking(undefined) }
+      }} onRestore={async item => {
+        setWorking('正在核对业务回滚差异')
+        try {
+          const preview = await api.rollbackPreview(scenario.id, item.id)
+          if (preview.completed_work_orders_reopened.length) throw new Error(`默认禁止重新打开已完成工单：${preview.completed_work_orders_reopened.join('、')}`)
+          if (preview.removed_work_orders.length) throw new Error(`默认禁止删除历史版本之后新增的工单：${preview.removed_work_orders.join('、')}`)
+          const reason = window.prompt('请填写业务回滚原因')?.trim()
+          if (!reason) return
+          const message = `将业务数据回滚到 V${String(item.number).padStart(3, '0')} 的快照。\n\n新增 ${preview.added_work_orders.length} 个、删除 ${preview.removed_work_orders.length} 个、修改 ${preview.modified_work_orders.length} 个工单；技师变化 ${preview.technician_changes.length} 项，锁定变化 ${preview.lock_changes.length} 项。\n\n这不是普通的计划切换。操作会创建新的 D 和 V，现有历史不会删除。`
           if (!window.confirm(message)) return
-          const restored = await api.restorePlanVersion(scenario.id, item.id, scenario.revision)
+          const restored = await api.rollbackPlanVersion(scenario.id, item.id, scenario.revision, preview.confirmation_token, reason, commandKey('rollback'))
           if (activeScenarioId.current !== scenario.id) return
           const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
           if (activeScenarioId.current !== scenario.id) return
-          setScenario(fresh); setPlans(planItems); setSchedule(restored.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch'); setToast(`已恢复为 V${String(restored.number).padStart(3, '0')}`)
-        } catch (error) { setToast(error instanceof Error ? error.message : '恢复失败') }
+          setScenario(fresh); setPlans(planItems); setSchedule(restored.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch'); setToast(`业务数据已回滚，生成 V${String(restored.number).padStart(3, '0')}`)
+        } catch (error) { setToast(error instanceof Error ? error.message : '业务回滚失败') }
         finally { setWorking(undefined) }
       }} onCompare={async (before, after) => { setWorking('正在比较指定版本'); try { setComparison(await api.comparison(scenario.id, before.id, after.id)) } catch (error) { setToast(error instanceof Error ? error.message : '版本比较失败') } finally { setWorking(undefined) } }} onRename={async (item, label) => { try { const updated = await api.renamePlanVersion(scenario.id, item.id, label); setPlans(current => current.map(plan => plan.id === updated.id ? updated : plan)); setToast('方案名称已更新') } catch (error) { setToast(error instanceof Error ? error.message : '重命名失败') } }} onReset={async () => {
         if (!window.confirm('恢复初始业务数据？已有方案历史会保留。')) return
@@ -474,7 +514,7 @@ export default function App() {
       setWorking('正在改派并局部重排')
       try {
         await api.lock(scenario.id, orderId, technicianId, true)
-        const result = await api.replan(scenario.id, replanTime, 'stable')
+        const result = await api.replan(scenario.id, replanTime, 'stable', undefined, commandKey('replan'))
         if (activeScenarioId.current !== scenario.id) return
         const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
         if (activeScenarioId.current !== scenario.id) return

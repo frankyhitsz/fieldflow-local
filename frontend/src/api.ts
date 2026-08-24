@@ -1,5 +1,5 @@
 import type {
-  Comparison, PlanVersion, Scenario, Schedule, Strategy, StrategyExperiment,
+  Comparison, PlanVersion, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
   StrategyProfile, StrategyWeights, Technician, WorkOrder,
 } from './types'
 
@@ -42,9 +42,12 @@ export const api = {
   planVersions: (id: string) => request<PlanVersion[]>(`/api/scenarios/${id}/plan-versions`),
   planVersion: (id: string, versionId: string) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}`),
   renamePlanVersion: (id: string, versionId: string, label: string) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}`, { method: 'PATCH', body: JSON.stringify({ label }) }),
-  restorePlanVersion: (id: string, versionId: string, expectedRevision: number) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}/restore`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) }),
-  baseline: (id: string) => request<Schedule>(`/api/scenarios/${id}/baseline`, { method: 'POST' }),
-  optimize: (id: string, strategy: Strategy = 'balanced', profileId?: string) => request<Schedule>(`/api/scenarios/${id}/optimize`, { method: 'POST', body: JSON.stringify({ strategy, profile_id: profileId }) }),
+  rollbackPreview: (id: string, versionId: string) => request<RollbackPreview>(`/api/scenarios/${id}/plan-versions/${versionId}/rollback-preview`),
+  rollbackPlanVersion: (id: string, versionId: string, expectedRevision: number, confirmationToken: string, reason: string, idempotencyKey: string) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}/restore`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, confirmation_token: confirmationToken, reason, idempotency_key: idempotencyKey }) }),
+  activatePlanVersion: (id: string, versionId: string, expectedRevision: number, idempotencyKey: string) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}/activate`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey }) }),
+  clonePlanScenario: (id: string, versionId: string, name: string, idempotencyKey: string) => request<Scenario>(`/api/scenarios/${id}/plan-versions/${versionId}/clone-scenario`, { method: 'POST', body: JSON.stringify({ name, idempotency_key: idempotencyKey }) }),
+  baseline: (id: string, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/baseline`, { method: 'POST', headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined }),
+  optimize: (id: string, strategy: Strategy = 'balanced', profileId?: string, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/optimize`, { method: 'POST', headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined, body: JSON.stringify({ strategy, profile_id: profileId }) }),
   replan: (id: string, currentTime = 600, strategy: Strategy | 'stable' = 'stable', emergencyOrder?: WorkOrder, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/replan`, { method: 'POST', body: JSON.stringify({ current_time: currentTime, planning_time: currentTime, strategy, emergency_order: emergencyOrder, idempotency_key: idempotencyKey }) }),
   lock: (scenarioId: string, orderId: string, technicianId: string, locked: boolean) =>
     request<Scenario>(`/api/scenarios/${scenarioId}/lock`, {
@@ -57,6 +60,7 @@ export const api = {
   deleteStrategyProfile: (id: string) => request<void>(`/api/strategy-profiles/${id}`, { method: 'DELETE' }),
   createExperiment: (id: string, profileIds: string[], timeLimit?: number) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments`, { method: 'POST', body: JSON.stringify({ dataset: 'current', profile_ids: profileIds, time_limit_seconds: timeLimit }) }),
   experiment: (id: string, experimentId: string, signal?: AbortSignal) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments/${experimentId}`, { signal }),
+  cancelExperiment: (id: string, experimentId: string) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments/${experimentId}/cancel`, { method: 'POST' }),
   publishExperiment: (id: string, experimentId: string, candidateId: string, expectedRevision: number) => request<PlanVersion>(`/api/scenarios/${id}/strategy-experiments/${experimentId}/publish`, { method: 'POST', body: JSON.stringify({ candidate_id: candidateId, expected_revision: expectedRevision }) }),
   createWorkOrder: (scenarioId: string, order: WorkOrder) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders`, { method: 'POST', body: JSON.stringify(order) }),
   updateWorkOrder: (scenarioId: string, orderId: string, order: Partial<WorkOrder>) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', body: JSON.stringify(order) }),

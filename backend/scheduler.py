@@ -12,6 +12,7 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 from .hashing import content_hash
 from .models import (
+    PlanningContext,
     ScheduleAssignment,
     ScheduleKPI,
     ScheduleResult,
@@ -24,8 +25,8 @@ from .models import (
     UnassignedWorkOrder,
     WorkOrder,
 )
-from .timeutils import hhmm, travel_minutes
-from .travel import TRAVEL_MODEL_VERSION
+from .timeutils import hhmm
+from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
 BUSINESS_SCORE_POLICY_VERSION = "FIELD_SERVICE_SCORE_V2"
 METRIC_POLICY_VERSION = "FIELD_SERVICE_METRICS_V2"
@@ -74,6 +75,7 @@ def _diagnose_unassigned(
     scenario: ScheduleScenario,
     locked: dict[str, str],
     dropped_by_solver: bool = False,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> UnassignedWorkOrder:
     eligible = [t for t in scenario.technicians if _eligible(t, order)]
     if not eligible:
@@ -98,7 +100,7 @@ def _diagnose_unassigned(
         eligible = [tech]
     individually_feasible = []
     for tech in eligible:
-        arrive = tech.shift_start + travel_minutes(tech.start_location, order.location)
+        arrive = tech.shift_start + provider.minutes(tech.start_location, order.location)
         start = max(arrive, order.window_start)
         finish = start + order.service_duration
         if start <= order.window_end:
@@ -192,6 +194,7 @@ def _explanation(
 def _attach_route_insertion_evidence(
     scenario: ScheduleScenario,
     assignments: list[ScheduleAssignment],
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> None:
     """Record route-local travel deltas without claiming a global counterfactual optimum."""
     orders = {item.id: item for item in scenario.work_orders}
@@ -205,9 +208,9 @@ def _attach_route_insertion_evidence(
     def cheapest_delta(technician: Technician, route: list[ScheduleAssignment], order: WorkOrder) -> int:
         points = [technician.start_location, *[orders[item.work_order_id].location for item in route], technician.start_location]
         return min(
-            travel_minutes(points[index], order.location)
-            + travel_minutes(order.location, points[index + 1])
-            - travel_minutes(points[index], points[index + 1])
+            provider.minutes(points[index], order.location)
+            + provider.minutes(order.location, points[index + 1])
+            - provider.minutes(points[index], points[index + 1])
             for index in range(len(points) - 1)
         )
 
@@ -218,9 +221,9 @@ def _attach_route_insertion_evidence(
             previous_point = technician.start_location if index == 0 else orders[route[index - 1].work_order_id].location
             next_point = technician.start_location if index == len(route) - 1 else orders[route[index + 1].work_order_id].location
             insertion_delta = (
-                travel_minutes(previous_point, order.location)
-                + travel_minutes(order.location, next_point)
-                - travel_minutes(previous_point, next_point)
+                provider.minutes(previous_point, order.location)
+                + provider.minutes(order.location, next_point)
+                - provider.minutes(previous_point, next_point)
             )
             alternatives = {
                 item.id: cheapest_delta(item, grouped.get(item.id, []), order)
@@ -272,6 +275,7 @@ def calculate_kpis(
     assignments: list[ScheduleAssignment],
     unassigned: list[UnassignedWorkOrder],
     previous: ScheduleResult | None = None,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> ScheduleKPI:
     orders = {o.id: o for o in scenario.work_orders}
     grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
@@ -290,8 +294,8 @@ def calculate_kpis(
         route_travel = sum(a.travel_minutes for a in route)
         waiting = sum(max(0, item.start_time - item.arrival_time) for item in route)
         if route:
-            route_travel += travel_minutes(orders[route[-1].work_order_id].location, tech.start_location)
-            route_end = route[-1].finish_time + travel_minutes(orders[route[-1].work_order_id].location, tech.start_location)
+            route_travel += provider.minutes(orders[route[-1].work_order_id].location, tech.start_location)
+            route_end = route[-1].finish_time + provider.minutes(orders[route[-1].work_order_id].location, tech.start_location)
         else:
             route_end = tech.shift_start
         overtime = max(0, route_end - tech.shift_end)
@@ -457,8 +461,9 @@ def _result(
     solver_objective_value: float | None = None,
     solver_name: str = "fieldflow-greedy",
     solver_version: str = "1",
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> ScheduleResult:
-    kpis = calculate_kpis(scenario, assignments, unassigned, previous if kind == "replan" else None)
+    kpis = calculate_kpis(scenario, assignments, unassigned, previous if kind == "replan" else None, provider)
     # Stability is a replanning concern. A normal optimization may be compared
     # with a baseline, but must not pay a penalty merely for improving it.
     changes = sum(1 for a in assignments if a.changed) if kind == "replan" else 0
@@ -491,7 +496,7 @@ def _result(
         business_score_policy_version=BUSINESS_SCORE_POLICY_VERSION,
         scenario_snapshot_hash=content_hash(scenario),
         solver_config_hash=content_hash(scenario.solver_config),
-        travel_model_version=TRAVEL_MODEL_VERSION,
+        travel_model_version=provider.version,
         metric_policy_version=METRIC_POLICY_VERSION,
         solver_name=solver_name,
         solver_version=solver_version,
@@ -502,6 +507,7 @@ def recompute_business_result(
     scenario: ScheduleScenario,
     result: ScheduleResult,
     previous: ScheduleResult | None = None,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> ScheduleResult:
     """Bind solver output to the immutable business snapshot and scoring policy."""
     rebound = result.model_copy(deep=True)
@@ -513,6 +519,7 @@ def recompute_business_result(
         rebound.assignments,
         rebound.unassigned,
         previous if rebound.kind == "replan" else None,
+        provider,
     )
     changes = sum(1 for item in rebound.assignments if item.changed) if rebound.kind == "replan" else 0
     rebound.objective_breakdown = objective_breakdown(
@@ -526,7 +533,7 @@ def recompute_business_result(
     rebound.objective = rebound.business_score
     rebound.business_score_policy_version = BUSINESS_SCORE_POLICY_VERSION
     rebound.metric_policy_version = METRIC_POLICY_VERSION
-    rebound.travel_model_version = TRAVEL_MODEL_VERSION
+    rebound.travel_model_version = provider.version
     return rebound
 
 
@@ -568,7 +575,12 @@ def scenario_for_profile(scenario: ScheduleScenario, profile: StrategyProfile) -
     return effective
 
 
-def baseline_schedule(scenario: ScheduleScenario, version: int, strategy: str = "baseline") -> ScheduleResult:
+def baseline_schedule(
+    scenario: ScheduleScenario,
+    version: int,
+    strategy: str = "baseline",
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
+) -> ScheduleResult:
     started_at = time.perf_counter()
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     routes: dict[str, list[ScheduleAssignment]] = defaultdict(list)
@@ -587,15 +599,15 @@ def baseline_schedule(scenario: ScheduleScenario, version: int, strategy: str = 
         choices: list[tuple[int, int, int, Technician]] = []
         for tech in candidates:
             available, point = state[tech.id]
-            travel = travel_minutes(point, order.location)
+            travel = provider.minutes(point, order.location)
             arrival = available + travel
             start = max(arrival, order.window_start)
             finish = start + order.service_duration
-            return_time = travel_minutes(order.location, tech.start_location)
+            return_time = provider.minutes(order.location, tech.start_location)
             if start <= order.window_end and finish + return_time <= tech.shift_end + tech.overtime_limit:
                 choices.append((start, travel, finish, tech))
         if not choices:
-            unassigned.append(_diagnose_unassigned(order, scenario, locked))
+            unassigned.append(_diagnose_unassigned(order, scenario, locked, provider=provider))
             continue
         start, travel, finish, tech = min(choices, key=lambda choice: (choice[0], choice[1], choice[3].id))
         arrival = state[tech.id][0] + travel
@@ -626,12 +638,13 @@ def baseline_schedule(scenario: ScheduleScenario, version: int, strategy: str = 
         assignments.append(assignment)
         state[tech.id] = (finish, order.location)
 
-    _attach_route_insertion_evidence(scenario, assignments)
+    _attach_route_insertion_evidence(scenario, assignments, provider)
     runtime_ms = max(1, round((time.perf_counter() - started_at) * 1000))
     return _result(
         scenario, "baseline", version, SolverStatus.feasible, runtime_ms, assignments, unassigned,
         note="确定性贪心基线：按 SLA 截止时间排序，并选择最早可到达的合格技师。",
         strategy=strategy,
+        provider=provider,
     )
 
 
@@ -643,6 +656,7 @@ def optimized_schedule(
     current_time: int | None = None,
     time_limit_seconds: float | None = None,
     strategy: str = "balanced",
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> ScheduleResult:
     started_at = time.perf_counter()
     technicians = scenario.technicians
@@ -685,12 +699,12 @@ def optimized_schedule(
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
             service = node_orders[from_node].service_duration if from_node in node_orders else 0
-            return service + travel_minutes(locations[from_node], locations[to_node])
+            return service + provider.minutes(locations[from_node], locations[to_node])
 
         def cost_cb(from_index: int, to_index: int, vehicle: int = vehicle) -> int:
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
-            cost = travel_minutes(locations[from_node], locations[to_node]) * scenario.solver_config.travel_weight
+            cost = provider.minutes(locations[from_node], locations[to_node]) * scenario.solver_config.travel_weight
             order = node_orders.get(to_node)
             old = previous_by_id.get(order.id) if order else None
             if preserve_previous and old and old.technician_id != technicians[vehicle].id:
@@ -730,12 +744,17 @@ def optimized_schedule(
     service_dimension = routing.GetDimensionOrDie("ServiceLoad")
     service_dimension.SetGlobalSpanCostCoefficient(max(0, scenario.solver_config.imbalance_weight))
 
+    vehicle_available: list[bool] = []
     for vehicle, tech in enumerate(technicians):
         start_index = routing.Start(vehicle)
         end_index = routing.End(vehicle)
         start_min = max(tech.shift_start, current_time or tech.shift_start) if previous else tech.shift_start
-        time_dimension.CumulVar(start_index).SetRange(start_min, start_min)
-        time_dimension.CumulVar(end_index).SetRange(start_min, tech.shift_end + tech.overtime_limit)
+        latest_return = tech.shift_end + tech.overtime_limit
+        available = start_min <= latest_return
+        vehicle_available.append(available)
+        safe_start = start_min if available else latest_return
+        time_dimension.CumulVar(start_index).SetRange(safe_start, safe_start)
+        time_dimension.CumulVar(end_index).SetRange(safe_start, latest_return)
         time_dimension.SetCumulVarSoftUpperBound(end_index, tech.shift_end, scenario.solver_config.overtime_weight)
 
     precheck_unassigned: set[str] = set()
@@ -743,7 +762,7 @@ def optimized_schedule(
         node = order_nodes[order.id]
         index = manager.NodeToIndex(node)
         time_dimension.CumulVar(index).SetRange(order.window_start, order.window_end)
-        eligible_vehicles = [i for i, tech in enumerate(technicians) if _eligible(tech, order)]
+        eligible_vehicles = [i for i, tech in enumerate(technicians) if vehicle_available[i] and _eligible(tech, order)]
         locked_to = locked.get(order.id)
         if locked_to:
             eligible_vehicles = [i for i in eligible_vehicles if technicians[i].id == locked_to]
@@ -788,7 +807,7 @@ def optimized_schedule(
     termination_reason = ROUTING_STATUS_NAMES.get(routing_status_code, f"ROUTING_STATUS_{routing_status_code}")
 
     if not solution:
-        unassigned = [_diagnose_unassigned(order, scenario, locked, False) for order in active_orders]
+        unassigned = [_diagnose_unassigned(order, scenario, locked, False, provider) for order in active_orders]
         return _result(
             scenario, kind, version, mapped_status, runtime_ms, [], unassigned, previous,
             note=f"没有生成可执行候选（{termination_reason}），当前正式方案保持不变。",
@@ -800,6 +819,7 @@ def optimized_schedule(
             solution_found=False,
             solver_name="ortools-routing",
             solver_version=ortools.__version__,
+            provider=provider,
         )
 
     assignments: list[ScheduleAssignment] = []
@@ -815,7 +835,7 @@ def optimized_schedule(
                 order = node_orders[node]
                 sequence += 1
                 start = solution.Value(time_dimension.CumulVar(index))
-                travel = travel_minutes(previous_point, order.location)
+                travel = provider.minutes(previous_point, order.location)
                 arrival = available + travel
                 finish = start + order.service_duration
                 old = previous_by_id.get(order.id)
@@ -854,11 +874,11 @@ def optimized_schedule(
         _mark_replan_changes(assignments, previous, set(order_by_id))
 
     unassigned = [
-        _diagnose_unassigned(order, scenario, locked, dropped_by_solver=order.id not in precheck_unassigned)
+        _diagnose_unassigned(order, scenario, locked, dropped_by_solver=order.id not in precheck_unassigned, provider=provider)
         for order in active_orders
         if order.id not in assigned_ids
     ]
-    _attach_route_insertion_evidence(scenario, assignments)
+    _attach_route_insertion_evidence(scenario, assignments, provider)
     strategy_names = {"balanced": "均衡", "completion": "完成率优先", "punctuality": "准时优先", "low_travel": "低行程", "low_overtime": "低加班", "fair_workload": "工作量公平", "stable": "稳定优先", "custom": "自定义"}
     optimality_note = (
         "求解器已证明当前候选为全局最优解。"
@@ -880,6 +900,7 @@ def optimized_schedule(
         solver_objective_value=float(solution.ObjectiveValue()),
         solver_name="ortools-routing",
         solver_version=ortools.__version__,
+        provider=provider,
     )
 
 
@@ -890,19 +911,23 @@ def replan_schedule(
     current_time: int,
     time_limit_seconds: float | None = None,
     strategy: str = "stable",
+    planning_context: PlanningContext | None = None,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> ScheduleResult:
-    """Replan only work that has not started, keeping the executed prefix byte-for-byte stable."""
+    """Replan pending work while preserving assignments frozen by explicit execution facts."""
     scenario_copy = scenario.model_copy(deep=True)
     orders = {o.id: o for o in scenario_copy.work_orders}
+    if planning_context and planning_context.scenario_revision != scenario.revision:
+        raise ValueError("planning context does not match scenario revision")
+    frozen_ids = (
+        {item.work_order_id for item in planning_context.frozen_assignments}
+        if planning_context
+        else {order.id for order in scenario.work_orders if order.status.value in {"started", "completed"}}
+    )
     fixed = [
         a.model_copy(deep=True)
         for a in previous.assignments
-        if orders.get(a.work_order_id)
-        and (
-            orders[a.work_order_id].status.value in {"started", "completed"}
-            or a.start_time <= current_time
-            or a.arrival_time - a.travel_minutes <= current_time
-        )
+        if orders.get(a.work_order_id) and a.work_order_id in frozen_ids
     ]
     fixed_ids = {a.work_order_id for a in fixed}
     scenario_copy.work_orders = [o for o in scenario_copy.work_orders if o.id not in fixed_ids]
@@ -914,7 +939,7 @@ def replan_schedule(
         fixed_by_tech[item.technician_id].append(item)
         item.changed = False
         if "本次不调整" not in "".join(item.explanation):
-            item.explanation.append("工单已执行或正在路上，本次不调整")
+            item.explanation.append("工单已有明确执行状态，本次不调整")
     for tech in scenario_copy.technicians:
         prefix = sorted(fixed_by_tech.get(tech.id, []), key=lambda a: a.sequence)
         if prefix:
@@ -932,6 +957,7 @@ def replan_schedule(
         current_time=current_time,
         time_limit_seconds=time_limit_seconds,
         strategy=strategy,
+        provider=provider,
     )
     offsets = {tech.id: len(fixed_by_tech.get(tech.id, [])) for tech in scenario.technicians}
     replanned: list[ScheduleAssignment] = []
@@ -946,6 +972,8 @@ def replan_schedule(
     for item in replanned:
         if item.changed:
             item.explanation.append("为接纳突发工单或降低 SLA 风险，本项安排发生调整")
+    warning_count = len(planning_context.inferred_departure_warnings) if planning_context else 0
+    warning_note = f"；另有 {warning_count} 个工单仅按计划时间可能已出发，未据此自动冻结" if warning_count else ""
     final = _result(
         scenario,
         "replan",
@@ -955,7 +983,7 @@ def replan_schedule(
         merged,
         partial.unassigned,
         previous,
-        note=f"局部重排保留了 {len(fixed)} 个已执行或在途工单；{partial.solver_note}",
+        note=f"局部重排保留了 {len(fixed)} 个具有明确执行状态的工单{warning_note}；{partial.solver_note}",
         strategy=strategy,
         requested_time_limit_ms=partial.requested_time_limit_ms,
         effective_time_limit_ms=partial.effective_time_limit_ms,
@@ -965,6 +993,7 @@ def replan_schedule(
         solver_objective_value=partial.solver_objective_value,
         solver_name=partial.solver_name,
         solver_version=partial.solver_version,
+        provider=provider,
     )
     return final
 

@@ -110,6 +110,22 @@ def test_optimizer_allows_waits_longer_than_six_hours_and_records_real_arrival()
     assert assignment.arrival_time < assignment.start_time
 
 
+def test_replan_after_all_shift_capacity_expires_returns_diagnostics_instead_of_crashing():
+    scenario = get_fixture("main")
+    previous = baseline_schedule(scenario, 1)
+    result = optimized_schedule(
+        scenario,
+        2,
+        previous=previous,
+        kind="replan",
+        current_time=1800,
+        time_limit_seconds=1,
+        strategy="stable",
+    )
+    assert result.assignments == []
+    assert len(result.unassigned) == len(scenario.work_orders)
+
+
 def test_assignment_explanation_uses_route_local_insertion_evidence():
     scenario = get_fixture("main")
     result = optimized_schedule(scenario, 1, time_limit_seconds=1)

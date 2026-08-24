@@ -60,19 +60,29 @@ export type Schedule = {
 export type Comparison = {
   scenario_id: string; before: Schedule; after: Schedule
   delta: Record<string, number | null>; changed_orders: Record<string, unknown>[]
+  comparable: boolean; same_scenario_snapshot: boolean; common_work_order_count: number
+  added_work_orders: string[]; removed_work_orders: string[]; modified_work_orders: string[]
+  common_technicians: string[]
 }
 
 export type Strategy = 'balanced' | 'completion' | 'punctuality' | 'low_travel' | 'low_overtime' | 'fair_workload'
 
 export type PlanVersion = {
   id: string; scenario_id: string; number: number
-  action: 'baseline' | 'optimize' | 'replan' | 'restore' | 'experiment_publish'
+  action: 'baseline' | 'optimize' | 'replan' | 'activate' | 'restore' | 'experiment_publish'
   label: string; data_revision: number; source_version_id: string | null
-  relation: 'new' | 'optimized_from' | 'replanned_from' | 'restored_from' | 'published_from_experiment' | 'fresh_after_data_change'
+  relation: 'new' | 'optimized_from' | 'replanned_from' | 'reactivated_from' | 'restored_from' | 'published_from_experiment' | 'fresh_after_data_change'
   active: boolean; created_at: string; scenario_snapshot?: Scenario | null
+  coverage_status: 'CURRENT_AND_COMPLETE' | 'PARTIAL_NEW_DEMAND' | 'STALE_DATA_CHANGED'
   selected: Schedule
   artifacts: { id: string; role: 'baseline' | 'selected' | 'candidate'; strategy: string; schedule: Schedule }[]
   candidate_id: string | null; scenario_snapshot_hash: string; source_plan_snapshot_hash: string | null
+}
+
+export type RollbackPreview = {
+  scenario_id: string; source_version_id: string; expected_revision: number; confirmation_token: string
+  added_work_orders: string[]; removed_work_orders: string[]; modified_work_orders: string[]
+  completed_work_orders_reopened: string[]; technician_changes: string[]; lock_changes: string[]
 }
 
 export type StrategyWeights = {
@@ -93,9 +103,11 @@ export type StrategyCandidate = {
 
 export type StrategyExperiment = {
   id: string; scenario_id: string; dataset: string; data_revision: number
-  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; progress: number
+  status: 'QUEUED' | 'RUNNING' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'COMPLETED_WITH_ERRORS' | 'FAILED' | 'INTERRUPTED'; progress: number
   error: string | null; created_at: string; profile_ids: string[]
   requested_time_limit_seconds: number | null; candidates: StrategyCandidate[]
   fingerprint: string; scenario_snapshot_hash: string; score_policy_version: string
   travel_model_version: string; solver_version: string; candidate_errors: Record<string, string>
+  finished_at: string | null; cancel_requested_at: string | null
+  winner_candidate_id: string | null; winner_plan_version_id: string | null; published_at: string | null
 }

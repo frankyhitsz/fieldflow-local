@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-test('baseline, optimize, compare, arbitrary restore, and version report', async ({ page, request }) => {
+test('baseline, optimize, compare, arbitrary activation, and version report', async ({ page, request }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'FieldFlow' })).toBeHidden()
   await expect(page.getByRole('heading', { name: '今日调度 · 城西片区' })).toBeVisible()
@@ -19,8 +19,7 @@ test('baseline, optimize, compare, arbitrary restore, and version report', async
   await page.locator('.compare-modal .icon-btn').click()
 
   const v1 = page.getByRole('button', { name: '打开 V001', exact: true }).locator('..')
-  page.once('dialog', dialog => dialog.accept())
-  await v1.getByRole('button', { name: '恢复为新版本' }).click()
+  await v1.getByRole('button', { name: '重新激活' }).click()
   await expect(page.locator('.command-context').getByText(/V003/)).toBeVisible({ timeout: 15_000 })
 
   const versions = await request.get('/api/scenarios/main/plan-versions')

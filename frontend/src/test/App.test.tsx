@@ -28,6 +28,7 @@ const schedule: Schedule = {
 const plan: PlanVersion = {
   id: 'PV-1', scenario_id: 'main', number: 1, action: 'optimize', label: '均衡优化', data_revision: 0,
   source_version_id: null, relation: 'new', active: true, created_at: '2026-08-23T10:00:00Z',
+  coverage_status: 'CURRENT_AND_COMPLETE',
   selected: schedule, scenario_snapshot: scenario,
   artifacts: [{ id: 'ART-1', role: 'baseline', strategy: 'balanced', schedule: { ...schedule, id: 'SCH-BASE', kind: 'baseline', version: 1, strategy: 'baseline' } }],
   candidate_id: 'CAND-1', scenario_snapshot_hash: 'test', source_plan_snapshot_hash: null,

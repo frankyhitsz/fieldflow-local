@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from .hashing import content_hash
 from .models import (
     CoverageSummary,
+    PlanningContext,
     ScheduleAssignment,
     ScheduleResult,
     ScheduleScenario,
@@ -13,8 +14,8 @@ from .models import (
     SolverStatus,
     VerificationIssue,
 )
-from .scheduler import calculate_kpis, objective_breakdown
-from .timeutils import travel_minutes
+from .normalization import normalize_schedule
+from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
 PUBLISHABLE_STATUSES = {
     SolverStatus.optimal,
@@ -31,6 +32,8 @@ def verify_schedule(
     scenario: ScheduleScenario,
     result: ScheduleResult,
     source: ScheduleResult | None = None,
+    planning_context: PlanningContext | None = None,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> ScheduleVerificationReport:
     errors: list[VerificationIssue] = []
     warnings: list[VerificationIssue] = []
@@ -86,6 +89,8 @@ def verify_schedule(
         error("SCENARIO_HASH_MISMATCH", "candidate scenario snapshot hash does not match current data")
     if result.solver_status not in PUBLISHABLE_STATUSES or not result.solution_found:
         error("SOLVER_STATUS_NOT_PUBLISHABLE", f"solver status {result.solver_status.value} cannot be published")
+    if result.travel_model_version != provider.version:
+        error("TRAVEL_MODEL_MISMATCH", f"candidate travel model {result.travel_model_version} does not match {provider.version}")
 
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
@@ -120,7 +125,7 @@ def verify_schedule(
         if [item.sequence for item in ordered] != list(range(1, len(ordered) + 1)):
             error("NONCONTIGUOUS_SEQUENCE", f"{technician_id}: route sequence is not contiguous", technician_id=technician_id)
         for before, after in zip(ordered, ordered[1:], strict=False):
-            travel = travel_minutes(orders[before.work_order_id].location, orders[after.work_order_id].location)
+            travel = provider.minutes(orders[before.work_order_id].location, orders[after.work_order_id].location)
             if after.travel_minutes != travel:
                 error("TRAVEL_TIME_MISMATCH", f"{after.work_order_id}: travel minutes do not match route", after.work_order_id, technician_id)
             if after.arrival_time < before.finish_time + travel:
@@ -130,37 +135,80 @@ def verify_schedule(
         if ordered:
             technician = technicians[technician_id]
             first = ordered[0]
-            first_travel = travel_minutes(technician.start_location, orders[first.work_order_id].location)
+            first_travel = provider.minutes(technician.start_location, orders[first.work_order_id].location)
             if first.travel_minutes != first_travel:
                 error("FIRST_LEG_TRAVEL_MISMATCH", f"{first.work_order_id}: first-leg travel minutes do not match depot", first.work_order_id, technician_id)
             if first.arrival_time < technician.shift_start + first_travel:
                 error("IMPOSSIBLE_DEPOT_DEPARTURE", f"{first.work_order_id}: arrival precedes possible depot departure", first.work_order_id, technician_id)
             last = ordered[-1]
-            return_travel = travel_minutes(orders[last.work_order_id].location, technician.start_location)
+            return_travel = provider.minutes(orders[last.work_order_id].location, technician.start_location)
             if last.finish_time + return_travel > technician.shift_end + technician.overtime_limit:
                 error("RETURN_EXCEEDS_OVERTIME", f"{technician_id}: route return exceeds overtime limit", technician_id=technician_id)
 
     if source is not None:
         source_by_id = {item.work_order_id: item for item in source.assignments}
         result_by_id = {item.work_order_id: item for item in result.assignments}
-        for order in scenario.work_orders:
-            if order.status.value not in {"started", "completed"}:
-                continue
-            old = source_by_id.get(order.id)
-            new = result_by_id.get(order.id)
+        if planning_context and planning_context.scenario_revision != scenario.revision:
+            error("PLANNING_CONTEXT_REVISION_MISMATCH", "planning context does not match candidate revision")
+        frozen = (
+            {item.work_order_id: item for item in planning_context.frozen_assignments}
+            if planning_context
+            else {
+                order.id: None
+                for order in scenario.work_orders
+                if order.status.value in {"started", "completed"}
+            }
+        )
+        for work_order_id, frozen_item in frozen.items():
+            old = source_by_id.get(work_order_id)
+            new = result_by_id.get(work_order_id)
             if old is None:
-                error("IMMUTABLE_SOURCE_MISSING", f"{order.id}: source plan has no immutable assignment", order.id)
+                error("IMMUTABLE_SOURCE_MISSING", f"{work_order_id}: source plan has no immutable assignment", work_order_id)
+            elif frozen_item is not None and (
+                old.technician_id,
+                old.sequence,
+                old.start_time,
+                old.finish_time,
+            ) != (
+                frozen_item.technician_id,
+                frozen_item.sequence,
+                frozen_item.start_time,
+                frozen_item.finish_time,
+            ):
+                error("PLANNING_CONTEXT_SOURCE_MISMATCH", f"{work_order_id}: frozen assignment does not match source plan", work_order_id)
             elif new is None or (new.technician_id, new.sequence, new.start_time, new.finish_time) != (old.technician_id, old.sequence, old.start_time, old.finish_time):
-                error("IMMUTABLE_ASSIGNMENT_CHANGED", f"{order.id}: started or completed assignment changed", order.id)
+                error("IMMUTABLE_ASSIGNMENT_CHANGED", f"{work_order_id}: frozen assignment changed", work_order_id)
+        if planning_context:
+            for work_order_id in planning_context.inferred_departure_warnings:
+                warnings.append(VerificationIssue(
+                    code="PLANNED_DEPARTURE_NOT_EXECUTION_FACT",
+                    message=f"{work_order_id}: planned time suggests departure, but the assignment was not frozen without an execution fact",
+                    work_order_id=work_order_id,
+                ))
 
     recomputed_kpis = None
     if not any(issue.code in {"UNKNOWN_WORK_ORDER", "UNKNOWN_TECHNICIAN", "DUPLICATE_ASSIGNMENT"} for issue in errors):
-        recomputed_kpis = calculate_kpis(scenario, result.assignments, result.unassigned, source if result.kind == "replan" else None)
+        normalized = normalize_schedule(scenario, result, source, provider)
+        expected_by_id = {item.work_order_id: item for item in normalized.assignments}
+        for assignment in result.assignments:
+            expected = expected_by_id[assignment.work_order_id]
+            if assignment.travel_minutes != expected.travel_minutes:
+                error("TRAVEL_TIME_MISMATCH", f"{assignment.work_order_id}: derived travel time was not normalized", assignment.work_order_id, assignment.technician_id)
+            if assignment.sla_late_minutes != expected.sla_late_minutes:
+                error("SLA_LATENESS_MISMATCH", f"{assignment.work_order_id}: derived SLA lateness was not normalized", assignment.work_order_id, assignment.technician_id)
+            if assignment.changed != expected.changed:
+                error("CHANGED_FLAG_MISMATCH", f"{assignment.work_order_id}: changed flag does not match source plan", assignment.work_order_id, assignment.technician_id)
+            if assignment.locked != expected.locked:
+                error("LOCKED_FLAG_MISMATCH", f"{assignment.work_order_id}: locked flag does not match scenario locks", assignment.work_order_id, assignment.technician_id)
+            if assignment.explanation != expected.explanation:
+                error("EXPLANATION_MISMATCH", f"{assignment.work_order_id}: explanation was not regenerated", assignment.work_order_id, assignment.technician_id)
+            if assignment.evidence != expected.evidence:
+                error("EVIDENCE_MISMATCH", f"{assignment.work_order_id}: evidence was not regenerated", assignment.work_order_id, assignment.technician_id)
+        recomputed_kpis = normalized.kpis
         if recomputed_kpis.model_dump() != result.kpis.model_dump():
             error("KPI_MISMATCH", "candidate KPI values do not match recomputed metrics")
-        changes = sum(1 for item in result.assignments if item.changed) if result.kind == "replan" else 0
-        recomputed_breakdown = objective_breakdown(scenario, recomputed_kpis, result.unassigned, result.assignments, changes)
-        recomputed_score = round(sum(recomputed_breakdown.values()), 2)
+        recomputed_breakdown = normalized.objective_breakdown
+        recomputed_score = normalized.business_score
         if recomputed_breakdown != result.objective_breakdown or result.objective != recomputed_score or result.business_score != recomputed_score:
             error("BUSINESS_SCORE_MISMATCH", "candidate business score does not match recomputed metrics")
 
