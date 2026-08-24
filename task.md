@@ -31,7 +31,7 @@
 - [x] 容量表可读取 Artifact，展示完整性、内部/外部/未服务计数和外部承接清单。
 - [x] 补充 route-entry 历史一致性、受控重算拒绝、外包 Artifact、计划无关随机事件、配对比较、并发 retry、运行时漂移、结果/Artifact 篡改、Legacy 证明和成本来源测试。
 - [x] 额外发现并修正风险仿真中突发事件只在班次起点加固定延迟的简化：现在按冻结事件时间和位置插入行程与服务时长。
-- [x] `make verify` 除本机 Chromium SIGTRAP 外全部通过；API Playwright 1 项通过，三轮 auto-review 记录已更新。Linux 页面门禁待推送后由 GitHub Actions 补证。
+- [x] `make verify` 除本机 Chromium SIGTRAP 外全部通过；API Playwright 1 项通过，三轮 auto-review 记录已更新。核心提交 `9d4f613` 的 GitHub Actions `32742927633` 已由 Linux Playwright 补证。
 
 ## 经复核不在 v0.5.4 实现
 
@@ -48,5 +48,5 @@ Ruff / Pyright                     通过
 React 组件                         10 passed
 TypeScript / 生产构建              通过
 完整 make verify                   lint/audit/test/build/demo/benchmark 通过；本机页面 Chromium SIGTRAP
-GitHub Actions                     待推送后确认
+GitHub Actions 32742927633         python-compat / fieldflow 全部 success
 ```
