@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import ortools
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -1616,6 +1617,23 @@ FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 ALLOWED_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8000", "http://127.0.0.1:8000"}
 
 
+def browser_origin_allowed(
+    request: Request,
+    origin: str,
+    configured_origins: set[str],
+) -> bool:
+    normalized = origin.rstrip("/")
+    if normalized in configured_origins:
+        return True
+    parsed = urlsplit(normalized)
+    request_host = request.headers.get("host", "").lower()
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.scheme == request.url.scheme
+        and parsed.netloc.lower() == request_host
+    )
+
+
 def create_app(
     *,
     db_path: str | Path | None = None,
@@ -1634,10 +1652,17 @@ def create_app(
         for item in os.getenv("FIELDFLOW_ALLOWED_HOSTS", "127.0.0.1,localhost,testserver").split(",")
         if item.strip()
     ]
+    configured_origins = {
+        item.strip().rstrip("/")
+        for item in os.getenv(
+            "FIELDFLOW_ALLOWED_ORIGINS", ",".join(sorted(ALLOWED_ORIGINS))
+        ).split(",")
+        if item.strip()
+    }
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=sorted(ALLOWED_ORIGINS),
+        allow_origins=sorted(configured_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -1646,7 +1671,11 @@ def create_app(
     @application.middleware("http")
     async def validate_browser_origin(request: Request, call_next):
         origin = request.headers.get("origin")
-        if request.method not in {"GET", "HEAD", "OPTIONS"} and origin and origin not in ALLOWED_ORIGINS:
+        if (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            and origin
+            and not browser_origin_allowed(request, origin, configured_origins)
+        ):
             return Response("不允许的请求来源", status_code=403)
         return await call_next(request)
 

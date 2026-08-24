@@ -534,6 +534,14 @@ def test_local_host_origin_and_report_filename_boundaries(monkeypatch, tmp_path)
             headers={"Origin": "https://attacker.example"},
         )
         assert forbidden.status_code == 403
+        same_origin_custom_port = client.post(
+            "/api/scenarios/main/baseline",
+            headers={
+                "Host": "127.0.0.1:8012",
+                "Origin": "http://127.0.0.1:8012",
+            },
+        )
+        assert same_origin_custom_port.status_code == 200
         allowed = client.post(
             "/api/scenarios/main/baseline",
             headers={"Origin": "http://127.0.0.1:8000"},

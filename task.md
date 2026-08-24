@@ -116,3 +116,22 @@ CSS 业务文字下限  通过（显式最小值 11px）
 ```
 
 `make test-e2e` 已尝试两种浏览器。本机 Google Chrome 在当前 macOS 沙箱中以 `SIGABRT` 退出，Playwright 缓存的 headless Chromium 以 `SIGTRAP` 退出；3 项测试均未进入页面或执行断言。这项不记为通过，需在允许启动浏览器的本机或 CI 环境补跑。
+
+### CI 回归修复
+
+GitHub Actions 首次执行暴露了本地浏览器未能运行时遗漏的问题：Demo 在 `127.0.0.1:8012` 启动，但 Origin 白名单只包含 8000/5173，导致同源 baseline POST 被误拒绝为 403。因 V001 未生成，后续锁定测试又读取了不存在的 active plan。
+
+修复内容：
+
+- Origin 检查接受与当前请求 Host+端口完全一致的 `http/https` 同源，仍拒绝外部来源。
+- CORS 跨端口白名单可通过 `FIELDFLOW_ALLOWED_ORIGINS` 显式配置。
+- 锁定 E2E 不再依赖前一测试留下的方案，缺少 active plan 时会自行建立基线。
+
+回归结果：
+
+- `make lint`：通过。
+- `make test`：54 项通过，覆盖率 88.34%。
+- `make test-frontend`：4 项通过。
+- `make build`、`make demo-check`：通过。
+- 在 8012 端口启动真实服务并携带 `Origin: http://127.0.0.1:8012` 请求 baseline：返回 200，生成 V001。
+- 本机 Playwright 1.62.1 所需的 Chromium 1234 不支持当前 `mac13-arm64` 环境，E2E 未进入断言；GitHub Actions 的 Ubuntu 环境会按工作流安装匹配浏览器后执行。

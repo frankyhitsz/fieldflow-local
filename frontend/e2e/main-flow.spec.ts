@@ -6,7 +6,7 @@ test('baseline, optimize, compare, arbitrary activation, and version report', as
   await expect(page.getByRole('heading', { name: '今日调度 · 城西片区' })).toBeVisible()
 
   await page.getByRole('button', { name: '生成基线' }).click()
-  await expect(page.getByText(/人工基线 · V001/)).toBeVisible()
+  await expect(page.getByText(/人工基线 · V001/)).toBeVisible({ timeout: 15_000 })
   await page.getByRole('button', { name: '生成推荐方案' }).click()
   await expect(page.getByText(/优化方案 · V002/)).toBeVisible({ timeout: 15_000 })
 
@@ -41,10 +41,18 @@ test('critical navigation remains reachable at 200 percent zoom', async ({ page 
 })
 
 test('changing a lock marks the displayed plan stale', async ({ page, request }) => {
-  const versions = await request.get('/api/scenarios/main/plan-versions')
-  const plans = await versions.json()
-  const active = plans.find((item: { active: boolean }) => item.active)
-  const assignment = active.selected.assignments[0]
+  let versions = await request.get('/api/scenarios/main/plan-versions')
+  let plans = await versions.json()
+  let active = plans.find((item: { active: boolean }) => item.active)
+  if (!active) {
+    const baseline = await request.post('/api/scenarios/main/baseline')
+    expect(baseline.ok()).toBeTruthy()
+    versions = await request.get('/api/scenarios/main/plan-versions')
+    plans = await versions.json()
+    active = plans.find((item: { active: boolean }) => item.active)
+  }
+  expect(active).toBeDefined()
+  const assignment = active!.selected.assignments[0]
 
   await page.goto('/')
   await page.getByRole('button', { name: '全部' }).click()
