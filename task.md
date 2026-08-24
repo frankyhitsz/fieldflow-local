@@ -46,6 +46,7 @@
 - [x] E2E 主流程和“锁定后方案过期”用例各自创建独立场景，不依赖共享 `main` 的历史是否为空。
 - [x] 修复优化方案历史恢复时错误继承 routing time limit 导致的 409；API 生命周期 E2E 已通过。
 - [x] 本地 Playwright 优先使用配套 headless Chromium；Linux CI 仍使用工作流安装的 Chromium。
+- [x] 根据 Linux Chromium 的实际边界修正桌面工作区高度：1440×900 不越界，较矮视口改为纵向滚动而不是被主容器裁掉。
 
 ## 当前验证
 

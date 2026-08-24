@@ -54,13 +54,13 @@ test('dispatch workspace keeps its primary regions visible at 1440 by 900', asyn
   await expect(page.getByRole('heading', { name: '技师时间轴' })).toBeVisible()
   const regions = await page.locator('.queue, .map-panel, .timeline').evaluateAll(items => items.map(item => {
     const box = item.getBoundingClientRect()
-    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+    return { name: item.className, left: box.left, top: box.top, right: box.right, bottom: box.bottom }
   }))
   for (const box of regions) {
-    expect(box.left).toBeGreaterThanOrEqual(0)
-    expect(box.top).toBeGreaterThanOrEqual(0)
-    expect(box.right).toBeLessThanOrEqual(1440)
-    expect(box.bottom).toBeLessThanOrEqual(900)
+    expect(box.left, box.name).toBeGreaterThanOrEqual(0)
+    expect(box.top, box.name).toBeGreaterThanOrEqual(0)
+    expect(box.right, box.name).toBeLessThanOrEqual(1440)
+    expect(box.bottom, box.name).toBeLessThanOrEqual(900)
   }
 })
 
