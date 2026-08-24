@@ -57,8 +57,8 @@ React 组件                        7 passed
 Demo check                       通过
 Benchmark smoke                  通过
 pip-audit                        0 known vulnerabilities
-npm audit --offline              0 vulnerabilities（在线端点两次 ECONNRESET）
+npm audit --offline              0 vulnerabilities（本机在线端点两次 ECONNRESET）
 Playwright API 生命周期           1 passed
 ```
 
-页面级 Playwright 在本机尚未进入应用断言，Chromium 启动时被 macOS 进程沙箱以 `SIGTRAP` 终止。Linux CI 会安装独立 Chromium 并作为最终 E2E 与在线 npm audit 证据；远端未全绿前不标记交付完成。
+页面级 Playwright 在本机尚未进入应用断言，Chromium 启动时被 macOS 进程沙箱以 `SIGTRAP` 终止。GitHub Actions 运行 `32715170478` 已在 Linux 上完成在线依赖审计和全部 Playwright 流程；`python-compat` 与 `fieldflow` 两个作业均通过。
