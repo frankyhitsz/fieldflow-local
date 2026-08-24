@@ -33,8 +33,8 @@
 - [x] Schema 升至 v14，v1–v13 迁移矩阵和备份路径断言同步更新。
 - [x] OpenAPI 快照、前端类型、README、架构、指标、逐项复核和 Changelog 更新到 v0.5.2。
 - [x] Benchmark smoke 改用完整排程一致性校验，并检查容量违规和风险新字段；仍明确不称正式性能 Benchmark。
-- [ ] 整套本地 `make verify` 通过。
-- [ ] 提交并推送；确认最新提交的 `python-compat` 与 `fieldflow` CI 均通过。
+- [x] 本机可运行门禁与 Linux CI 合并覆盖完整 `make verify`；本机受网络/浏览器沙箱阻止的两项已由 CI 通过。
+- [x] 代码提交 `6c7110c` 已推送；Actions `32722664748` 的 `python-compat` 与 `fieldflow` 均通过。
 
 ## 明确保留的后续范围
 
@@ -58,6 +58,8 @@ Playwright API 生命周期           1 passed
 Demo check                       通过
 Benchmark smoke                  通过
 npm production audit             0 vulnerabilities
-pip-audit                        本机两次连接 PyPI 均被对端重置，等待 Linux CI 在线复核
-Playwright 页面流程              本机 Chromium 启动受沙箱 SIGTRAP 阻止，等待 Linux CI 复核
+pip-audit                        本机两次连接 PyPI 被重置；Linux CI success
+Playwright 页面流程              本机 Chromium 受沙箱 SIGTRAP 阻止；Linux CI 5 tests success
+GitHub Actions 32722664748       python-compat success；fieldflow success
+Linux 在线补证                   pip-audit success；Playwright 5 tests success
 ```
