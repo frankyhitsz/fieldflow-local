@@ -17,9 +17,13 @@ export type ExecutionEvent = {
   booking_id: string; source_assignment_hash: string; source_sequence: number
   planned_start_at: number | null; planned_finish_at: number | null
   actual_duration_minutes: number | null; actual_late_start_minutes: number
-  early_start_override_reason: string | null; note: string
+  early_start_override_reason: string | null; estimated_remaining_minutes: number | null; note: string
 }
 export type ExecutionResult = { scenario: Scenario; event: ExecutionEvent }
+export type ManualReassignmentResult = {
+  lock_persisted: boolean; replan_status: 'COMPLETED' | 'FAILED'; active_plan_preserved: boolean
+  scenario: Scenario; schedule: Schedule | null; error: Record<string, unknown> | null
+}
 export type Scenario = {
   id: string; name: string; description: string; planning_date: string; seed: number
   technicians: Technician[]; work_orders: WorkOrder[]
@@ -83,6 +87,7 @@ export type PlanVersion = {
   id: string; scenario_id: string; number: number
   action: 'baseline' | 'optimize' | 'replan' | 'activate' | 'restore' | 'experiment_publish'
   label: string; data_revision: number; source_version_id: string | null
+  lineage_source_version_id: string | null; stability_baseline_version_id: string | null
   relation: 'new' | 'optimized_from' | 'replanned_from' | 'reactivated_from' | 'restored_from' | 'published_from_experiment' | 'fresh_after_data_change'
   active: boolean; created_at: string; scenario_snapshot?: Scenario | null
   coverage_status: 'CURRENT_AND_COMPLETE' | 'PARTIAL_NEW_DEMAND' | 'STALE_DATA_CHANGED'
@@ -131,16 +136,19 @@ export type StrategyExperiment = {
 export type CostBreakdown = {
   labor_cost_cents: number; travel_cost_cents: number; overtime_cost_cents: number
   sla_penalty_cents: number; unserved_revenue_cents: number; outsourcing_cost_cents: number
+  cash_operating_cost_cents: number; service_failure_loss_cents: number; total_economic_impact_cents: number
   total_cost_cents: number; technician_cost_cents: Record<string, number>
 }
 
 export type CostAnalysis = {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
+  schedule_signature: string; analysis_scope: 'FULL_DAY_PLAN'; travel_model_fingerprint: string
+  analysis_code_version: string; analysis_input_hash: string
   policy: Record<string, unknown>; policy_fingerprint: string; breakdown: CostBreakdown; assumptions: string[]
 }
 
 export type CapacityOption = {
-  option_id: 'add_technician' | 'add_skill' | 'extend_shift' | 'allow_overtime' | 'outsource_unserved' | 'add_service_depot'
+  option_id: 'add_technician' | 'add_skill' | 'extend_shift' | 'allow_overtime' | 'outsource_unserved' | 'relocate_one_technician_start'
   name: string; assumption: string; feasible: boolean
   completion_rate: number; sla_on_time_rate: number; unassigned_count: number
   travel_minutes: number; overtime_minutes: number
@@ -152,13 +160,32 @@ export type CapacityOption = {
 
 export type CapacityAnalysis = {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
-  evaluation_method: string; base_schedule_signature: string; base_cost: CostBreakdown; options: CapacityOption[]
+  analysis_scope: 'FULL_DAY_PLAN'; analysis_code_version: string; analysis_input_hash: string; evaluation_method: string
+  reference_mode: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'
+  selected_plan_signature: string; reference_schedule_signature: string
+  reference_solver_policy_fingerprint: string; reference_travel_model_fingerprint: string
+  reference_kpis: Kpis; cost_policy_fingerprint: string
+  capacity_policy: Record<string, unknown>; capacity_policy_fingerprint: string
+  base_schedule_signature: string; base_cost: CostBreakdown; options: CapacityOption[]
 }
 
 export type RiskSimulation = {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
-  simulation_policy_version: string; simulation_input_hash: string; seed: number; trials: number
-  expected_sla_on_time_rate: number; late_minutes_p50: number; late_minutes_p90: number; late_minutes_p95: number
-  expected_overtime_minutes: number; plan_failure_probability: number; expected_unserved_orders: number
+  schedule_signature: string; analysis_scope: 'FULL_DAY_PLAN'; travel_model_fingerprint: string
+  execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE' | 'EARLIEST_FEASIBLE_EXECUTION'; execution_policy_version: string
+  simulation_policy_version: string; analysis_code_version: string; simulation_input_hash: string; seed: number; trials: number
+  expected_sla_on_time_rate: number; sla_rate_ci_low: number; sla_rate_ci_high: number
+  late_minutes_p50: number; late_minutes_p90: number; late_minutes_p95: number
+  expected_overtime_minutes: number; additional_disruption_probability: number
+  baseline_unserved_orders: number; expected_total_unserved_orders: number
+  plan_failure_probability: number; expected_unserved_orders: number
   assumptions: string[]
+}
+
+export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimulation> = {
+  id: string; scenario_id: string; number: number; plan_version_id: string; plan_number: number
+  analysis_type: 'COST' | 'CAPACITY' | 'RISK'; scenario_snapshot_hash: string; schedule_hash: string
+  execution_watermark: number | null; travel_model_fingerprint: string
+  policy_version: string; policy_snapshot: Record<string, unknown>; code_version: string; input_hash: string
+  status: 'COMPLETED'; result: T; created_at: string
 }

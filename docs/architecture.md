@@ -27,8 +27,12 @@ request
 - Cloning creates an independent scenario from a historical snapshot.
 - Resetting a scenario restores its own first revision, so a clone returns to the snapshot it was created from rather than to a similarly named built-in fixture.
 - Business rollback is an explicit, previewed operation. It creates a new `D` and `V` and does not delete later history.
+- Runtime applicability is stored in `plan_applicability`. Reading a plan overlays `active` and `coverage_status` without rewriting the frozen `plan_versions.payload`.
+- Replan lineage stores both the immediate source and the original stability baseline. Activating a historical replan preserves the latter.
 
 An emergency intake commits its work order and `D` revision before replanning. Intake and each solve attempt have separate idempotency records. If solving fails, the previous plan remains visible with `PARTIAL_NEW_DEMAND`; the work order is not rolled back and another attempt can be started without receiving it twice.
+
+The intake command also stores the exact solve publication key. Startup reconciliation can therefore distinguish an intake that still needs a retry from a solve that already published, without guessing a key from the command namespace.
 
 Replanning receives a persisted `PlanningContext`. Only explicit started or completed states are frozen automatically. A time-based inference is a warning, not an execution fact.
 
@@ -40,10 +44,16 @@ Work-order status is not editable through the generic update route. Starting and
 
 Strategy experiments use one worker and a bounded four-slot queue. Cancellation is cooperative between candidate solves. A cancellation request cannot be overwritten by stale worker progress. A run can finish as `COMPLETED_WITH_ERRORS` when some profiles fail, and the experiment records the single candidate and plan selected for publication.
 
+## Decision analysis
+
+Cost, capacity, and risk analysis validate the selected plan's snapshot, solver policy, schedule and travel fingerprints. The UI creates a `DecisionAnalysisRun` instead of displaying an untracked recalculation. Runs receive a scenario-local `A` number and persist the complete input policy, code version, input hash and result; identical inputs for the same V and analysis type are deduplicated.
+
+The current analysis contract is `FULL_DAY_PLAN`. A plan snapshot containing started or completed work is rejected until an execution-watermarked actual/forecast model exists. Capacity defaults to selected-plan incremental placement; controlled reoptimization uses one deterministic policy for both the reference and every option.
+
 ## Storage
 
-SQLite schema v6 uses foreign keys for scenario-owned data, enforces one parent for every schedule artifact, limits each run to one candidate, and stores work-order execution events. Connections use WAL and a busy timeout. Migrations create a timestamped backup before changing an existing database.
+SQLite schema v13 uses foreign keys for scenario-owned data, enforces one parent for every schedule artifact, limits each schedule run to one candidate, separates plan applicability, and stores work-order execution events and decision-analysis runs. Connections use WAL and a busy timeout. Migrations create a timestamped backup before changing an existing database.
 
-The legacy `schedules` table remains as an API compatibility projection of published plans. New business logic uses `plan_versions`, `schedule_runs`, `schedule_candidates`, and `work_order_execution_events`. Saved candidates are immutable; publication rechecks their run, source, snapshot, planning context, and solver configuration.
+The legacy `schedules` table remains as an API compatibility projection of published plans. New business logic uses `plan_versions`, `plan_applicability`, `schedule_runs`, `schedule_candidates`, `decision_analysis_runs`, and `work_order_execution_events`. Saved candidates are immutable; publication rechecks their run, source, snapshot, planning context, and solver configuration.
 
 The application factory delays Store initialization and worker creation until FastAPI lifespan startup. The current module still uses a process-local Store binding, so two app instances should not be served concurrently in one process.

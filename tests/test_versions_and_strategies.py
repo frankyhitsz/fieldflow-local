@@ -499,6 +499,37 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
         )
 
 
+def test_replan_activation_preserves_lineage_and_original_stability_baseline(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "activation-stability.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        replanned = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": 600, "strategy": "stable", "time_limit_seconds": 1},
+        )
+        assert replanned.status_code == 200, replanned.text
+        baseline_plan, replan_plan = client.get("/api/scenarios/main/plan-versions").json()
+        assert replan_plan["lineage_source_version_id"] == baseline_plan["id"]
+        assert replan_plan["stability_baseline_version_id"] == baseline_plan["id"]
+
+        activated = client.post(
+            f"/api/scenarios/main/plan-versions/{replan_plan['id']}/activate",
+            json={"expected_revision": 0, "idempotency_key": "activate-replan-stability-001"},
+        )
+        assert activated.status_code == 200, activated.text
+        restored = activated.json()
+        assert restored["lineage_source_version_id"] == replan_plan["id"]
+        assert restored["stability_baseline_version_id"] == baseline_plan["id"]
+        assert restored["selected"]["kpis"]["stability_rate"] == replan_plan["selected"]["kpis"]["stability_rate"]
+        assert (
+            restored["selected"]["kpis"]["same_technician_rate"]
+            == replan_plan["selected"]["kpis"]["same_technician_rate"]
+        )
+
+
 def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "clone-reset.db"))
     import backend.main as main_module
@@ -767,9 +798,31 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 13
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
+
+
+@pytest.mark.parametrize("legacy_version", range(1, 13))
+def test_schema_versions_1_through_12_converge_to_current_schema(tmp_path, legacy_version):
+    database = tmp_path / f"schema-v{legacy_version}.db"
+    Store(database)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(f"PRAGMA user_version={legacy_version}")
+
+    migrated = Store(database)
+    assert migrated.get_scenario("main") is not None
+    with closing(sqlite3.connect(database)) as connection, connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert "publication_key" in {row[1] for row in connection.execute("PRAGMA table_info(command_keys)").fetchall()}
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='plan_applicability'"
+        ).fetchone()
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_runs'"
+        ).fetchone()
 
 
 def test_relational_schema_enforces_foreign_keys_and_artifact_parent(tmp_path):
@@ -780,6 +833,7 @@ def test_relational_schema_enforces_foreign_keys_and_artifact_parent(tmp_path):
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA foreign_key_list(plan_versions)").fetchall()
+        assert connection.execute("PRAGMA foreign_key_list(plan_applicability)").fetchall()
         assert connection.execute("PRAGMA foreign_key_list(schedule_artifacts)").fetchall()
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("INSERT INTO publication_keys VALUES ('orphan', 'x', 'missing-plan', 'now')")
@@ -814,7 +868,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"

@@ -244,20 +244,22 @@ function CompareDrawer({ data, onClose }: { data: Comparison; onClose: () => voi
   </section></div>
 }
 
-function ExecutionDialog({ scenario, assignment, action, onClose, onSubmit }: { scenario: Scenario; assignment: Assignment; action: 'start' | 'complete'; onClose: () => void; onSubmit: (occurredAt: number, earlyStartOverrideReason: string, note: string) => void }) {
+function ExecutionDialog({ scenario, assignment, action, onClose, onSubmit }: { scenario: Scenario; assignment: Assignment; action: 'start' | 'complete'; onClose: () => void; onSubmit: (occurredAt: number, earlyStartOverrideReason: string, estimatedRemainingMinutes: number | undefined, note: string) => void }) {
   const order = scenario.work_orders.find(item => item.id === assignment.work_order_id)!
   const technician = scenario.technicians.find(item => item.id === assignment.technician_id)
   const [occurredAt, setOccurredAt] = useState(() => executionDefaultTime(scenario, assignment, action))
   const [overrideReason, setOverrideReason] = useState('')
+  const [estimatedRemainingMinutes, setEstimatedRemainingMinutes] = useState(order.service_duration)
   const [note, setNote] = useState('')
   const customerReadyAt = Math.max(order.window_start, order.reported_at ?? 0)
   const early = action === 'start' && occurredAt < customerReadyAt
-  return <div className="modal-backdrop" onMouseDown={onClose}><form className="editor-modal compact execution-modal" role="dialog" aria-modal="true" aria-labelledby="execution-title" onMouseDown={event => event.stopPropagation()} onSubmit={event => { event.preventDefault(); onSubmit(occurredAt, overrideReason.trim(), note.trim()) }}>
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="editor-modal compact execution-modal" role="dialog" aria-modal="true" aria-labelledby="execution-title" onMouseDown={event => event.stopPropagation()} onSubmit={event => { event.preventDefault(); onSubmit(occurredAt, overrideReason.trim(), action === 'start' ? estimatedRemainingMinutes : undefined, note.trim()) }}>
     <div className="editor-head"><div><span className="eyebrow">ACTUAL EXECUTION</span><h2 id="execution-title">{action === 'start' ? '登记开始服务' : '登记完成服务'}</h2></div><button type="button" className="icon-btn" onClick={onClose} aria-label="关闭执行登记"><X size={18} /></button></div>
     <div className="execution-summary"><b>{assignment.work_order_id}</b><span>{technician?.name} · 计划 {hhmm(assignment.start_time)}–{hhmm(assignment.finish_time)}</span></div>
     <div className="form-grid">
       <label>实际发生时间（当日起分钟）<input aria-label="实际发生时间" type="number" min="0" max="2280" step="1" value={occurredAt} onChange={event => setOccurredAt(Number(event.target.value))} /><small>{hhmm(occurredAt)}，与重排时点相互独立</small></label>
       <label>执行技师<input aria-label="执行技师" value={technician?.name || assignment.technician_id} disabled /></label>
+      {action === 'start' && <label>预计剩余服务（分钟）<input aria-label="预计剩余服务" type="number" min="1" max="480" step="1" value={estimatedRemainingMinutes} onChange={event => setEstimatedRemainingMinutes(Number(event.target.value))} /><small>局部重排会据此冻结技师容量；超出估计后使用场景保守默认值</small></label>}
       {early && <label className="span-2">提前开始原因<textarea aria-label="提前开始原因" required value={overrideReason} onChange={event => setOverrideReason(event.target.value)} placeholder={`客户允许时间为 ${hhmm(customerReadyAt)}，请记录授权原因`} /></label>}
       <label className="span-2">执行备注<textarea aria-label="执行备注" value={note} onChange={event => setNote(event.target.value)} placeholder="可记录客户确认、现场情况或偏差原因" /></label>
     </div>
@@ -569,13 +571,19 @@ export default function App() {
     {selected && <ExplanationPanel scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
       setWorking('正在改派并局部重排')
       try {
-        await api.lock(scenario.id, orderId, technicianId, true)
-        const result = await api.replan(scenario.id, replanTime, 'stable', undefined, commandKey('replan'))
+        const result = await api.manualReassignment(scenario.id, orderId, technicianId, replanTime, scenario.revision, commandKey('manual-reassignment'))
         if (activeScenarioId.current !== scenario.id) return
-        const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
+        const planItems = await api.planVersions(scenario.id)
         if (activeScenarioId.current !== scenario.id) return
-        setScenario(fresh); setPlans(planItems); setSchedule(result); setHistoricalScenario(undefined); setToast('工单已改派并锁定')
-      } catch (error) { setToast(error instanceof Error ? error.message : '改派失败') }
+        setScenario(result.scenario); setPlans(planItems); setSchedule(result.schedule || planItems.find(item => item.active)?.selected); setHistoricalScenario(undefined)
+        setToast(result.replan_status === 'COMPLETED' ? '工单已改派并锁定' : '人工锁定已保存，但局部重排失败；最后发布方案仍保留，请检查后重试')
+      } catch (error) {
+        try {
+          const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
+          if (activeScenarioId.current === scenario.id) { setScenario(fresh); setPlans(planItems); setSchedule(planItems.find(item => item.active)?.selected) }
+        } catch { /* Keep the original actionable error when refresh also fails. */ }
+        setToast(error instanceof Error ? error.message : '改派失败')
+      }
       finally { setWorking(undefined) }
     }} onLock={async (assignment, locked) => {
       setWorking(locked ? '正在锁定安排' : '正在解除锁定')
@@ -595,11 +603,11 @@ export default function App() {
       } catch (e) { setToast(e instanceof Error ? e.message : '锁定失败') } finally { setWorking(undefined) }
     }} />}
     {comparison && <CompareDrawer data={comparison} onClose={() => setComparison(undefined)} />}
-    {executionEditor && <ExecutionDialog scenario={scenario} assignment={executionEditor.assignment} action={executionEditor.action} onClose={() => setExecutionEditor(undefined)} onSubmit={async (occurredAt, earlyStartOverrideReason, note) => {
+    {executionEditor && <ExecutionDialog scenario={scenario} assignment={executionEditor.assignment} action={executionEditor.action} onClose={() => setExecutionEditor(undefined)} onSubmit={async (occurredAt, earlyStartOverrideReason, estimatedRemainingMinutes, note) => {
       const { assignment, action } = executionEditor
       setWorking(action === 'start' ? '正在登记开始服务' : '正在登记完成服务')
       try {
-        const result = await api.executeWorkOrder(scenario.id, assignment.work_order_id, action, assignment.technician_id, occurredAt, scenario.revision, commandKey(`execution-${action}`), { earlyStartOverrideReason, note })
+        const result = await api.executeWorkOrder(scenario.id, assignment.work_order_id, action, assignment.technician_id, occurredAt, scenario.revision, commandKey(`execution-${action}`), { earlyStartOverrideReason, estimatedRemainingMinutes, note })
         if (activeScenarioId.current !== scenario.id) return
         const planItems = await api.planVersions(scenario.id)
         if (activeScenarioId.current !== scenario.id) return

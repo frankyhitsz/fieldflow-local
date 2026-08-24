@@ -68,6 +68,20 @@ class PlanCoverageStatus(str, Enum):
     stale_data_changed = "STALE_DATA_CHANGED"
 
 
+class DecisionAnalysisScope(str, Enum):
+    full_day_plan = "FULL_DAY_PLAN"
+
+
+class CapacityReferenceMode(str, Enum):
+    selected_plan_delta = "SELECTED_PLAN_DELTA"
+    controlled_reoptimization = "CONTROLLED_REOPTIMIZATION"
+
+
+class RiskExecutionPolicy(str, Enum):
+    follow_published_schedule = "FOLLOW_PUBLISHED_SCHEDULE"
+    earliest_feasible_execution = "EARLIEST_FEASIBLE_EXECUTION"
+
+
 class FreezeReason(str, Enum):
     started = "STARTED"
     completed = "COMPLETED"
@@ -161,6 +175,7 @@ class SolverConfig(BaseModel):
     overtime_weight: int = 30
     imbalance_weight: int = 1
     replan_change_weight: int = 80
+    active_service_default_remaining_minutes: int = Field(default=15, ge=5, le=240)
 
 
 class SolverPolicySnapshot(BaseModel):
@@ -355,6 +370,23 @@ class LockRequest(BaseModel):
     locked: bool = True
 
 
+class ManualReassignmentRequest(BaseModel):
+    work_order_id: Identifier
+    technician_id: Identifier
+    planning_time: int = Field(ge=0, le=1800)
+    expected_revision: int = Field(ge=0)
+    idempotency_key: IdempotencyKey
+
+
+class ManualReassignmentResult(BaseModel):
+    lock_persisted: bool
+    replan_status: Literal["COMPLETED", "FAILED"]
+    active_plan_preserved: bool
+    scenario: ScheduleScenario
+    schedule: ScheduleResult | None = None
+    error: dict[str, Any] | None = None
+
+
 class OptimizeRequest(BaseModel):
     time_limit_seconds: float | None = Field(default=None, ge=1, le=30)
     strategy: Literal["balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload"] = (
@@ -421,6 +453,7 @@ class WorkOrderExecutionRequest(BaseModel):
     expected_revision: int = Field(ge=0)
     idempotency_key: IdempotencyKey
     early_start_override_reason: ShortDescription | None = None
+    estimated_remaining_minutes: int | None = Field(default=None, ge=1, le=480)
     note: ShortDescription = ""
 
 
@@ -444,6 +477,7 @@ class WorkOrderExecutionEvent(BaseModel):
     actual_duration_minutes: int | None = Field(default=None, ge=1, le=2280)
     actual_late_start_minutes: int = Field(default=0, ge=0)
     early_start_override_reason: str | None = None
+    estimated_remaining_minutes: int | None = Field(default=None, ge=1, le=480)
     note: str = ""
 
 
@@ -519,6 +553,8 @@ class PlanVersion(BaseModel):
     label: ShortLabel
     data_revision: int
     source_version_id: str | None = None
+    lineage_source_version_id: str | None = None
+    stability_baseline_version_id: str | None = None
     relation: Literal[
         "new",
         "optimized_from",
@@ -706,6 +742,16 @@ class DecisionCostPolicy(BaseModel):
     outsourcing_cost_per_order_cents: int = Field(default=25_000, ge=0)
 
 
+class CapacityPolicy(BaseModel):
+    policy_version: str = "FIELD_SERVICE_CAPACITY_V2"
+    add_technician_fixed_cost_cents: int = Field(default=60_000, ge=0)
+    add_skill_fixed_cost_cents: int = Field(default=15_000, ge=0)
+    extend_shift_fixed_cost_cents: int = Field(default=0, ge=0)
+    allow_overtime_fixed_cost_cents: int = Field(default=0, ge=0)
+    outsource_unserved_fixed_cost_cents: int = Field(default=0, ge=0)
+    relocate_one_technician_start_fixed_cost_cents: int = Field(default=40_000, ge=0)
+
+
 class PlanCostBreakdown(BaseModel):
     labor_cost_cents: int = Field(ge=0)
     travel_cost_cents: int = Field(ge=0)
@@ -713,6 +759,10 @@ class PlanCostBreakdown(BaseModel):
     sla_penalty_cents: int = Field(ge=0)
     unserved_revenue_cents: int = Field(ge=0)
     outsourcing_cost_cents: int = Field(ge=0)
+    cash_operating_cost_cents: int = Field(ge=0)
+    service_failure_loss_cents: int = Field(ge=0)
+    total_economic_impact_cents: int = Field(ge=0)
+    # Kept for clients created before the cost terminology was corrected.
     total_cost_cents: int = Field(ge=0)
     technician_cost_cents: dict[str, int] = Field(default_factory=dict)
 
@@ -722,6 +772,11 @@ class CostAnalysis(BaseModel):
     plan_version_id: str
     plan_number: int
     scenario_snapshot_hash: str
+    schedule_signature: str
+    analysis_scope: DecisionAnalysisScope = DecisionAnalysisScope.full_day_plan
+    travel_model_fingerprint: str
+    analysis_code_version: str
+    analysis_input_hash: str
     policy: DecisionCostPolicy
     policy_fingerprint: str
     breakdown: PlanCostBreakdown
@@ -734,13 +789,27 @@ CapacityOptionId = Literal[
     "extend_shift",
     "allow_overtime",
     "outsource_unserved",
-    "add_service_depot",
+    "relocate_one_technician_start",
 ]
 
 
 class CapacityAnalysisRequest(BaseModel):
     option_ids: list[CapacityOptionId] = Field(default_factory=list, max_length=6)
+    reference_mode: CapacityReferenceMode = CapacityReferenceMode.selected_plan_delta
     cost_policy: DecisionCostPolicy = Field(default_factory=DecisionCostPolicy)
+    capacity_policy: CapacityPolicy = Field(default_factory=CapacityPolicy)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_option_name(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "option_ids" not in value:
+            return value
+        migrated = dict(value)
+        migrated["option_ids"] = [
+            "relocate_one_technician_start" if item == "add_service_depot" else item
+            for item in migrated.get("option_ids", [])
+        ]
+        return migrated
 
     @model_validator(mode="after")
     def validate_options(self) -> CapacityAnalysisRequest:
@@ -775,7 +844,20 @@ class CapacityAnalysis(BaseModel):
     plan_version_id: str
     plan_number: int
     scenario_snapshot_hash: str
+    analysis_scope: DecisionAnalysisScope = DecisionAnalysisScope.full_day_plan
+    analysis_code_version: str
+    analysis_input_hash: str
     evaluation_method: str
+    reference_mode: CapacityReferenceMode
+    selected_plan_signature: str
+    reference_schedule_signature: str
+    reference_solver_policy_fingerprint: str
+    reference_travel_model_fingerprint: str
+    reference_kpis: ScheduleKPI
+    cost_policy_fingerprint: str
+    capacity_policy: CapacityPolicy
+    capacity_policy_fingerprint: str
+    # Backward-compatible alias of reference_schedule_signature.
     base_schedule_signature: str
     base_cost: PlanCostBreakdown
     options: list[CapacityOptionResult]
@@ -789,6 +871,7 @@ class RiskSimulationRequest(BaseModel):
     technician_absence_basis_points: int = Field(default=300, ge=0, le=10_000)
     emergency_order_basis_points: int = Field(default=1_200, ge=0, le=10_000)
     customer_no_show_basis_points: int = Field(default=400, ge=0, le=10_000)
+    execution_policy: RiskExecutionPolicy = RiskExecutionPolicy.follow_published_schedule
 
 
 class RiskSimulationResult(BaseModel):
@@ -796,18 +879,57 @@ class RiskSimulationResult(BaseModel):
     plan_version_id: str
     plan_number: int
     scenario_snapshot_hash: str
-    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V1"
+    schedule_signature: str
+    analysis_scope: DecisionAnalysisScope = DecisionAnalysisScope.full_day_plan
+    travel_model_fingerprint: str
+    execution_policy: RiskExecutionPolicy
+    execution_policy_version: str = "FIELD_SERVICE_RISK_EXECUTION_V2"
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V2"
+    analysis_code_version: str
     simulation_input_hash: str
     seed: int
     trials: int
     expected_sla_on_time_rate: float = Field(ge=0, le=1)
+    sla_rate_ci_low: float = Field(ge=0, le=1)
+    sla_rate_ci_high: float = Field(ge=0, le=1)
     late_minutes_p50: int = Field(ge=0)
     late_minutes_p90: int = Field(ge=0)
     late_minutes_p95: int = Field(ge=0)
     expected_overtime_minutes: float = Field(ge=0)
+    additional_disruption_probability: float = Field(ge=0, le=1)
+    baseline_unserved_orders: int = Field(ge=0)
+    expected_total_unserved_orders: float = Field(ge=0)
+    # Compatibility aliases with corrected definitions documented in the API.
     plan_failure_probability: float = Field(ge=0, le=1)
     expected_unserved_orders: float = Field(ge=0)
     assumptions: list[str] = Field(default_factory=list)
+
+
+class DecisionAnalysisRunRequest(BaseModel):
+    analysis_type: Literal["COST", "CAPACITY", "RISK"]
+    cost_policy: DecisionCostPolicy = Field(default_factory=DecisionCostPolicy)
+    capacity_request: CapacityAnalysisRequest = Field(default_factory=CapacityAnalysisRequest)
+    risk_request: RiskSimulationRequest = Field(default_factory=RiskSimulationRequest)
+
+
+class DecisionAnalysisRun(BaseModel):
+    id: str
+    scenario_id: str
+    number: int = Field(ge=0)
+    plan_version_id: str
+    plan_number: int = Field(ge=1)
+    analysis_type: Literal["COST", "CAPACITY", "RISK"]
+    scenario_snapshot_hash: str
+    schedule_hash: str
+    execution_watermark: int | None = Field(default=None, ge=0)
+    travel_model_fingerprint: str
+    policy_version: str
+    policy_snapshot: dict[str, Any]
+    code_version: str
+    input_hash: str
+    status: Literal["COMPLETED"] = "COMPLETED"
+    result: CostAnalysis | CapacityAnalysis | RiskSimulationResult
+    created_at: str
 
 
 class VerificationIssue(BaseModel):

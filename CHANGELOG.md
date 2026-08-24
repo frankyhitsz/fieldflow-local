@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## 0.5.1 — unreleased
+
+- Bound capacity analysis to the selected plan by default and added a same-policy controlled reoptimization mode.
+- Made risk simulation follow published starts and separated cash cost, service-failure loss, total economic impact, and additional disruption risk.
+- Added immutable, deduplicated A-numbered decision-analysis records with snapshot, travel, policy, code, and input provenance.
+- Rejected full-day analysis when execution facts require a watermarked actual/forecast context.
+- Added emergency intake recovery keys, an idempotent manual reassignment command, configurable active-service estimates, and stable replan lineage.
+- Moved mutable plan applicability out of frozen plan payloads and upgraded SQLite through schema v13.
+- Added Pyright, dependency audits, OpenAPI snapshots, property tests, a Python 3.11 compatibility job, and stronger decision benchmarks.
+
+## 0.5.0
 
 - Made repeated post-completion replanning safe and separated future route sequence from immutable booking identity.
 - Added actual execution-time contracts, stale-assignment start gates, actual-position travel checks and active-service overrun projection.

@@ -1,0 +1,7069 @@
+{
+  "components": {
+    "schemas": {
+      "ActivatePlanRequest": {
+        "properties": {
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "idempotency_key"
+        ],
+        "title": "ActivatePlanRequest",
+        "type": "object"
+      },
+      "CapacityAnalysis": {
+        "properties": {
+          "analysis_code_version": {
+            "title": "Analysis Code Version",
+            "type": "string"
+          },
+          "analysis_input_hash": {
+            "title": "Analysis Input Hash",
+            "type": "string"
+          },
+          "analysis_scope": {
+            "$ref": "#/components/schemas/DecisionAnalysisScope",
+            "default": "FULL_DAY_PLAN"
+          },
+          "base_cost": {
+            "$ref": "#/components/schemas/PlanCostBreakdown"
+          },
+          "base_schedule_signature": {
+            "title": "Base Schedule Signature",
+            "type": "string"
+          },
+          "capacity_policy": {
+            "$ref": "#/components/schemas/CapacityPolicy"
+          },
+          "capacity_policy_fingerprint": {
+            "title": "Capacity Policy Fingerprint",
+            "type": "string"
+          },
+          "cost_policy_fingerprint": {
+            "title": "Cost Policy Fingerprint",
+            "type": "string"
+          },
+          "evaluation_method": {
+            "title": "Evaluation Method",
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/CapacityOptionResult"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "plan_number": {
+            "title": "Plan Number",
+            "type": "integer"
+          },
+          "plan_version_id": {
+            "title": "Plan Version Id",
+            "type": "string"
+          },
+          "reference_kpis": {
+            "$ref": "#/components/schemas/ScheduleKPI"
+          },
+          "reference_mode": {
+            "$ref": "#/components/schemas/CapacityReferenceMode"
+          },
+          "reference_schedule_signature": {
+            "title": "Reference Schedule Signature",
+            "type": "string"
+          },
+          "reference_solver_policy_fingerprint": {
+            "title": "Reference Solver Policy Fingerprint",
+            "type": "string"
+          },
+          "reference_travel_model_fingerprint": {
+            "title": "Reference Travel Model Fingerprint",
+            "type": "string"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "selected_plan_signature": {
+            "title": "Selected Plan Signature",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "plan_version_id",
+          "plan_number",
+          "scenario_snapshot_hash",
+          "analysis_code_version",
+          "analysis_input_hash",
+          "evaluation_method",
+          "reference_mode",
+          "selected_plan_signature",
+          "reference_schedule_signature",
+          "reference_solver_policy_fingerprint",
+          "reference_travel_model_fingerprint",
+          "reference_kpis",
+          "cost_policy_fingerprint",
+          "capacity_policy",
+          "capacity_policy_fingerprint",
+          "base_schedule_signature",
+          "base_cost",
+          "options"
+        ],
+        "title": "CapacityAnalysis",
+        "type": "object"
+      },
+      "CapacityAnalysisRequest": {
+        "properties": {
+          "capacity_policy": {
+            "$ref": "#/components/schemas/CapacityPolicy"
+          },
+          "cost_policy": {
+            "$ref": "#/components/schemas/DecisionCostPolicy"
+          },
+          "option_ids": {
+            "items": {
+              "enum": [
+                "add_technician",
+                "add_skill",
+                "extend_shift",
+                "allow_overtime",
+                "outsource_unserved",
+                "relocate_one_technician_start"
+              ],
+              "type": "string"
+            },
+            "maxItems": 6,
+            "title": "Option Ids",
+            "type": "array"
+          },
+          "reference_mode": {
+            "$ref": "#/components/schemas/CapacityReferenceMode",
+            "default": "SELECTED_PLAN_DELTA"
+          }
+        },
+        "title": "CapacityAnalysisRequest",
+        "type": "object"
+      },
+      "CapacityOptionResult": {
+        "properties": {
+          "assumption": {
+            "title": "Assumption",
+            "type": "string"
+          },
+          "completion_improvement_percentage_points": {
+            "title": "Completion Improvement Percentage Points",
+            "type": "number"
+          },
+          "completion_rate": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Completion Rate",
+            "type": "number"
+          },
+          "feasible": {
+            "title": "Feasible",
+            "type": "boolean"
+          },
+          "fixed_capacity_cost_cents": {
+            "minimum": 0.0,
+            "title": "Fixed Capacity Cost Cents",
+            "type": "integer"
+          },
+          "marginal_cost_cents": {
+            "title": "Marginal Cost Cents",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "option_id": {
+            "enum": [
+              "add_technician",
+              "add_skill",
+              "extend_shift",
+              "allow_overtime",
+              "outsource_unserved",
+              "relocate_one_technician_start"
+            ],
+            "title": "Option Id",
+            "type": "string"
+          },
+          "overtime_delta_minutes": {
+            "title": "Overtime Delta Minutes",
+            "type": "integer"
+          },
+          "overtime_minutes": {
+            "minimum": 0.0,
+            "title": "Overtime Minutes",
+            "type": "integer"
+          },
+          "projected_total_cost_cents": {
+            "minimum": 0.0,
+            "title": "Projected Total Cost Cents",
+            "type": "integer"
+          },
+          "schedule_signature": {
+            "title": "Schedule Signature",
+            "type": "string"
+          },
+          "sla_improvement_percentage_points": {
+            "title": "Sla Improvement Percentage Points",
+            "type": "number"
+          },
+          "sla_on_time_rate": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Sla On Time Rate",
+            "type": "number"
+          },
+          "travel_delta_minutes": {
+            "title": "Travel Delta Minutes",
+            "type": "integer"
+          },
+          "travel_minutes": {
+            "minimum": 0.0,
+            "title": "Travel Minutes",
+            "type": "integer"
+          },
+          "unassigned_count": {
+            "minimum": 0.0,
+            "title": "Unassigned Count",
+            "type": "integer"
+          },
+          "unassigned_delta": {
+            "title": "Unassigned Delta",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "option_id",
+          "name",
+          "assumption",
+          "feasible",
+          "completion_rate",
+          "sla_on_time_rate",
+          "unassigned_count",
+          "travel_minutes",
+          "overtime_minutes",
+          "completion_improvement_percentage_points",
+          "sla_improvement_percentage_points",
+          "unassigned_delta",
+          "travel_delta_minutes",
+          "overtime_delta_minutes",
+          "fixed_capacity_cost_cents",
+          "marginal_cost_cents",
+          "projected_total_cost_cents",
+          "schedule_signature"
+        ],
+        "title": "CapacityOptionResult",
+        "type": "object"
+      },
+      "CapacityPolicy": {
+        "properties": {
+          "add_skill_fixed_cost_cents": {
+            "default": 15000,
+            "minimum": 0.0,
+            "title": "Add Skill Fixed Cost Cents",
+            "type": "integer"
+          },
+          "add_technician_fixed_cost_cents": {
+            "default": 60000,
+            "minimum": 0.0,
+            "title": "Add Technician Fixed Cost Cents",
+            "type": "integer"
+          },
+          "allow_overtime_fixed_cost_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Allow Overtime Fixed Cost Cents",
+            "type": "integer"
+          },
+          "extend_shift_fixed_cost_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Extend Shift Fixed Cost Cents",
+            "type": "integer"
+          },
+          "outsource_unserved_fixed_cost_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Outsource Unserved Fixed Cost Cents",
+            "type": "integer"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_CAPACITY_V2",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "relocate_one_technician_start_fixed_cost_cents": {
+            "default": 40000,
+            "minimum": 0.0,
+            "title": "Relocate One Technician Start Fixed Cost Cents",
+            "type": "integer"
+          }
+        },
+        "title": "CapacityPolicy",
+        "type": "object"
+      },
+      "CapacityReferenceMode": {
+        "enum": [
+          "SELECTED_PLAN_DELTA",
+          "CONTROLLED_REOPTIMIZATION"
+        ],
+        "title": "CapacityReferenceMode",
+        "type": "string"
+      },
+      "CloneScenarioRequest": {
+        "properties": {
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "idempotency_key"
+        ],
+        "title": "CloneScenarioRequest",
+        "type": "object"
+      },
+      "Comparison": {
+        "properties": {
+          "added_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Added Work Orders",
+            "type": "array"
+          },
+          "after": {
+            "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "before": {
+            "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "changed_orders": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Changed Orders",
+            "type": "array"
+          },
+          "common_technicians": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Common Technicians",
+            "type": "array"
+          },
+          "common_work_order_count": {
+            "default": 0,
+            "title": "Common Work Order Count",
+            "type": "integer"
+          },
+          "comparable": {
+            "default": true,
+            "title": "Comparable",
+            "type": "boolean"
+          },
+          "delta": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Delta",
+            "type": "object"
+          },
+          "modified_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Modified Work Orders",
+            "type": "array"
+          },
+          "removed_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Removed Work Orders",
+            "type": "array"
+          },
+          "same_scenario_snapshot": {
+            "default": true,
+            "title": "Same Scenario Snapshot",
+            "type": "boolean"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "before",
+          "after",
+          "delta",
+          "changed_orders"
+        ],
+        "title": "Comparison",
+        "type": "object"
+      },
+      "CostAnalysis": {
+        "properties": {
+          "analysis_code_version": {
+            "title": "Analysis Code Version",
+            "type": "string"
+          },
+          "analysis_input_hash": {
+            "title": "Analysis Input Hash",
+            "type": "string"
+          },
+          "analysis_scope": {
+            "$ref": "#/components/schemas/DecisionAnalysisScope",
+            "default": "FULL_DAY_PLAN"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Assumptions",
+            "type": "array"
+          },
+          "breakdown": {
+            "$ref": "#/components/schemas/PlanCostBreakdown"
+          },
+          "plan_number": {
+            "title": "Plan Number",
+            "type": "integer"
+          },
+          "plan_version_id": {
+            "title": "Plan Version Id",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/DecisionCostPolicy"
+          },
+          "policy_fingerprint": {
+            "title": "Policy Fingerprint",
+            "type": "string"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "schedule_signature": {
+            "title": "Schedule Signature",
+            "type": "string"
+          },
+          "travel_model_fingerprint": {
+            "title": "Travel Model Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "plan_version_id",
+          "plan_number",
+          "scenario_snapshot_hash",
+          "schedule_signature",
+          "travel_model_fingerprint",
+          "analysis_code_version",
+          "analysis_input_hash",
+          "policy",
+          "policy_fingerprint",
+          "breakdown"
+        ],
+        "title": "CostAnalysis",
+        "type": "object"
+      },
+      "CoverageSummary": {
+        "properties": {
+          "active_work_orders": {
+            "title": "Active Work Orders",
+            "type": "integer"
+          },
+          "assigned_work_orders": {
+            "title": "Assigned Work Orders",
+            "type": "integer"
+          },
+          "duplicate_assignments": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Duplicate Assignments",
+            "type": "array"
+          },
+          "duplicate_unassigned": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Duplicate Unassigned",
+            "type": "array"
+          },
+          "missing_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Work Orders",
+            "type": "array"
+          },
+          "overlapping_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Overlapping Work Orders",
+            "type": "array"
+          },
+          "unassigned_work_orders": {
+            "title": "Unassigned Work Orders",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "active_work_orders",
+          "assigned_work_orders",
+          "unassigned_work_orders"
+        ],
+        "title": "CoverageSummary",
+        "type": "object"
+      },
+      "DecisionAnalysisRun": {
+        "properties": {
+          "analysis_type": {
+            "enum": [
+              "COST",
+              "CAPACITY",
+              "RISK"
+            ],
+            "title": "Analysis Type",
+            "type": "string"
+          },
+          "code_version": {
+            "title": "Code Version",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "execution_watermark": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Watermark"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input_hash": {
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "number": {
+            "minimum": 0.0,
+            "title": "Number",
+            "type": "integer"
+          },
+          "plan_number": {
+            "minimum": 1.0,
+            "title": "Plan Number",
+            "type": "integer"
+          },
+          "plan_version_id": {
+            "title": "Plan Version Id",
+            "type": "string"
+          },
+          "policy_snapshot": {
+            "additionalProperties": true,
+            "title": "Policy Snapshot",
+            "type": "object"
+          },
+          "policy_version": {
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CostAnalysis"
+              },
+              {
+                "$ref": "#/components/schemas/CapacityAnalysis"
+              },
+              {
+                "$ref": "#/components/schemas/RiskSimulationResult"
+              }
+            ],
+            "title": "Result"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "schedule_hash": {
+            "title": "Schedule Hash",
+            "type": "string"
+          },
+          "status": {
+            "const": "COMPLETED",
+            "default": "COMPLETED",
+            "title": "Status",
+            "type": "string"
+          },
+          "travel_model_fingerprint": {
+            "title": "Travel Model Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "number",
+          "plan_version_id",
+          "plan_number",
+          "analysis_type",
+          "scenario_snapshot_hash",
+          "schedule_hash",
+          "travel_model_fingerprint",
+          "policy_version",
+          "policy_snapshot",
+          "code_version",
+          "input_hash",
+          "result",
+          "created_at"
+        ],
+        "title": "DecisionAnalysisRun",
+        "type": "object"
+      },
+      "DecisionAnalysisRunRequest": {
+        "properties": {
+          "analysis_type": {
+            "enum": [
+              "COST",
+              "CAPACITY",
+              "RISK"
+            ],
+            "title": "Analysis Type",
+            "type": "string"
+          },
+          "capacity_request": {
+            "$ref": "#/components/schemas/CapacityAnalysisRequest"
+          },
+          "cost_policy": {
+            "$ref": "#/components/schemas/DecisionCostPolicy"
+          },
+          "risk_request": {
+            "$ref": "#/components/schemas/RiskSimulationRequest"
+          }
+        },
+        "required": [
+          "analysis_type"
+        ],
+        "title": "DecisionAnalysisRunRequest",
+        "type": "object"
+      },
+      "DecisionAnalysisScope": {
+        "enum": [
+          "FULL_DAY_PLAN"
+        ],
+        "title": "DecisionAnalysisScope",
+        "type": "string"
+      },
+      "DecisionCostPolicy": {
+        "properties": {
+          "currency": {
+            "const": "CNY",
+            "default": "CNY",
+            "title": "Currency",
+            "type": "string"
+          },
+          "outsourcing_cost_per_order_cents": {
+            "default": 25000,
+            "minimum": 0.0,
+            "title": "Outsourcing Cost Per Order Cents",
+            "type": "integer"
+          },
+          "overtime_premium_basis_points": {
+            "default": 5000,
+            "maximum": 30000.0,
+            "minimum": 0.0,
+            "title": "Overtime Premium Basis Points",
+            "type": "integer"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_COST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "sla_penalty_per_late_minute_cents": {
+            "default": 200,
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Sla Penalty Per Late Minute Cents",
+            "type": "integer"
+          },
+          "travel_cost_per_minute_cents": {
+            "default": 35,
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Travel Cost Per Minute Cents",
+            "type": "integer"
+          },
+          "unserved_high_revenue_cents": {
+            "default": 20000,
+            "minimum": 0.0,
+            "title": "Unserved High Revenue Cents",
+            "type": "integer"
+          },
+          "unserved_low_revenue_cents": {
+            "default": 8000,
+            "minimum": 0.0,
+            "title": "Unserved Low Revenue Cents",
+            "type": "integer"
+          },
+          "unserved_normal_revenue_cents": {
+            "default": 12000,
+            "minimum": 0.0,
+            "title": "Unserved Normal Revenue Cents",
+            "type": "integer"
+          },
+          "unserved_urgent_revenue_cents": {
+            "default": 30000,
+            "minimum": 0.0,
+            "title": "Unserved Urgent Revenue Cents",
+            "type": "integer"
+          },
+          "vip_revenue_premium_cents": {
+            "default": 10000,
+            "minimum": 0.0,
+            "title": "Vip Revenue Premium Cents",
+            "type": "integer"
+          }
+        },
+        "title": "DecisionCostPolicy",
+        "type": "object"
+      },
+      "ExecutionSourceAssignment": {
+        "properties": {
+          "actual_start_at": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Start At"
+          },
+          "future_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Future Sequence"
+          },
+          "planned_finish_at": {
+            "maximum": 2280.0,
+            "minimum": 0.0,
+            "title": "Planned Finish At",
+            "type": "integer"
+          },
+          "planned_start_at": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Planned Start At",
+            "type": "integer"
+          },
+          "projected_available_at": {
+            "maximum": 2760.0,
+            "minimum": 0.0,
+            "title": "Projected Available At",
+            "type": "integer"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "source_assignment_hash": {
+            "title": "Source Assignment Hash",
+            "type": "string"
+          },
+          "source_schedule_id": {
+            "title": "Source Schedule Id",
+            "type": "string"
+          },
+          "source_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Sequence"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "technician_id",
+          "source_schedule_id",
+          "source_assignment_hash",
+          "sequence",
+          "planned_start_at",
+          "planned_finish_at",
+          "projected_available_at"
+        ],
+        "title": "ExecutionSourceAssignment",
+        "type": "object"
+      },
+      "ExecutionSourceContext": {
+        "properties": {
+          "active_plan_snapshot_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Plan Snapshot Hash"
+          },
+          "active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Plan Version Id"
+          },
+          "active_schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Schedule Id"
+          },
+          "completed_assignments": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionSourceAssignment"
+            },
+            "title": "Completed Assignments",
+            "type": "array"
+          },
+          "execution_event_sequence": {
+            "minimum": 0.0,
+            "title": "Execution Event Sequence",
+            "type": "integer"
+          },
+          "started_assignments": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionSourceAssignment"
+            },
+            "title": "Started Assignments",
+            "type": "array"
+          },
+          "technician_projections": {
+            "items": {
+              "$ref": "#/components/schemas/TechnicianExecutionProjection"
+            },
+            "title": "Technician Projections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "execution_event_sequence"
+        ],
+        "title": "ExecutionSourceContext",
+        "type": "object"
+      },
+      "ExperimentPublishRequest": {
+        "properties": {
+          "candidate_id": {
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "candidate_id",
+          "expected_revision"
+        ],
+        "title": "ExperimentPublishRequest",
+        "type": "object"
+      },
+      "FreezeReason": {
+        "enum": [
+          "STARTED",
+          "COMPLETED"
+        ],
+        "title": "FreezeReason",
+        "type": "string"
+      },
+      "FrozenAssignment": {
+        "properties": {
+          "finish_time": {
+            "maximum": 2280.0,
+            "minimum": 0.0,
+            "title": "Finish Time",
+            "type": "integer"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/FreezeReason"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "source_assignment_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Assignment Hash"
+          },
+          "source_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Sequence"
+          },
+          "start_time": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Start Time",
+            "type": "integer"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "technician_id",
+          "sequence",
+          "start_time",
+          "finish_time",
+          "reason"
+        ],
+        "title": "FrozenAssignment",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "LockRequest": {
+        "properties": {
+          "locked": {
+            "default": true,
+            "title": "Locked",
+            "type": "boolean"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "technician_id"
+        ],
+        "title": "LockRequest",
+        "type": "object"
+      },
+      "LockedAssignment": {
+        "properties": {
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "technician_id"
+        ],
+        "title": "LockedAssignment",
+        "type": "object"
+      },
+      "ManualReassignmentRequest": {
+        "properties": {
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "planning_time": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Planning Time",
+            "type": "integer"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "technician_id",
+          "planning_time",
+          "expected_revision",
+          "idempotency_key"
+        ],
+        "title": "ManualReassignmentRequest",
+        "type": "object"
+      },
+      "ManualReassignmentResult": {
+        "properties": {
+          "active_plan_preserved": {
+            "title": "Active Plan Preserved",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "lock_persisted": {
+            "title": "Lock Persisted",
+            "type": "boolean"
+          },
+          "replan_status": {
+            "enum": [
+              "COMPLETED",
+              "FAILED"
+            ],
+            "title": "Replan Status",
+            "type": "string"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/ScheduleScenario"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "lock_persisted",
+          "replan_status",
+          "active_plan_preserved",
+          "scenario"
+        ],
+        "title": "ManualReassignmentResult",
+        "type": "object"
+      },
+      "OptimizeRequest": {
+        "properties": {
+          "profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "strategy": {
+            "default": "balanced",
+            "enum": [
+              "balanced",
+              "completion",
+              "punctuality",
+              "low_travel",
+              "low_overtime",
+              "fair_workload"
+            ],
+            "title": "Strategy",
+            "type": "string"
+          },
+          "time_limit_seconds": {
+            "anyOf": [
+              {
+                "maximum": 30.0,
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Limit Seconds"
+          }
+        },
+        "title": "OptimizeRequest",
+        "type": "object"
+      },
+      "PlanCostBreakdown": {
+        "properties": {
+          "cash_operating_cost_cents": {
+            "minimum": 0.0,
+            "title": "Cash Operating Cost Cents",
+            "type": "integer"
+          },
+          "labor_cost_cents": {
+            "minimum": 0.0,
+            "title": "Labor Cost Cents",
+            "type": "integer"
+          },
+          "outsourcing_cost_cents": {
+            "minimum": 0.0,
+            "title": "Outsourcing Cost Cents",
+            "type": "integer"
+          },
+          "overtime_cost_cents": {
+            "minimum": 0.0,
+            "title": "Overtime Cost Cents",
+            "type": "integer"
+          },
+          "service_failure_loss_cents": {
+            "minimum": 0.0,
+            "title": "Service Failure Loss Cents",
+            "type": "integer"
+          },
+          "sla_penalty_cents": {
+            "minimum": 0.0,
+            "title": "Sla Penalty Cents",
+            "type": "integer"
+          },
+          "technician_cost_cents": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Technician Cost Cents",
+            "type": "object"
+          },
+          "total_cost_cents": {
+            "minimum": 0.0,
+            "title": "Total Cost Cents",
+            "type": "integer"
+          },
+          "total_economic_impact_cents": {
+            "minimum": 0.0,
+            "title": "Total Economic Impact Cents",
+            "type": "integer"
+          },
+          "travel_cost_cents": {
+            "minimum": 0.0,
+            "title": "Travel Cost Cents",
+            "type": "integer"
+          },
+          "unserved_revenue_cents": {
+            "minimum": 0.0,
+            "title": "Unserved Revenue Cents",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "labor_cost_cents",
+          "travel_cost_cents",
+          "overtime_cost_cents",
+          "sla_penalty_cents",
+          "unserved_revenue_cents",
+          "outsourcing_cost_cents",
+          "cash_operating_cost_cents",
+          "service_failure_loss_cents",
+          "total_economic_impact_cents",
+          "total_cost_cents"
+        ],
+        "title": "PlanCostBreakdown",
+        "type": "object"
+      },
+      "PlanCoverageStatus": {
+        "enum": [
+          "CURRENT_AND_COMPLETE",
+          "PARTIAL_NEW_DEMAND",
+          "STALE_DATA_CHANGED"
+        ],
+        "title": "PlanCoverageStatus",
+        "type": "string"
+      },
+      "PlanVersion": {
+        "properties": {
+          "action": {
+            "enum": [
+              "baseline",
+              "optimize",
+              "replan",
+              "activate",
+              "restore",
+              "experiment_publish"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "active": {
+            "default": false,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ScheduleArtifact"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Id"
+          },
+          "coverage_status": {
+            "$ref": "#/components/schemas/PlanCoverageStatus",
+            "default": "CURRENT_AND_COMPLETE"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "data_revision": {
+            "title": "Data Revision",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "lineage_source_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage Source Version Id"
+          },
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "relation": {
+            "default": "new",
+            "enum": [
+              "new",
+              "optimized_from",
+              "replanned_from",
+              "reactivated_from",
+              "restored_from",
+              "published_from_experiment",
+              "fresh_after_data_change"
+            ],
+            "title": "Relation",
+            "type": "string"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleScenario"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scenario_snapshot_hash": {
+            "default": "",
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "selected": {
+            "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "source_plan_snapshot_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Plan Snapshot Hash"
+          },
+          "source_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Version Id"
+          },
+          "stability_baseline_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stability Baseline Version Id"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "number",
+          "action",
+          "label",
+          "data_revision",
+          "created_at",
+          "selected"
+        ],
+        "title": "PlanVersion",
+        "type": "object"
+      },
+      "PlanVersionPatch": {
+        "properties": {
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "PlanVersionPatch",
+        "type": "object"
+      },
+      "PlanningContext": {
+        "properties": {
+          "execution_source_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionSourceContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution_warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Execution Warnings",
+            "type": "array"
+          },
+          "frozen_assignments": {
+            "items": {
+              "$ref": "#/components/schemas/FrozenAssignment"
+            },
+            "title": "Frozen Assignments",
+            "type": "array"
+          },
+          "inferred_departure_warnings": {
+            "items": {
+              "maxLength": 80,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Inferred Departure Warnings",
+            "type": "array"
+          },
+          "planning_time": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Planning Time",
+            "type": "integer"
+          },
+          "scenario_revision": {
+            "minimum": 0.0,
+            "title": "Scenario Revision",
+            "type": "integer"
+          },
+          "source_plan_snapshot_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Plan Snapshot Hash"
+          },
+          "source_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Plan Version Id"
+          }
+        },
+        "required": [
+          "planning_time",
+          "scenario_revision"
+        ],
+        "title": "PlanningContext",
+        "type": "object"
+      },
+      "Point": {
+        "properties": {
+          "x": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "X",
+            "type": "number"
+          },
+          "y": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Y",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "title": "Point",
+        "type": "object"
+      },
+      "Priority": {
+        "enum": [
+          "urgent",
+          "high",
+          "normal",
+          "low"
+        ],
+        "title": "Priority",
+        "type": "string"
+      },
+      "ReplanRequest": {
+        "properties": {
+          "current_time": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Time"
+          },
+          "emergency_order": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkOrder"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "intake_idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intake Idempotency Key"
+          },
+          "planning_time": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planning Time"
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "strategy": {
+            "default": "stable",
+            "enum": [
+              "balanced",
+              "completion",
+              "punctuality",
+              "low_travel",
+              "low_overtime",
+              "fair_workload",
+              "stable"
+            ],
+            "title": "Strategy",
+            "type": "string"
+          },
+          "time_limit_seconds": {
+            "anyOf": [
+              {
+                "maximum": 30.0,
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Limit Seconds"
+          }
+        },
+        "title": "ReplanRequest",
+        "type": "object"
+      },
+      "RestoreRequest": {
+        "properties": {
+          "allow_delete_new_orders": {
+            "default": false,
+            "title": "Allow Delete New Orders",
+            "type": "boolean"
+          },
+          "allow_reopen_completed": {
+            "default": false,
+            "description": "兼容旧客户端；执行事件不可变，服务端始终拒绝重新打开已完成工单",
+            "title": "Allow Reopen Completed",
+            "type": "boolean"
+          },
+          "confirmation_token": {
+            "maxLength": 128,
+            "minLength": 16,
+            "title": "Confirmation Token",
+            "type": "string"
+          },
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "confirmation_token",
+          "reason",
+          "idempotency_key"
+        ],
+        "title": "RestoreRequest",
+        "type": "object"
+      },
+      "RiskExecutionPolicy": {
+        "enum": [
+          "FOLLOW_PUBLISHED_SCHEDULE",
+          "EARLIEST_FEASIBLE_EXECUTION"
+        ],
+        "title": "RiskExecutionPolicy",
+        "type": "string"
+      },
+      "RiskSimulationRequest": {
+        "properties": {
+          "customer_no_show_basis_points": {
+            "default": 400,
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Customer No Show Basis Points",
+            "type": "integer"
+          },
+          "emergency_order_basis_points": {
+            "default": 1200,
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Emergency Order Basis Points",
+            "type": "integer"
+          },
+          "execution_policy": {
+            "$ref": "#/components/schemas/RiskExecutionPolicy",
+            "default": "FOLLOW_PUBLISHED_SCHEDULE"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "service_duration_jitter_percent": {
+            "default": 25,
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Service Duration Jitter Percent",
+            "type": "integer"
+          },
+          "technician_absence_basis_points": {
+            "default": 300,
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Technician Absence Basis Points",
+            "type": "integer"
+          },
+          "travel_delay_max_percent": {
+            "default": 35,
+            "maximum": 300.0,
+            "minimum": 0.0,
+            "title": "Travel Delay Max Percent",
+            "type": "integer"
+          },
+          "trials": {
+            "default": 500,
+            "maximum": 5000.0,
+            "minimum": 50.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "title": "RiskSimulationRequest",
+        "type": "object"
+      },
+      "RiskSimulationResult": {
+        "properties": {
+          "additional_disruption_probability": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Additional Disruption Probability",
+            "type": "number"
+          },
+          "analysis_code_version": {
+            "title": "Analysis Code Version",
+            "type": "string"
+          },
+          "analysis_scope": {
+            "$ref": "#/components/schemas/DecisionAnalysisScope",
+            "default": "FULL_DAY_PLAN"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Assumptions",
+            "type": "array"
+          },
+          "baseline_unserved_orders": {
+            "minimum": 0.0,
+            "title": "Baseline Unserved Orders",
+            "type": "integer"
+          },
+          "execution_policy": {
+            "$ref": "#/components/schemas/RiskExecutionPolicy"
+          },
+          "execution_policy_version": {
+            "default": "FIELD_SERVICE_RISK_EXECUTION_V2",
+            "title": "Execution Policy Version",
+            "type": "string"
+          },
+          "expected_overtime_minutes": {
+            "minimum": 0.0,
+            "title": "Expected Overtime Minutes",
+            "type": "number"
+          },
+          "expected_sla_on_time_rate": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Expected Sla On Time Rate",
+            "type": "number"
+          },
+          "expected_total_unserved_orders": {
+            "minimum": 0.0,
+            "title": "Expected Total Unserved Orders",
+            "type": "number"
+          },
+          "expected_unserved_orders": {
+            "minimum": 0.0,
+            "title": "Expected Unserved Orders",
+            "type": "number"
+          },
+          "late_minutes_p50": {
+            "minimum": 0.0,
+            "title": "Late Minutes P50",
+            "type": "integer"
+          },
+          "late_minutes_p90": {
+            "minimum": 0.0,
+            "title": "Late Minutes P90",
+            "type": "integer"
+          },
+          "late_minutes_p95": {
+            "minimum": 0.0,
+            "title": "Late Minutes P95",
+            "type": "integer"
+          },
+          "plan_failure_probability": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Plan Failure Probability",
+            "type": "number"
+          },
+          "plan_number": {
+            "title": "Plan Number",
+            "type": "integer"
+          },
+          "plan_version_id": {
+            "title": "Plan Version Id",
+            "type": "string"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "schedule_signature": {
+            "title": "Schedule Signature",
+            "type": "string"
+          },
+          "seed": {
+            "title": "Seed",
+            "type": "integer"
+          },
+          "simulation_input_hash": {
+            "title": "Simulation Input Hash",
+            "type": "string"
+          },
+          "simulation_policy_version": {
+            "default": "FIELD_SERVICE_SIMULATION_V2",
+            "title": "Simulation Policy Version",
+            "type": "string"
+          },
+          "sla_rate_ci_high": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Sla Rate Ci High",
+            "type": "number"
+          },
+          "sla_rate_ci_low": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Sla Rate Ci Low",
+            "type": "number"
+          },
+          "travel_model_fingerprint": {
+            "title": "Travel Model Fingerprint",
+            "type": "string"
+          },
+          "trials": {
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "plan_version_id",
+          "plan_number",
+          "scenario_snapshot_hash",
+          "schedule_signature",
+          "travel_model_fingerprint",
+          "execution_policy",
+          "analysis_code_version",
+          "simulation_input_hash",
+          "seed",
+          "trials",
+          "expected_sla_on_time_rate",
+          "sla_rate_ci_low",
+          "sla_rate_ci_high",
+          "late_minutes_p50",
+          "late_minutes_p90",
+          "late_minutes_p95",
+          "expected_overtime_minutes",
+          "additional_disruption_probability",
+          "baseline_unserved_orders",
+          "expected_total_unserved_orders",
+          "plan_failure_probability",
+          "expected_unserved_orders"
+        ],
+        "title": "RiskSimulationResult",
+        "type": "object"
+      },
+      "RollbackPreview": {
+        "properties": {
+          "added_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Added Work Orders",
+            "type": "array"
+          },
+          "affected_execution_event_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Affected Execution Event Ids",
+            "type": "array"
+          },
+          "changed_plan_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changed Plan Work Orders",
+            "type": "array"
+          },
+          "completed_work_orders_reopened": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Completed Work Orders Reopened",
+            "type": "array"
+          },
+          "confirmation_token": {
+            "title": "Confirmation Token",
+            "type": "string"
+          },
+          "current_plan_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Plan Number"
+          },
+          "current_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Plan Version Id"
+          },
+          "executed_work_orders_deleted": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Executed Work Orders Deleted",
+            "type": "array"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "lock_changes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Lock Changes",
+            "type": "array"
+          },
+          "modified_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Modified Work Orders",
+            "type": "array"
+          },
+          "removed_work_orders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Removed Work Orders",
+            "type": "array"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "source_version_id": {
+            "title": "Source Version Id",
+            "type": "string"
+          },
+          "started_work_orders_reopened": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Started Work Orders Reopened",
+            "type": "array"
+          },
+          "technician_changes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Technician Changes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "source_version_id",
+          "expected_revision",
+          "confirmation_token"
+        ],
+        "title": "RollbackPreview",
+        "type": "object"
+      },
+      "ScenarioCreate": {
+        "properties": {
+          "fixture_id": {
+            "default": "main",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Fixture Id",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "ScenarioCreate",
+        "type": "object"
+      },
+      "ScheduleArtifact": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "baseline",
+              "selected",
+              "candidate"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "strategy": {
+            "title": "Strategy",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "strategy",
+          "schedule"
+        ],
+        "title": "ScheduleArtifact",
+        "type": "object"
+      },
+      "ScheduleAssignment": {
+        "properties": {
+          "arrival_time": {
+            "title": "Arrival Time",
+            "type": "integer"
+          },
+          "changed": {
+            "default": false,
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "explanation": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Explanation",
+            "type": "array"
+          },
+          "finish_time": {
+            "title": "Finish Time",
+            "type": "integer"
+          },
+          "locked": {
+            "default": false,
+            "title": "Locked",
+            "type": "boolean"
+          },
+          "planning_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planning Fingerprint"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "sla_late_minutes": {
+            "title": "Sla Late Minutes",
+            "type": "integer"
+          },
+          "source_assignment_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Assignment Hash"
+          },
+          "source_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Sequence"
+          },
+          "start_time": {
+            "title": "Start Time",
+            "type": "integer"
+          },
+          "technician_id": {
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "travel_minutes": {
+            "title": "Travel Minutes",
+            "type": "integer"
+          },
+          "work_order_id": {
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "technician_id",
+          "sequence",
+          "arrival_time",
+          "start_time",
+          "finish_time",
+          "travel_minutes",
+          "sla_late_minutes",
+          "explanation"
+        ],
+        "title": "ScheduleAssignment",
+        "type": "object"
+      },
+      "ScheduleCandidate": {
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "planning_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanningContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "planning_context_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planning Context Hash"
+          },
+          "publishable": {
+            "title": "Publishable",
+            "type": "boolean"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "integer"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "solver_config_hash": {
+            "title": "Solver Config Hash",
+            "type": "string"
+          },
+          "solver_policy_fingerprint": {
+            "default": "",
+            "title": "Solver Policy Fingerprint",
+            "type": "string"
+          },
+          "source_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Plan Version Id"
+          },
+          "verification_report": {
+            "$ref": "#/components/schemas/ScheduleVerificationReport"
+          }
+        },
+        "required": [
+          "id",
+          "run_id",
+          "scenario_id",
+          "scenario_revision",
+          "scenario_snapshot_hash",
+          "solver_config_hash",
+          "schedule",
+          "verification_report",
+          "publishable",
+          "created_at"
+        ],
+        "title": "ScheduleCandidate",
+        "type": "object"
+      },
+      "ScheduleKPI": {
+        "properties": {
+          "adjacency_preservation_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adjacency Preservation Rate"
+          },
+          "assigned_on_time_rate": {
+            "default": 0,
+            "title": "Assigned On Time Rate",
+            "type": "number"
+          },
+          "average_occupied_utilization": {
+            "default": 0,
+            "title": "Average Occupied Utilization",
+            "type": "number"
+          },
+          "average_utilization": {
+            "title": "Average Utilization",
+            "type": "number"
+          },
+          "committed_on_time_rate": {
+            "default": 0,
+            "title": "Committed On Time Rate",
+            "type": "number"
+          },
+          "completion_rate": {
+            "title": "Completion Rate",
+            "type": "number"
+          },
+          "customer_notification_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Notification Count"
+          },
+          "high_priority_missed": {
+            "title": "High Priority Missed",
+            "type": "integer"
+          },
+          "normalized_workload_range": {
+            "default": 0,
+            "title": "Normalized Workload Range",
+            "type": "number"
+          },
+          "p90_late_minutes": {
+            "default": 0,
+            "title": "P90 Late Minutes",
+            "type": "integer"
+          },
+          "same_technician_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Same Technician Rate"
+          },
+          "sla_late_count": {
+            "title": "Sla Late Count",
+            "type": "integer"
+          },
+          "sla_on_time_rate": {
+            "title": "Sla On Time Rate",
+            "type": "number"
+          },
+          "stability_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stability Rate"
+          },
+          "start_time_shift_median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Time Shift Median"
+          },
+          "start_time_shift_over_15m_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Time Shift Over 15M Count"
+          },
+          "start_time_shift_p90": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Time Shift P90"
+          },
+          "technician": {
+            "items": {
+              "$ref": "#/components/schemas/TechnicianKPI"
+            },
+            "title": "Technician",
+            "type": "array"
+          },
+          "total_late_minutes": {
+            "default": 0,
+            "title": "Total Late Minutes",
+            "type": "integer"
+          },
+          "total_overtime_minutes": {
+            "title": "Total Overtime Minutes",
+            "type": "integer"
+          },
+          "total_service_minutes": {
+            "title": "Total Service Minutes",
+            "type": "integer"
+          },
+          "total_travel_minutes": {
+            "title": "Total Travel Minutes",
+            "type": "integer"
+          },
+          "total_waiting_minutes": {
+            "default": 0,
+            "title": "Total Waiting Minutes",
+            "type": "integer"
+          },
+          "unassigned_count": {
+            "title": "Unassigned Count",
+            "type": "integer"
+          },
+          "workload_range": {
+            "default": 0,
+            "title": "Workload Range",
+            "type": "integer"
+          },
+          "workload_stddev": {
+            "title": "Workload Stddev",
+            "type": "number"
+          }
+        },
+        "required": [
+          "completion_rate",
+          "sla_on_time_rate",
+          "sla_late_count",
+          "total_travel_minutes",
+          "total_service_minutes",
+          "total_overtime_minutes",
+          "average_utilization",
+          "unassigned_count",
+          "high_priority_missed",
+          "workload_stddev",
+          "technician"
+        ],
+        "title": "ScheduleKPI",
+        "type": "object"
+      },
+      "ScheduleResult": {
+        "properties": {
+          "assignments": {
+            "items": {
+              "$ref": "#/components/schemas/ScheduleAssignment"
+            },
+            "title": "Assignments",
+            "type": "array"
+          },
+          "business_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Business Score"
+          },
+          "business_score_policy_version": {
+            "default": "FIELD_SERVICE_SCORE_V2",
+            "title": "Business Score Policy Version",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "effective_time_limit_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Time Limit Ms"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "baseline",
+              "optimized",
+              "replan"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "kpis": {
+            "$ref": "#/components/schemas/ScheduleKPI"
+          },
+          "metric_policy_version": {
+            "default": "FIELD_SERVICE_METRICS_V2",
+            "title": "Metric Policy Version",
+            "type": "string"
+          },
+          "objective": {
+            "title": "Objective",
+            "type": "number"
+          },
+          "objective_breakdown": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Objective Breakdown",
+            "type": "object"
+          },
+          "requested_time_limit_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Time Limit Ms"
+          },
+          "runtime_ms": {
+            "title": "Runtime Ms",
+            "type": "integer"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "default": 0,
+            "title": "Scenario Revision",
+            "type": "integer"
+          },
+          "scenario_snapshot_hash": {
+            "default": "",
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "solution_found": {
+            "default": true,
+            "title": "Solution Found",
+            "type": "boolean"
+          },
+          "solver_config_hash": {
+            "default": "",
+            "title": "Solver Config Hash",
+            "type": "string"
+          },
+          "solver_name": {
+            "default": "fieldflow-greedy",
+            "title": "Solver Name",
+            "type": "string"
+          },
+          "solver_note": {
+            "default": "",
+            "title": "Solver Note",
+            "type": "string"
+          },
+          "solver_objective_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Solver Objective Value"
+          },
+          "solver_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SolverPolicySnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "solver_status": {
+            "$ref": "#/components/schemas/SolverStatus"
+          },
+          "solver_status_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Solver Status Code"
+          },
+          "solver_version": {
+            "default": "1",
+            "title": "Solver Version",
+            "type": "string"
+          },
+          "source_schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Schedule Id"
+          },
+          "strategy": {
+            "default": "balanced",
+            "enum": [
+              "baseline",
+              "balanced",
+              "completion",
+              "punctuality",
+              "low_travel",
+              "low_overtime",
+              "fair_workload",
+              "stable",
+              "custom"
+            ],
+            "title": "Strategy",
+            "type": "string"
+          },
+          "termination_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Termination Reason"
+          },
+          "travel_model_fingerprint": {
+            "default": "EUCLIDEAN_GRID_V2",
+            "title": "Travel Model Fingerprint",
+            "type": "string"
+          },
+          "travel_model_version": {
+            "default": "EUCLIDEAN_GRID_V2",
+            "title": "Travel Model Version",
+            "type": "string"
+          },
+          "unassigned": {
+            "items": {
+              "$ref": "#/components/schemas/UnassignedWorkOrder"
+            },
+            "title": "Unassigned",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "kind",
+          "version",
+          "created_at",
+          "solver_status",
+          "runtime_ms",
+          "objective",
+          "assignments",
+          "unassigned",
+          "kpis"
+        ],
+        "title": "ScheduleResult",
+        "type": "object"
+      },
+      "ScheduleRun": {
+        "properties": {
+          "action": {
+            "enum": [
+              "baseline",
+              "optimize",
+              "replan",
+              "activate",
+              "restore",
+              "experiment"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Id"
+          },
+          "effective_time_limit_ms": {
+            "title": "Effective Time Limit Ms",
+            "type": "integer"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "planning_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanningContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "planning_context_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planning Context Hash"
+          },
+          "requested_time_limit_ms": {
+            "title": "Requested Time Limit Ms",
+            "type": "integer"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "integer"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "solution_found": {
+            "default": false,
+            "title": "Solution Found",
+            "type": "boolean"
+          },
+          "solver_config_hash": {
+            "title": "Solver Config Hash",
+            "type": "string"
+          },
+          "solver_name": {
+            "title": "Solver Name",
+            "type": "string"
+          },
+          "solver_policy_fingerprint": {
+            "default": "",
+            "title": "Solver Policy Fingerprint",
+            "type": "string"
+          },
+          "solver_version": {
+            "title": "Solver Version",
+            "type": "string"
+          },
+          "source_plan_snapshot_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Plan Snapshot Hash"
+          },
+          "source_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Plan Version Id"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ScheduleRunStatus"
+          },
+          "termination_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Termination Reason"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "action",
+          "scenario_revision",
+          "scenario_snapshot_hash",
+          "solver_name",
+          "solver_version",
+          "solver_config_hash",
+          "requested_time_limit_ms",
+          "effective_time_limit_ms",
+          "status",
+          "started_at"
+        ],
+        "title": "ScheduleRun",
+        "type": "object"
+      },
+      "ScheduleRunStatus": {
+        "enum": [
+          "QUEUED",
+          "RUNNING",
+          "OPTIMAL",
+          "FEASIBLE",
+          "TIME_LIMIT_FEASIBLE",
+          "TIME_LIMIT_NO_SOLUTION",
+          "INFEASIBLE",
+          "NO_SOLUTION",
+          "INVALID_MODEL",
+          "FAILED",
+          "CANCELLED"
+        ],
+        "title": "ScheduleRunStatus",
+        "type": "string"
+      },
+      "ScheduleScenario": {
+        "properties": {
+          "description": {
+            "maxLength": 500,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "locked_assignments": {
+            "items": {
+              "$ref": "#/components/schemas/LockedAssignment"
+            },
+            "title": "Locked Assignments",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "planning_date": {
+            "default": "2026-08-23",
+            "title": "Planning Date",
+            "type": "string"
+          },
+          "revision": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "seed": {
+            "default": 20260823,
+            "title": "Seed",
+            "type": "integer"
+          },
+          "solver_config": {
+            "$ref": "#/components/schemas/SolverConfig"
+          },
+          "source_scenario_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Scenario Id"
+          },
+          "technicians": {
+            "items": {
+              "$ref": "#/components/schemas/Technician"
+            },
+            "title": "Technicians",
+            "type": "array"
+          },
+          "work_orders": {
+            "items": {
+              "$ref": "#/components/schemas/WorkOrder"
+            },
+            "title": "Work Orders",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "technicians",
+          "work_orders"
+        ],
+        "title": "ScheduleScenario",
+        "type": "object"
+      },
+      "ScheduleVerificationReport": {
+        "properties": {
+          "checked_at": {
+            "title": "Checked At",
+            "type": "string"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/CoverageSummary"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/VerificationIssue"
+            },
+            "title": "Errors",
+            "type": "array"
+          },
+          "publishable": {
+            "title": "Publishable",
+            "type": "boolean"
+          },
+          "recomputed_kpis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleKPI"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "valid": {
+            "title": "Valid",
+            "type": "boolean"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/VerificationIssue"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "valid",
+          "publishable",
+          "coverage",
+          "checked_at"
+        ],
+        "title": "ScheduleVerificationReport",
+        "type": "object"
+      },
+      "Skill": {
+        "enum": [
+          "electrical",
+          "hvac",
+          "network"
+        ],
+        "title": "Skill",
+        "type": "string"
+      },
+      "SolverConfig": {
+        "properties": {
+          "active_service_default_remaining_minutes": {
+            "default": 15,
+            "maximum": 240.0,
+            "minimum": 5.0,
+            "title": "Active Service Default Remaining Minutes",
+            "type": "integer"
+          },
+          "imbalance_weight": {
+            "default": 1,
+            "title": "Imbalance Weight",
+            "type": "integer"
+          },
+          "overtime_weight": {
+            "default": 30,
+            "title": "Overtime Weight",
+            "type": "integer"
+          },
+          "replan_change_weight": {
+            "default": 80,
+            "title": "Replan Change Weight",
+            "type": "integer"
+          },
+          "sla_late_weight": {
+            "default": 12,
+            "title": "Sla Late Weight",
+            "type": "integer"
+          },
+          "time_limit_seconds": {
+            "default": 2.0,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Time Limit Seconds",
+            "type": "number"
+          },
+          "travel_weight": {
+            "default": 4,
+            "title": "Travel Weight",
+            "type": "integer"
+          }
+        },
+        "title": "SolverConfig",
+        "type": "object"
+      },
+      "SolverPolicySnapshot": {
+        "properties": {
+          "effective_drop_penalties": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Effective Drop Penalties",
+            "type": "object"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "first_solution_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Solution Strategy"
+          },
+          "local_search_metaheuristic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Local Search Metaheuristic"
+          },
+          "original_drop_penalties": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Original Drop Penalties",
+            "type": "object"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_SOLVER_POLICY_V2",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "profile_name": {
+            "title": "Profile Name",
+            "type": "string"
+          },
+          "profile_snapshot": {
+            "additionalProperties": true,
+            "title": "Profile Snapshot",
+            "type": "object"
+          },
+          "solution_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Solution Limit"
+          },
+          "solver_config": {
+            "$ref": "#/components/schemas/SolverConfig"
+          },
+          "time_limit_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Limit Ms"
+          },
+          "unassigned_penalty_scale": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unassigned Penalty Scale"
+          }
+        },
+        "required": [
+          "profile_name",
+          "solver_config",
+          "fingerprint"
+        ],
+        "title": "SolverPolicySnapshot",
+        "type": "object"
+      },
+      "SolverStatus": {
+        "enum": [
+          "OPTIMAL",
+          "FEASIBLE",
+          "TIME_LIMIT_FEASIBLE",
+          "TIME_LIMIT_NO_SOLUTION",
+          "INFEASIBLE",
+          "NO_SOLUTION",
+          "INVALID_MODEL",
+          "FAILED",
+          "CANCELLED",
+          "TIME_LIMIT"
+        ],
+        "title": "SolverStatus",
+        "type": "string"
+      },
+      "StrategyCandidate": {
+        "properties": {
+          "advantages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Advantages",
+            "type": "array"
+          },
+          "dominated_by": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Dominated By",
+            "type": "array"
+          },
+          "evaluation_score": {
+            "title": "Evaluation Score",
+            "type": "number"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "pareto_optimal": {
+            "default": true,
+            "title": "Pareto Optimal",
+            "type": "boolean"
+          },
+          "profile_id": {
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "profile_name": {
+            "title": "Profile Name",
+            "type": "string"
+          },
+          "publishable": {
+            "default": true,
+            "title": "Publishable",
+            "type": "boolean"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "schedule_candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Candidate Id"
+          },
+          "verification_report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleVerificationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "profile_id",
+          "profile_name",
+          "schedule",
+          "evaluation_score"
+        ],
+        "title": "StrategyCandidate",
+        "type": "object"
+      },
+      "StrategyExperiment": {
+        "properties": {
+          "cancel_requested_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel Requested At"
+          },
+          "candidate_errors": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Candidate Errors",
+            "type": "object"
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyCandidate"
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "data_revision": {
+            "title": "Data Revision",
+            "type": "integer"
+          },
+          "dataset": {
+            "title": "Dataset",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "fingerprint": {
+            "default": "",
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "profile_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Profile Ids",
+            "type": "array"
+          },
+          "profile_snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyProfile"
+            },
+            "title": "Profile Snapshots",
+            "type": "array"
+          },
+          "progress": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Progress",
+            "type": "integer"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
+          },
+          "requested_time_limit_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Time Limit Seconds"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleScenario"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scenario_snapshot_hash": {
+            "default": "",
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "score_policy_version": {
+            "default": "FIELD_SERVICE_SCORE_V2",
+            "title": "Score Policy Version",
+            "type": "string"
+          },
+          "solver_version": {
+            "default": "",
+            "title": "Solver Version",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "QUEUED",
+              "RUNNING",
+              "CANCEL_REQUESTED",
+              "CANCELLED",
+              "COMPLETED",
+              "COMPLETED_WITH_ERRORS",
+              "FAILED",
+              "INTERRUPTED"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "travel_model_fingerprint": {
+            "default": "EUCLIDEAN_GRID_V2",
+            "title": "Travel Model Fingerprint",
+            "type": "string"
+          },
+          "travel_model_version": {
+            "default": "EUCLIDEAN_GRID_V2",
+            "title": "Travel Model Version",
+            "type": "string"
+          },
+          "winner_candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Winner Candidate Id"
+          },
+          "winner_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Winner Plan Version Id"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "dataset",
+          "data_revision",
+          "status",
+          "progress",
+          "created_at"
+        ],
+        "title": "StrategyExperiment",
+        "type": "object"
+      },
+      "StrategyExperimentRequest": {
+        "properties": {
+          "dataset": {
+            "default": "current",
+            "enum": [
+              "current",
+              "strategy-medium",
+              "strategy-stress"
+            ],
+            "title": "Dataset",
+            "type": "string"
+          },
+          "profile_ids": {
+            "items": {
+              "maxLength": 80,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Profile Ids",
+            "type": "array"
+          },
+          "time_limit_seconds": {
+            "anyOf": [
+              {
+                "maximum": 30.0,
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Limit Seconds"
+          }
+        },
+        "title": "StrategyExperimentRequest",
+        "type": "object"
+      },
+      "StrategyProfile": {
+        "properties": {
+          "builtin": {
+            "default": false,
+            "title": "Builtin",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 160,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 30,
+            "minLength": 2,
+            "title": "Name",
+            "type": "string"
+          },
+          "time_limit_seconds": {
+            "default": 2.0,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Time Limit Seconds",
+            "type": "number"
+          },
+          "weights": {
+            "$ref": "#/components/schemas/StrategyWeights"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
+        "title": "StrategyProfile",
+        "type": "object"
+      },
+      "StrategyProfileCreate": {
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 160,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 30,
+            "minLength": 2,
+            "title": "Name",
+            "type": "string"
+          },
+          "time_limit_seconds": {
+            "default": 2.0,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Time Limit Seconds",
+            "type": "number"
+          },
+          "weights": {
+            "$ref": "#/components/schemas/StrategyWeights"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "StrategyProfileCreate",
+        "type": "object"
+      },
+      "StrategyWeights": {
+        "properties": {
+          "imbalance_weight": {
+            "default": 1,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Imbalance Weight",
+            "type": "integer"
+          },
+          "overtime_weight": {
+            "default": 30,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Overtime Weight",
+            "type": "integer"
+          },
+          "replan_change_weight": {
+            "default": 80,
+            "maximum": 2000.0,
+            "minimum": 0.0,
+            "title": "Replan Change Weight",
+            "type": "integer"
+          },
+          "sla_late_weight": {
+            "default": 12,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Sla Late Weight",
+            "type": "integer"
+          },
+          "travel_weight": {
+            "default": 4,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Travel Weight",
+            "type": "integer"
+          },
+          "unassigned_penalty_scale": {
+            "default": 1.0,
+            "maximum": 5.0,
+            "minimum": 0.1,
+            "title": "Unassigned Penalty Scale",
+            "type": "number"
+          }
+        },
+        "title": "StrategyWeights",
+        "type": "object"
+      },
+      "Technician": {
+        "properties": {
+          "color": {
+            "default": "#315c4b",
+            "pattern": "^#[0-9A-Fa-f]{6}$",
+            "title": "Color",
+            "type": "string"
+          },
+          "cost_per_minute_cents": {
+            "default": 100,
+            "exclusiveMinimum": 0.0,
+            "maximum": 10000.0,
+            "title": "Cost Per Minute Cents",
+            "type": "integer"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "overtime_limit": {
+            "default": 60,
+            "maximum": 240.0,
+            "minimum": 0.0,
+            "title": "Overtime Limit",
+            "type": "integer"
+          },
+          "shift_end": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Shift End",
+            "type": "integer"
+          },
+          "shift_start": {
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Shift Start",
+            "type": "integer"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/Skill"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "start_location": {
+            "$ref": "#/components/schemas/Point"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "skills",
+          "shift_start",
+          "shift_end",
+          "start_location"
+        ],
+        "title": "Technician",
+        "type": "object"
+      },
+      "TechnicianExecutionProjection": {
+        "properties": {
+          "available_at": {
+            "maximum": 2760.0,
+            "minimum": 0.0,
+            "title": "Available At",
+            "type": "integer"
+          },
+          "effective_location": {
+            "$ref": "#/components/schemas/Point"
+          },
+          "estimated_remaining_minutes": {
+            "default": 0,
+            "maximum": 480.0,
+            "minimum": 0.0,
+            "title": "Estimated Remaining Minutes",
+            "type": "integer"
+          },
+          "execution_event_sequence": {
+            "minimum": 1.0,
+            "title": "Execution Event Sequence",
+            "type": "integer"
+          },
+          "overrun": {
+            "default": false,
+            "title": "Overrun",
+            "type": "boolean"
+          },
+          "source_work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Source Work Order Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "started",
+              "completed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "technician_id",
+          "source_work_order_id",
+          "state",
+          "effective_location",
+          "available_at",
+          "execution_event_sequence"
+        ],
+        "title": "TechnicianExecutionProjection",
+        "type": "object"
+      },
+      "TechnicianKPI": {
+        "properties": {
+          "assignment_count": {
+            "title": "Assignment Count",
+            "type": "integer"
+          },
+          "normalized_workload": {
+            "default": 0,
+            "title": "Normalized Workload",
+            "type": "number"
+          },
+          "occupied_minutes": {
+            "default": 0,
+            "title": "Occupied Minutes",
+            "type": "integer"
+          },
+          "occupied_utilization": {
+            "default": 0,
+            "title": "Occupied Utilization",
+            "type": "number"
+          },
+          "overtime_minutes": {
+            "title": "Overtime Minutes",
+            "type": "integer"
+          },
+          "overtime_ratio": {
+            "default": 0,
+            "title": "Overtime Ratio",
+            "type": "number"
+          },
+          "service_minutes": {
+            "title": "Service Minutes",
+            "type": "integer"
+          },
+          "service_utilization": {
+            "default": 0,
+            "title": "Service Utilization",
+            "type": "number"
+          },
+          "technician_id": {
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "travel_minutes": {
+            "title": "Travel Minutes",
+            "type": "integer"
+          },
+          "travel_ratio": {
+            "default": 0,
+            "title": "Travel Ratio",
+            "type": "number"
+          },
+          "utilization": {
+            "title": "Utilization",
+            "type": "number"
+          },
+          "waiting_minutes": {
+            "default": 0,
+            "title": "Waiting Minutes",
+            "type": "integer"
+          },
+          "waiting_ratio": {
+            "default": 0,
+            "title": "Waiting Ratio",
+            "type": "number"
+          }
+        },
+        "required": [
+          "technician_id",
+          "service_minutes",
+          "travel_minutes",
+          "overtime_minutes",
+          "utilization",
+          "assignment_count"
+        ],
+        "title": "TechnicianKPI",
+        "type": "object"
+      },
+      "TechnicianUpdate": {
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "pattern": "^#[0-9A-Fa-f]{6}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "cost_per_minute_cents": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 10000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Per Minute Cents"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "overtime_limit": {
+            "anyOf": [
+              {
+                "maximum": 240.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overtime Limit"
+          },
+          "shift_end": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shift End"
+          },
+          "shift_start": {
+            "anyOf": [
+              {
+                "maximum": 1440.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shift Start"
+          },
+          "skills": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Skill"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skills"
+          },
+          "start_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Point"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "TechnicianUpdate",
+        "type": "object"
+      },
+      "UnassignedReason": {
+        "enum": [
+          "NO_ELIGIBLE_TECHNICIAN",
+          "TIME_WINDOW_INFEASIBLE",
+          "SHIFT_CAPACITY_EXCEEDED",
+          "DROPPED_BY_OBJECTIVE",
+          "LOCKED_PLAN_CONFLICT"
+        ],
+        "title": "UnassignedReason",
+        "type": "string"
+      },
+      "UnassignedWorkOrder": {
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/UnassignedReason"
+          },
+          "suggestions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Suggestions",
+            "type": "array"
+          },
+          "work_order_id": {
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "reason",
+          "detail"
+        ],
+        "title": "UnassignedWorkOrder",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VerificationIssue": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "technician_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Technician Id"
+          },
+          "work_order_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Order Id"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "VerificationIssue",
+        "type": "object"
+      },
+      "WorkOrder": {
+        "properties": {
+          "customer_name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Customer Name",
+            "type": "string"
+          },
+          "drop_penalty": {
+            "default": 1200,
+            "exclusiveMinimum": 0.0,
+            "title": "Drop Penalty",
+            "type": "integer"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "is_emergency": {
+            "default": false,
+            "title": "Is Emergency",
+            "type": "boolean"
+          },
+          "location": {
+            "$ref": "#/components/schemas/Point"
+          },
+          "note": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Note",
+            "type": "string"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority",
+            "default": "normal"
+          },
+          "reported_at": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported At"
+          },
+          "required_skills": {
+            "items": {
+              "$ref": "#/components/schemas/Skill"
+            },
+            "title": "Required Skills",
+            "type": "array"
+          },
+          "service_duration": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 480.0,
+            "title": "Service Duration",
+            "type": "integer"
+          },
+          "sla_deadline": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Sla Deadline",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkOrderStatus",
+            "default": "pending"
+          },
+          "title": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "vip": {
+            "default": false,
+            "title": "Vip",
+            "type": "boolean"
+          },
+          "window_end": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Window End",
+            "type": "integer"
+          },
+          "window_start": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Window Start",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "customer_name",
+          "title",
+          "required_skills",
+          "location",
+          "service_duration",
+          "window_start",
+          "window_end",
+          "sla_deadline"
+        ],
+        "title": "WorkOrder",
+        "type": "object"
+      },
+      "WorkOrderExecutionEvent": {
+        "properties": {
+          "action": {
+            "enum": [
+              "start",
+              "complete"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "actual_duration_minutes": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Duration Minutes"
+          },
+          "actual_late_start_minutes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Actual Late Start Minutes",
+            "type": "integer"
+          },
+          "booking_id": {
+            "default": "",
+            "title": "Booking Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "early_start_override_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Early Start Override Reason"
+          },
+          "estimated_remaining_minutes": {
+            "anyOf": [
+              {
+                "maximum": 480.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Remaining Minutes"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          },
+          "occurred_at": {
+            "title": "Occurred At",
+            "type": "integer"
+          },
+          "plan_version_id": {
+            "title": "Plan Version Id",
+            "type": "string"
+          },
+          "planned_finish_at": {
+            "anyOf": [
+              {
+                "maximum": 2760.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Finish At"
+          },
+          "planned_start_at": {
+            "anyOf": [
+              {
+                "maximum": 2280.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Start At"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "integer"
+          },
+          "sequence": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "source_assignment_hash": {
+            "default": "",
+            "title": "Source Assignment Hash",
+            "type": "string"
+          },
+          "source_sequence": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Source Sequence",
+            "type": "integer"
+          },
+          "technician_id": {
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "work_order_id",
+          "technician_id",
+          "action",
+          "occurred_at",
+          "scenario_revision",
+          "plan_version_id",
+          "idempotency_key",
+          "created_at"
+        ],
+        "title": "WorkOrderExecutionEvent",
+        "type": "object"
+      },
+      "WorkOrderExecutionRequest": {
+        "properties": {
+          "early_start_override_reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Early Start Override Reason"
+          },
+          "estimated_remaining_minutes": {
+            "anyOf": [
+              {
+                "maximum": 480.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Remaining Minutes"
+          },
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "note": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Note",
+            "type": "string"
+          },
+          "occurred_at": {
+            "maximum": 2280.0,
+            "minimum": 0.0,
+            "title": "Occurred At",
+            "type": "integer"
+          },
+          "technician_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Technician Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "technician_id",
+          "occurred_at",
+          "expected_revision",
+          "idempotency_key"
+        ],
+        "title": "WorkOrderExecutionRequest",
+        "type": "object"
+      },
+      "WorkOrderExecutionResult": {
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/WorkOrderExecutionEvent"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/ScheduleScenario"
+          }
+        },
+        "required": [
+          "scenario",
+          "event"
+        ],
+        "title": "WorkOrderExecutionResult",
+        "type": "object"
+      },
+      "WorkOrderStatus": {
+        "enum": [
+          "pending",
+          "started",
+          "completed"
+        ],
+        "title": "WorkOrderStatus",
+        "type": "string"
+      },
+      "WorkOrderUpdate": {
+        "properties": {
+          "customer_name": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Name"
+          },
+          "drop_penalty": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Penalty"
+          },
+          "is_emergency": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Emergency"
+          },
+          "location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Point"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Priority"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reported_at": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported At"
+          },
+          "required_skills": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Skill"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Required Skills"
+          },
+          "service_duration": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 480.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Duration"
+          },
+          "sla_deadline": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sla Deadline"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkOrderStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "vip": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vip"
+          },
+          "window_end": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window End"
+          },
+          "window_start": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Start"
+          }
+        },
+        "title": "WorkOrderUpdate",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "本地现场服务排程接口",
+    "title": "FieldFlow API",
+    "version": "0.5.1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/health": {
+      "get": {
+        "operationId": "health_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health Api Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/api/scenarios": {
+      "get": {
+        "operationId": "list_scenarios_api_scenarios_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScheduleScenario"
+                  },
+                  "title": "Response List Scenarios Api Scenarios Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Scenarios"
+      },
+      "post": {
+        "operationId": "create_scenario_api_scenarios_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScenarioCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Scenario"
+      }
+    },
+    "/api/scenarios/{scenario_id}": {
+      "get": {
+        "operationId": "get_scenario_api_scenarios__scenario_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Scenario"
+      }
+    },
+    "/api/scenarios/{scenario_id}/analysis-runs/{analysis_id}": {
+      "get": {
+        "operationId": "get_decision_analysis_run_api_scenarios__scenario_id__analysis_runs__analysis_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "analysis_id",
+            "required": true,
+            "schema": {
+              "title": "Analysis Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionAnalysisRun"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Decision Analysis Run"
+      }
+    },
+    "/api/scenarios/{scenario_id}/baseline": {
+      "post": {
+        "operationId": "run_baseline_api_scenarios__scenario_id__baseline_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Baseline"
+      }
+    },
+    "/api/scenarios/{scenario_id}/comparison": {
+      "get": {
+        "operationId": "comparison_api_scenarios__scenario_id__comparison_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Comparison"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Comparison"
+      }
+    },
+    "/api/scenarios/{scenario_id}/execution-events": {
+      "get": {
+        "operationId": "list_execution_events_api_scenarios__scenario_id__execution_events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WorkOrderExecutionEvent"
+                  },
+                  "title": "Response List Execution Events Api Scenarios  Scenario Id  Execution Events Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Execution Events"
+      }
+    },
+    "/api/scenarios/{scenario_id}/lock": {
+      "post": {
+        "operationId": "lock_assignment_api_scenarios__scenario_id__lock_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LockRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Lock Assignment"
+      }
+    },
+    "/api/scenarios/{scenario_id}/manual-reassignment": {
+      "post": {
+        "description": "Persist a manual lock and run its replan as one idempotent business command.\n\nThe lock is a durable dispatcher decision. If solving fails, the response\nexplicitly reports that partial outcome and keeps the last published plan\nvisible as stale instead of hiding the new business state.",
+        "operationId": "manual_reassignment_api_scenarios__scenario_id__manual_reassignment_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualReassignmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualReassignmentResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Manual Reassignment"
+      }
+    },
+    "/api/scenarios/{scenario_id}/optimize": {
+      "post": {
+        "operationId": "run_optimize_api_scenarios__scenario_id__optimize_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/OptimizeRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Optimize"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions": {
+      "get": {
+        "operationId": "list_plan_versions_api_scenarios__scenario_id__plan_versions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PlanVersion"
+                  },
+                  "title": "Response List Plan Versions Api Scenarios  Scenario Id  Plan Versions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Plan Versions"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}": {
+      "get": {
+        "operationId": "get_plan_version_api_scenarios__scenario_id__plan_versions__version_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanVersion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plan Version"
+      },
+      "patch": {
+        "operationId": "rename_plan_version_api_scenarios__scenario_id__plan_versions__version_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanVersionPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanVersion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Plan Version"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/activate": {
+      "post": {
+        "operationId": "activate_plan_version_api_scenarios__scenario_id__plan_versions__version_id__activate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivatePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanVersion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Activate Plan Version"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/analysis-runs": {
+      "get": {
+        "operationId": "list_decision_analysis_runs_api_scenarios__scenario_id__plan_versions__version_id__analysis_runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DecisionAnalysisRun"
+                  },
+                  "title": "Response List Decision Analysis Runs Api Scenarios  Scenario Id  Plan Versions  Version Id  Analysis Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Decision Analysis Runs"
+      },
+      "post": {
+        "operationId": "create_decision_analysis_run_api_scenarios__scenario_id__plan_versions__version_id__analysis_runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionAnalysisRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionAnalysisRun"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Decision Analysis Run"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/capacity-analysis": {
+      "post": {
+        "operationId": "post_capacity_analysis_api_scenarios__scenario_id__plan_versions__version_id__capacity_analysis_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapacityAnalysisRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapacityAnalysis"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Capacity Analysis"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/clone-scenario": {
+      "post": {
+        "operationId": "clone_plan_scenario_api_scenarios__scenario_id__plan_versions__version_id__clone_scenario_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneScenarioRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Plan Scenario"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/cost-analysis": {
+      "get": {
+        "operationId": "get_cost_analysis_api_scenarios__scenario_id__plan_versions__version_id__cost_analysis_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CostAnalysis"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cost Analysis"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/report": {
+      "get": {
+        "operationId": "version_report_api_scenarios__scenario_id__plan_versions__version_id__report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Version Report"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/restore": {
+      "post": {
+        "operationId": "restore_plan_version_api_scenarios__scenario_id__plan_versions__version_id__restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanVersion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore Plan Version"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/risk-simulation": {
+      "post": {
+        "operationId": "post_risk_simulation_api_scenarios__scenario_id__plan_versions__version_id__risk_simulation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RiskSimulationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskSimulationResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Risk Simulation"
+      }
+    },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/rollback-preview": {
+      "get": {
+        "operationId": "rollback_plan_preview_api_scenarios__scenario_id__plan_versions__version_id__rollback_preview_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RollbackPreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rollback Plan Preview"
+      }
+    },
+    "/api/scenarios/{scenario_id}/replan": {
+      "post": {
+        "operationId": "run_replan_api_scenarios__scenario_id__replan_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Replan"
+      }
+    },
+    "/api/scenarios/{scenario_id}/report": {
+      "get": {
+        "operationId": "report_api_scenarios__scenario_id__report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "schedule_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Schedule Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report"
+      }
+    },
+    "/api/scenarios/{scenario_id}/reset": {
+      "post": {
+        "operationId": "reset_scenario_api_scenarios__scenario_id__reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Scenario"
+      }
+    },
+    "/api/scenarios/{scenario_id}/schedule-candidates/{candidate_id}": {
+      "get": {
+        "operationId": "get_schedule_candidate_api_scenarios__scenario_id__schedule_candidates__candidate_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "candidate_id",
+            "required": true,
+            "schema": {
+              "title": "Candidate Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleCandidate"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Schedule Candidate"
+      }
+    },
+    "/api/scenarios/{scenario_id}/schedule-runs": {
+      "get": {
+        "operationId": "list_schedule_runs_api_scenarios__scenario_id__schedule_runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScheduleRun"
+                  },
+                  "title": "Response List Schedule Runs Api Scenarios  Scenario Id  Schedule Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Schedule Runs"
+      }
+    },
+    "/api/scenarios/{scenario_id}/schedule-runs/{run_id}": {
+      "get": {
+        "operationId": "get_schedule_run_api_scenarios__scenario_id__schedule_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleRun"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Schedule Run"
+      }
+    },
+    "/api/scenarios/{scenario_id}/schedules": {
+      "get": {
+        "operationId": "list_schedule_versions_api_scenarios__scenario_id__schedules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScheduleResult"
+                  },
+                  "title": "Response List Schedule Versions Api Scenarios  Scenario Id  Schedules Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Schedule Versions"
+      }
+    },
+    "/api/scenarios/{scenario_id}/strategy-experiments": {
+      "post": {
+        "operationId": "create_strategy_experiment_api_scenarios__scenario_id__strategy_experiments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyExperimentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyExperiment"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Strategy Experiment"
+      }
+    },
+    "/api/scenarios/{scenario_id}/strategy-experiments/{experiment_id}": {
+      "get": {
+        "operationId": "get_strategy_experiment_api_scenarios__scenario_id__strategy_experiments__experiment_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyExperiment"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Strategy Experiment"
+      }
+    },
+    "/api/scenarios/{scenario_id}/strategy-experiments/{experiment_id}/cancel": {
+      "post": {
+        "operationId": "cancel_strategy_experiment_api_scenarios__scenario_id__strategy_experiments__experiment_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyExperiment"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Strategy Experiment"
+      }
+    },
+    "/api/scenarios/{scenario_id}/strategy-experiments/{experiment_id}/publish": {
+      "post": {
+        "operationId": "publish_strategy_candidate_api_scenarios__scenario_id__strategy_experiments__experiment_id__publish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExperimentPublishRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanVersion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish Strategy Candidate"
+      }
+    },
+    "/api/scenarios/{scenario_id}/technicians": {
+      "post": {
+        "operationId": "create_technician_api_scenarios__scenario_id__technicians_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Technician"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Technician"
+      }
+    },
+    "/api/scenarios/{scenario_id}/technicians/{technician_id}": {
+      "put": {
+        "operationId": "update_technician_api_scenarios__scenario_id__technicians__technician_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "technician_id",
+            "required": true,
+            "schema": {
+              "title": "Technician Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TechnicianUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Technician"
+      }
+    },
+    "/api/scenarios/{scenario_id}/work-orders": {
+      "post": {
+        "operationId": "create_work_order_api_scenarios__scenario_id__work_orders_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrder"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Work Order"
+      }
+    },
+    "/api/scenarios/{scenario_id}/work-orders/{work_order_id}": {
+      "delete": {
+        "operationId": "delete_work_order_api_scenarios__scenario_id__work_orders__work_order_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "work_order_id",
+            "required": true,
+            "schema": {
+              "title": "Work Order Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Work Order"
+      },
+      "put": {
+        "operationId": "update_work_order_api_scenarios__scenario_id__work_orders__work_order_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "work_order_id",
+            "required": true,
+            "schema": {
+              "title": "Work Order Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Work Order"
+      }
+    },
+    "/api/scenarios/{scenario_id}/work-orders/{work_order_id}/complete": {
+      "post": {
+        "operationId": "complete_work_order_api_scenarios__scenario_id__work_orders__work_order_id__complete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "work_order_id",
+            "required": true,
+            "schema": {
+              "title": "Work Order Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderExecutionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkOrderExecutionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete Work Order"
+      }
+    },
+    "/api/scenarios/{scenario_id}/work-orders/{work_order_id}/start": {
+      "post": {
+        "operationId": "start_work_order_api_scenarios__scenario_id__work_orders__work_order_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "work_order_id",
+            "required": true,
+            "schema": {
+              "title": "Work Order Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderExecutionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkOrderExecutionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Work Order"
+      }
+    },
+    "/api/strategy-profiles": {
+      "get": {
+        "operationId": "list_strategy_profiles_api_strategy_profiles_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_stable",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Stable",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StrategyProfile"
+                  },
+                  "title": "Response List Strategy Profiles Api Strategy Profiles Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Strategy Profiles"
+      },
+      "post": {
+        "operationId": "create_strategy_profile_api_strategy_profiles_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfileCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyProfile"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Strategy Profile"
+      }
+    },
+    "/api/strategy-profiles/{profile_id}": {
+      "delete": {
+        "operationId": "delete_strategy_profile_api_strategy_profiles__profile_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "title": "Profile Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Strategy Profile"
+      },
+      "put": {
+        "operationId": "update_strategy_profile_api_strategy_profiles__profile_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "title": "Profile Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfileCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyProfile"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Strategy Profile"
+      }
+    },
+    "/api/technicians": {
+      "get": {
+        "operationId": "get_technicians_api_technicians_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scenario_id",
+            "required": false,
+            "schema": {
+              "default": "main",
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Technicians"
+      }
+    },
+    "/api/work-orders": {
+      "get": {
+        "operationId": "get_work_orders_api_work_orders_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scenario_id",
+            "required": false,
+            "schema": {
+              "default": "main",
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Work Orders"
+      }
+    }
+  }
+}

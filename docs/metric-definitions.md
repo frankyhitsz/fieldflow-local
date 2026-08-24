@@ -29,3 +29,14 @@ Business score policy: `FIELD_SERVICE_SCORE_V2`
 ## Two objective values
 
 `solver_objective_value` is returned by OR-Tools and only has meaning for that solver configuration. `business_score` is recomputed from common business metrics and carries a policy version. Strategy experiments compare the latter and show the raw KPI beside it.
+
+## Decision analysis
+
+- `cash_operating_cost_cents`: planned labor, travel, overtime premium and outsourcing cash cost.
+- `service_failure_loss_cents`: modeled SLA lateness and unserved-demand economic loss.
+- `total_economic_impact_cents`: the sum of the previous two. It is not an accounting total.
+- `additional_disruption_probability`: probability that random absence, no-show, emergency load, window violation or overtime-limit breach disrupts the published plan. Known baseline unserved work is excluded from this probability.
+- `baseline_unserved_orders`: work already unserved by the published plan.
+- `expected_total_unserved_orders`: baseline unserved work plus simulated additional loss.
+
+Decision figures are valid only for the recorded snapshot, schedule, travel, policy, code and input fingerprints. The current scope is `FULL_DAY_PLAN` with no execution facts.

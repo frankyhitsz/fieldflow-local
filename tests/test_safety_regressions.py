@@ -774,6 +774,46 @@ def test_active_service_overrun_is_not_silently_available(monkeypatch, tmp_path)
         assert projection["available_at"] == planning_time + 15
 
 
+def test_dispatcher_remaining_estimate_is_used_before_default_overrun_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "active-estimate.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        first = _route_with_two_assignments(baseline)[0]
+        estimate = 180
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{first['work_order_id']}/start",
+            json={
+                "technician_id": first["technician_id"],
+                "occurred_at": first["start_time"],
+                "estimated_remaining_minutes": estimate,
+                "expected_revision": 0,
+                "idempotency_key": "active-estimate-start-001",
+            },
+        )
+        assert started.status_code == 200
+        assert started.json()["event"]["estimated_remaining_minutes"] == estimate
+        planning_time = first["finish_time"] + 20
+        assert planning_time < first["start_time"] + estimate
+        replanned = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": planning_time, "time_limit_seconds": 1},
+        )
+        assert replanned.status_code == 200, replanned.text
+        context = client.get("/api/scenarios/main/schedule-runs").json()[-1]["planning_context"]
+        assert context["execution_warnings"] == []
+        projection = next(
+            item
+            for item in context["execution_source_context"]["technician_projections"]
+            if item["technician_id"] == first["technician_id"]
+        )
+        assert projection["overrun"] is False
+        assert projection["estimated_remaining_minutes"] == estimate
+        assert projection["available_at"] == first["start_time"] + estimate
+
+
 def test_completion_profile_penalty_scaled_exactly_once(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "policy-completion.db"))
     import backend.main as main_module
@@ -890,6 +930,197 @@ def test_running_command_reconciles_to_retryable_after_restart(tmp_path):
     )
 
 
+def test_restart_after_replan_intake_committed_is_recoverable(tmp_path):
+    database = tmp_path / "intake-command-recovery.db"
+    store = Store(database)
+    namespace = "main:replan"
+    key = "emergency-recovery-001"
+    publication_key = f"{namespace}:{key}"
+    assert store.begin_command_record(
+        namespace,
+        key,
+        "fingerprint-emergency-001",
+        status="INTAKE_COMMITTED",
+        resource_type="work_order",
+        resource_id="WO-EMG-RECOVERY",
+        payload={"work_order_id": "WO-EMG-RECOVERY"},
+        publication_key=publication_key,
+    )
+
+    restarted = Store(database)
+    command = restarted.get_command_record(namespace, key, "fingerprint-emergency-001")
+    assert command["status"] == "FAILED_RETRYABLE"
+    assert command["publication_key"] == publication_key
+    assert restarted.begin_command_record(
+        namespace,
+        key,
+        "fingerprint-emergency-001",
+        status="INTAKE_COMMITTED",
+        resource_type="work_order",
+        resource_id="WO-EMG-RECOVERY",
+        payload={"attempt": 2},
+        publication_key=publication_key,
+    )
+
+
+def test_completed_intake_record_is_not_mistaken_for_abandoned_replan(tmp_path):
+    database = tmp_path / "intake-terminal.db"
+    store = Store(database)
+    assert store.begin_command_record(
+        "main:emergency-intake",
+        "intake-only-001",
+        "intake-fingerprint-001",
+        status="INTAKE_COMMITTED",
+        resource_type="work_order",
+        resource_id="WO-EMG-INTAKE",
+        payload={"work_order_id": "WO-EMG-INTAKE"},
+    )
+    restarted = Store(database)
+    command = restarted.get_command_record(
+        "main:emergency-intake",
+        "intake-only-001",
+        "intake-fingerprint-001",
+    )
+    assert command["status"] == "INTAKE_COMMITTED"
+    assert command["publication_key"] is None
+
+
+def test_restart_reconciles_emergency_command_with_explicit_publication_key(monkeypatch, tmp_path):
+    database = tmp_path / "published-emergency-recovery.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/api/scenarios/main/baseline",
+            headers={"Idempotency-Key": "published-recovery-001"},
+        )
+        assert response.status_code == 200
+        published_plan = client.get("/api/scenarios/main/plan-versions").json()[0]
+
+    store = Store(database)
+    namespace = "main:replan"
+    key = "different-user-facing-key"
+    publication_key = "main:baseline:published-recovery-001"
+    assert store.begin_command_record(
+        namespace,
+        key,
+        "emergency-published-fingerprint",
+        status="REPLAN_RUNNING",
+        resource_type="schedule_run",
+        resource_id="RUN-EMERGENCY",
+        payload={"run_id": "RUN-EMERGENCY"},
+        publication_key=publication_key,
+    )
+
+    restarted = Store(database)
+    command = restarted.get_command_record(namespace, key, "emergency-published-fingerprint")
+    assert command["status"] == "COMPLETED"
+    assert command["resource_id"] == published_plan["id"]
+
+
+def test_manual_reassignment_reports_durable_lock_when_replan_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "manual-reassignment.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        scenario = client.get("/api/scenarios/main").json()
+        assignment = next(
+            item
+            for item in baseline["assignments"]
+            if len(
+                [
+                    technician
+                    for technician in scenario["technicians"]
+                    if set(
+                        next(order for order in scenario["work_orders"] if order["id"] == item["work_order_id"])[
+                            "required_skills"
+                        ]
+                    ).issubset(set(technician["skills"]))
+                ]
+            )
+            >= 2
+        )
+        order = next(item for item in scenario["work_orders"] if item["id"] == assignment["work_order_id"])
+        target = next(
+            technician
+            for technician in scenario["technicians"]
+            if technician["id"] != assignment["technician_id"]
+            and set(order["required_skills"]).issubset(set(technician["skills"]))
+        )
+        monkeypatch.setattr(
+            main_module,
+            "replan_schedule",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("forced replan failure")),
+        )
+        payload = {
+            "work_order_id": order["id"],
+            "technician_id": target["id"],
+            "planning_time": assignment["start_time"],
+            "expected_revision": scenario["revision"],
+            "idempotency_key": "manual-reassignment-failure-001",
+        }
+        failed = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        assert failed.status_code == 200, failed.text
+        body = failed.json()
+        assert body["lock_persisted"] is True
+        assert body["replan_status"] == "FAILED"
+        assert body["active_plan_preserved"] is True
+        assert body["schedule"] is None
+        assert body["error"]["error_type"] == "RuntimeError"
+        assert {tuple(item.values()) for item in body["scenario"]["locked_assignments"]} >= {
+            (order["id"], target["id"])
+        }
+        plans = client.get("/api/scenarios/main/plan-versions").json()
+        assert len(plans) == 1
+        assert plans[0]["active"] is True
+        revision_after_failure = body["scenario"]["revision"]
+
+        replay = client.post("/api/scenarios/main/manual-reassignment", json=payload)
+        assert replay.status_code == 200
+        assert replay.json() == body
+        assert client.get("/api/scenarios/main").json()["revision"] == revision_after_failure
+
+
+def test_plan_payload_is_not_rewritten_when_applicability_changes(monkeypatch, tmp_path):
+    database = tmp_path / "plan-applicability.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline")
+        assert baseline.status_code == 200
+        version = client.get("/api/scenarios/main/plan-versions").json()[0]
+        order_id = baseline.json()["assignments"][0]["work_order_id"]
+        with closing(sqlite3.connect(database)) as connection:
+            frozen_payload = connection.execute(
+                "SELECT payload FROM plan_versions WHERE id=?", (version["id"],)
+            ).fetchone()[0]
+
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{order_id}",
+            json={"note": "只改变适用性，不改写历史方案"},
+        )
+        assert edited.status_code == 200
+        projected = client.get("/api/scenarios/main/plan-versions").json()[0]
+        assert projected["active"] is False
+        assert projected["coverage_status"] == "STALE_DATA_CHANGED"
+        with closing(sqlite3.connect(database)) as connection:
+            assert (
+                connection.execute("SELECT payload FROM plan_versions WHERE id=?", (version["id"],)).fetchone()[0]
+                == frozen_payload
+            )
+            applicability = connection.execute(
+                "SELECT active, coverage_status FROM plan_applicability WHERE plan_version_id=?",
+                (version["id"],),
+            ).fetchone()
+        assert applicability == (0, "STALE_DATA_CHANGED")
+
+
 def test_execution_sequence_has_database_unique_constraint(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "execution-sequence-unique.db"))
     import backend.main as main_module
@@ -975,7 +1206,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 

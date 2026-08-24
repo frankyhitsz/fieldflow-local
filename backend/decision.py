@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import math
 import random
+import statistics
 from collections import Counter, defaultdict
 
+from ._version import __version__
 from .hashing import content_hash
 from .models import (
     CapacityAnalysis,
     CapacityAnalysisRequest,
     CapacityOptionId,
     CapacityOptionResult,
+    CapacityReferenceMode,
     CostAnalysis,
+    DecisionAnalysisScope,
     DecisionCostPolicy,
     PlanCostBreakdown,
     PlanVersion,
     Point,
+    RiskExecutionPolicy,
     RiskSimulationRequest,
     RiskSimulationResult,
     ScheduleResult,
@@ -22,7 +27,7 @@ from .models import (
     Skill,
     Technician,
 )
-from .scheduler import baseline_schedule
+from .scheduler import baseline_schedule, calculate_kpis
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
 CAPACITY_OPTIONS: tuple[CapacityOptionId, ...] = (
@@ -31,7 +36,7 @@ CAPACITY_OPTIONS: tuple[CapacityOptionId, ...] = (
     "extend_shift",
     "allow_overtime",
     "outsource_unserved",
-    "add_service_depot",
+    "relocate_one_technician_start",
 )
 
 CAPACITY_NAMES: dict[CapacityOptionId, str] = {
@@ -40,17 +45,52 @@ CAPACITY_NAMES: dict[CapacityOptionId, str] = {
     "extend_shift": "统一延长班次 60 分钟",
     "allow_overtime": "增加 60 分钟加班容量",
     "outsource_unserved": "外包未服务工单",
-    "add_service_depot": "在需求中心增加服务站点",
+    "relocate_one_technician_start": "将一名高行程技师的出发点移至需求中心",
 }
 
-FIXED_CAPACITY_COST_CENTS: dict[CapacityOptionId, int] = {
-    "add_technician": 60_000,
-    "add_skill": 15_000,
-    "extend_shift": 0,
-    "allow_overtime": 0,
-    "outsource_unserved": 0,
-    "add_service_depot": 40_000,
-}
+
+class DecisionAnalysisError(ValueError):
+    def __init__(self, code: str, message: str, **details: object):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+def _validate_analysis_input(plan: PlanVersion, provider: TravelTimeProvider) -> ScheduleScenario:
+    if plan.scenario_snapshot is None:
+        raise DecisionAnalysisError("PLAN_SNAPSHOT_MISSING", "方案缺少业务快照")
+    if plan.selected.travel_model_fingerprint != provider.fingerprint:
+        raise DecisionAnalysisError(
+            "TRAVEL_MODEL_NOT_AVAILABLE",
+            "当前旅行模型与该方案冻结的模型不一致，不能生成可复现的经营分析",
+            plan_travel_model_fingerprint=plan.selected.travel_model_fingerprint,
+            available_travel_model_fingerprint=provider.fingerprint,
+        )
+    solver_policy = plan.selected.solver_policy
+    if solver_policy is None:
+        raise DecisionAnalysisError(
+            "SOLVER_POLICY_NOT_REPRODUCIBLE",
+            "方案缺少完整求解政策快照，不能生成可复现的经营分析",
+        )
+    expected_policy_fingerprint = content_hash(solver_policy.model_dump(exclude={"fingerprint"}, mode="json"))
+    if solver_policy.fingerprint != expected_policy_fingerprint:
+        raise DecisionAnalysisError(
+            "SOLVER_POLICY_NOT_REPRODUCIBLE",
+            "方案求解政策指纹与快照内容不一致",
+            stored_fingerprint=solver_policy.fingerprint,
+            recomputed_fingerprint=expected_policy_fingerprint,
+        )
+    started = sorted(item.id for item in plan.scenario_snapshot.work_orders if item.status.value == "started")
+    completed = sorted(item.id for item in plan.scenario_snapshot.work_orders if item.status.value == "completed")
+    if started or completed:
+        raise DecisionAnalysisError(
+            "EXECUTION_ANALYSIS_CONTEXT_REQUIRED",
+            "方案包含现场执行事实；当前版本尚未绑定执行水位，不能给出全日经营分析",
+            started_work_order_ids=started,
+            completed_work_order_ids=completed,
+        )
+    return plan.scenario_snapshot.model_copy(deep=True)
 
 
 def schedule_signature(schedule: ScheduleResult) -> str:
@@ -113,7 +153,9 @@ def analyze_plan_cost(
         if order.vip:
             unserved_revenue += policy.vip_revenue_premium_cents
     outsourcing_cost = outsourced_orders * policy.outsourcing_cost_per_order_cents
-    total = labor_cost + travel_cost + overtime_cost + sla_penalty + unserved_revenue + outsourcing_cost
+    cash = labor_cost + travel_cost + overtime_cost + outsourcing_cost
+    service_failure_loss = sla_penalty + unserved_revenue
+    total = cash + service_failure_loss
     return PlanCostBreakdown(
         labor_cost_cents=labor_cost,
         travel_cost_cents=travel_cost,
@@ -121,6 +163,9 @@ def analyze_plan_cost(
         sla_penalty_cents=sla_penalty,
         unserved_revenue_cents=unserved_revenue,
         outsourcing_cost_cents=outsourcing_cost,
+        cash_operating_cost_cents=cash,
+        service_failure_loss_cents=service_failure_loss,
+        total_economic_impact_cents=total,
         total_cost_cents=total,
         technician_cost_cents=technician_costs,
     )
@@ -129,22 +174,38 @@ def analyze_plan_cost(
 def cost_analysis(
     plan: PlanVersion,
     policy: DecisionCostPolicy | None = None,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> CostAnalysis:
-    if plan.scenario_snapshot is None:
-        raise ValueError("方案缺少业务快照")
+    scenario = _validate_analysis_input(plan, provider)
     policy = policy or DecisionCostPolicy()
+    input_hash = content_hash(
+        {
+            "scenario_snapshot_hash": plan.scenario_snapshot_hash,
+            "schedule_signature": schedule_signature(plan.selected),
+            "travel_model_fingerprint": provider.fingerprint,
+            "policy": policy,
+            "analysis_scope": DecisionAnalysisScope.full_day_plan,
+            "analysis_code_version": __version__,
+        }
+    )
     return CostAnalysis(
         scenario_id=plan.scenario_id,
         plan_version_id=plan.id,
         plan_number=plan.number,
         scenario_snapshot_hash=plan.scenario_snapshot_hash,
+        schedule_signature=schedule_signature(plan.selected),
+        analysis_scope=DecisionAnalysisScope.full_day_plan,
+        travel_model_fingerprint=provider.fingerprint,
+        analysis_code_version=__version__,
+        analysis_input_hash=input_hash,
         policy=policy,
         policy_fingerprint=content_hash(policy),
-        breakdown=analyze_plan_cost(plan.scenario_snapshot, plan.selected, policy),
+        breakdown=analyze_plan_cost(scenario, plan.selected, policy),
         assumptions=[
             "人工成本按计划占用分钟计，包括服务、行程和等待。",
             "加班成本只计算相对正常人工成本的额外溢价。",
-            "未服务收入损失按优先级和 VIP 标记估算，不等同于财务结算。",
+            "现金运营成本与 SLA/未服务经济损失分开列示；总经济影响不是财务结算。",
+            "该口径只适用于尚未开始执行的全日计划；含服务中工单的方案会被明确拒绝。",
         ],
     )
 
@@ -219,17 +280,104 @@ def _capacity_scenario(
             technician.overtime_limit = increased
         return alternative, "所有技师允许的加班上限增加 60 分钟，最高为 240 分钟。", changed
 
-    if option_id == "add_service_depot":
+    if option_id == "relocate_one_technician_start":
         if not alternative.technicians or not alternative.work_orders:
-            return alternative, "缺少技师或工单，无法评估新服务站点。", False
+            return alternative, "缺少技师或工单，无法评估出发点迁移。", False
         travel_by_tech: dict[str, int] = defaultdict(int)
         for assignment in base.assignments:
             travel_by_tech[assignment.technician_id] += assignment.travel_minutes
         target = max(alternative.technicians, key=lambda item: (travel_by_tech[item.id], item.id))
         target.start_location = _average_point([item.location for item in alternative.work_orders])
-        return alternative, f"把行程最高的 {target.id} 调整为从需求重心的新站点出发。", True
+        return alternative, f"仅把行程最高的 {target.id} 出发点移至需求重心；不创建站点、库存或仓容。", True
 
     return alternative, "未服务工单由同日外部服务商承接，并假设在 SLA 内完成。", True
+
+
+def _capacity_fixed_cost(request: CapacityAnalysisRequest, option_id: CapacityOptionId) -> int:
+    policy = request.capacity_policy
+    return {
+        "add_technician": policy.add_technician_fixed_cost_cents,
+        "add_skill": policy.add_skill_fixed_cost_cents,
+        "extend_shift": policy.extend_shift_fixed_cost_cents,
+        "allow_overtime": policy.allow_overtime_fixed_cost_cents,
+        "outsource_unserved": policy.outsource_unserved_fixed_cost_cents,
+        "relocate_one_technician_start": policy.relocate_one_technician_start_fixed_cost_cents,
+    }[option_id]
+
+
+def _anchored_incremental_schedule(
+    scenario: ScheduleScenario,
+    alternative: ScheduleScenario,
+    selected: ScheduleResult,
+    option_id: CapacityOptionId,
+    provider: TravelTimeProvider,
+) -> tuple[ScheduleResult, bool]:
+    """Keep every selected assignment fixed and place only previously unserved work.
+
+    This is deliberately narrower than a reoptimization. It gives the selected
+    plan delta mode a truthful counterfactual without attributing route changes
+    from a different algorithm to the capacity option.
+    """
+    result = selected.model_copy(deep=True)
+    result.id = f"ANALYSIS-{schedule_signature(selected)[:12]}-{option_id}"
+    base_routes: dict[str, list] = defaultdict(list)
+    for assignment in result.assignments:
+        base_routes[assignment.technician_id].append(assignment)
+    for route in base_routes.values():
+        route.sort(key=lambda item: item.sequence)
+
+    if option_id == "relocate_one_technician_start":
+        original_techs = {item.id: item for item in scenario.technicians}
+        alternative_techs = {item.id: item for item in alternative.technicians}
+        orders = {item.id: item for item in alternative.work_orders}
+        feasible = True
+        for technician_id, route in base_routes.items():
+            original = original_techs.get(technician_id)
+            moved = alternative_techs.get(technician_id)
+            if not original or not moved or original.start_location == moved.start_location or not route:
+                continue
+            first = route[0]
+            travel = provider.minutes(moved.start_location, orders[first.work_order_id].location, moved.shift_start)
+            arrival = moved.shift_start + travel
+            if arrival > first.start_time:
+                feasible = False
+                continue
+            first.travel_minutes = travel
+            first.arrival_time = arrival
+            first.evidence["capacity_relocation_origin"] = moved.start_location.model_dump(mode="json")
+        result.kpis = calculate_kpis(alternative, result.assignments, result.unassigned, provider=provider)
+        return result, feasible
+
+    pending_ids = {item.work_order_id for item in selected.unassigned}
+    if not pending_ids:
+        result.kpis = calculate_kpis(alternative, result.assignments, result.unassigned, provider=provider)
+        return result, True
+    incremental = alternative.model_copy(deep=True)
+    incremental.work_orders = [item for item in incremental.work_orders if item.id in pending_ids]
+    incremental.locked_assignments = []
+    order_locations = {item.id: item.location for item in alternative.work_orders}
+    usable_technicians: list[Technician] = []
+    for technician in incremental.technicians:
+        route = base_routes.get(technician.id, [])
+        if route:
+            tail = route[-1]
+            technician.shift_start = tail.finish_time
+            technician.start_location = order_locations[tail.work_order_id]
+        if technician.shift_start <= technician.shift_end + technician.overtime_limit:
+            usable_technicians.append(technician)
+    incremental.technicians = usable_technicians
+    added = baseline_schedule(incremental, 0, strategy="baseline", provider=provider)
+    sequence_offsets = {technician_id: len(route) for technician_id, route in base_routes.items()}
+    added_assignments = [item.model_copy(deep=True) for item in added.assignments]
+    for assignment in added_assignments:
+        assignment.sequence += sequence_offsets.get(assignment.technician_id, 0)
+        assignment.changed = False
+        assignment.evidence["capacity_incremental_assignment"] = True
+    result.assignments.extend(added_assignments)
+    result.assignments.sort(key=lambda item: (item.technician_id, item.sequence))
+    result.unassigned = [item.model_copy(deep=True) for item in added.unassigned]
+    result.kpis = calculate_kpis(alternative, result.assignments, result.unassigned, provider=provider)
+    return result, True
 
 
 def capacity_analysis(
@@ -237,24 +385,43 @@ def capacity_analysis(
     request: CapacityAnalysisRequest,
     provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> CapacityAnalysis:
-    if plan.scenario_snapshot is None:
-        raise ValueError("方案缺少业务快照")
-    scenario = plan.scenario_snapshot.model_copy(deep=True)
+    scenario = _validate_analysis_input(plan, provider)
     policy = request.cost_policy
     selected_options = tuple(request.option_ids) if request.option_ids else CAPACITY_OPTIONS
-    base = baseline_schedule(scenario, 0, strategy="baseline", provider=provider)
+    selected_signature = schedule_signature(plan.selected)
+    if request.reference_mode is CapacityReferenceMode.selected_plan_delta:
+        base = plan.selected.model_copy(deep=True)
+        evaluation_method = "SELECTED_PLAN_ANCHORED_INCREMENTAL_GREEDY_V2"
+        reference_policy_fingerprint = plan.selected.solver_policy.fingerprint if plan.selected.solver_policy else ""
+    else:
+        base = baseline_schedule(scenario, 0, strategy="baseline", provider=provider)
+        evaluation_method = "CONTROLLED_DETERMINISTIC_GREEDY_REOPTIMIZATION_V2"
+        reference_policy_fingerprint = base.solver_policy.fingerprint if base.solver_policy else ""
     base_cost = analyze_plan_cost(scenario, base, policy)
+    analysis_input_hash = content_hash(
+        {
+            "scenario_snapshot_hash": plan.scenario_snapshot_hash,
+            "selected_plan_signature": selected_signature,
+            "reference_schedule_signature": schedule_signature(base),
+            "reference_mode": request.reference_mode,
+            "travel_model_fingerprint": provider.fingerprint,
+            "request": request,
+            "analysis_code_version": __version__,
+        }
+    )
     options: list[CapacityOptionResult] = []
     active_orders = [item for item in scenario.work_orders if item.status.value != "completed"]
 
     for option_id in selected_options:
         alternative, assumption, feasible = _capacity_scenario(scenario, option_id, base)
-        fixed_cost = FIXED_CAPACITY_COST_CENTS[option_id]
+        fixed_cost = _capacity_fixed_cost(request, option_id)
         if option_id == "outsource_unserved":
             outsourced = len(base.unassigned)
             alternative_schedule = base
             alternative_cost = analyze_plan_cost(scenario, base, policy, outsourced_orders=outsourced)
-            projected_total = alternative_cost.total_cost_cents - alternative_cost.unserved_revenue_cents
+            projected_total = (
+                alternative_cost.total_economic_impact_cents - alternative_cost.unserved_revenue_cents + fixed_cost
+            )
             active_count = len(active_orders)
             on_time_assigned = sum(1 for item in base.assignments if item.sla_late_minutes == 0)
             completion_rate = 1.0 if active_count else 1.0
@@ -266,11 +433,24 @@ def capacity_analysis(
                 {"base": schedule_signature(base), "outsourced": sorted(item.work_order_id for item in base.unassigned)}
             )
         else:
-            alternative_schedule = baseline_schedule(alternative, 0, strategy="baseline", provider=provider)
+            if request.reference_mode is CapacityReferenceMode.selected_plan_delta:
+                alternative_schedule, anchored_feasible = _anchored_incremental_schedule(
+                    scenario, alternative, base, option_id, provider
+                )
+                feasible = feasible and anchored_feasible
+            else:
+                alternative_schedule = baseline_schedule(alternative, 0, strategy="baseline", provider=provider)
+                option_policy = alternative_schedule.solver_policy
+                if not option_policy or option_policy.fingerprint != reference_policy_fingerprint:
+                    raise DecisionAnalysisError(
+                        "CONTROLLED_POLICY_DRIFT",
+                        "容量选项没有使用与参考排程相同的求解政策",
+                        option_id=option_id,
+                    )
             alternative_cost = analyze_plan_cost(alternative, alternative_schedule, policy)
-            projected_total = alternative_cost.total_cost_cents + fixed_cost
+            projected_total = alternative_cost.total_economic_impact_cents + fixed_cost
             completion_rate = alternative_schedule.kpis.completion_rate
-            sla_rate = alternative_schedule.kpis.sla_on_time_rate
+            sla_rate = alternative_schedule.kpis.committed_on_time_rate
             unassigned_count = alternative_schedule.kpis.unassigned_count
             travel_minutes = alternative_schedule.kpis.total_travel_minutes
             overtime_minutes = alternative_schedule.kpis.total_overtime_minutes
@@ -287,12 +467,12 @@ def capacity_analysis(
                 travel_minutes=travel_minutes,
                 overtime_minutes=overtime_minutes,
                 completion_improvement_percentage_points=round((completion_rate - base.kpis.completion_rate) * 100, 2),
-                sla_improvement_percentage_points=round((sla_rate - base.kpis.sla_on_time_rate) * 100, 2),
+                sla_improvement_percentage_points=round((sla_rate - base.kpis.committed_on_time_rate) * 100, 2),
                 unassigned_delta=unassigned_count - base.kpis.unassigned_count,
                 travel_delta_minutes=travel_minutes - base.kpis.total_travel_minutes,
                 overtime_delta_minutes=overtime_minutes - base.kpis.total_overtime_minutes,
                 fixed_capacity_cost_cents=fixed_cost,
-                marginal_cost_cents=projected_total - base_cost.total_cost_cents,
+                marginal_cost_cents=projected_total - base_cost.total_economic_impact_cents,
                 projected_total_cost_cents=projected_total,
                 schedule_signature=signature,
             )
@@ -302,7 +482,19 @@ def capacity_analysis(
         plan_version_id=plan.id,
         plan_number=plan.number,
         scenario_snapshot_hash=plan.scenario_snapshot_hash,
-        evaluation_method="DETERMINISTIC_GREEDY_WHAT_IF_V1",
+        analysis_scope=DecisionAnalysisScope.full_day_plan,
+        analysis_code_version=__version__,
+        analysis_input_hash=analysis_input_hash,
+        evaluation_method=evaluation_method,
+        reference_mode=request.reference_mode,
+        selected_plan_signature=selected_signature,
+        reference_schedule_signature=schedule_signature(base),
+        reference_solver_policy_fingerprint=reference_policy_fingerprint,
+        reference_travel_model_fingerprint=provider.fingerprint,
+        reference_kpis=base.kpis,
+        cost_policy_fingerprint=content_hash(policy),
+        capacity_policy=request.capacity_policy,
+        capacity_policy_fingerprint=content_hash(request.capacity_policy),
         base_schedule_signature=schedule_signature(base),
         base_cost=base_cost,
         options=options,
@@ -317,10 +509,9 @@ def _percentile(values: list[int], quantile: float) -> int:
 def simulate_plan_risk(
     plan: PlanVersion,
     request: RiskSimulationRequest,
+    provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
 ) -> RiskSimulationResult:
-    if plan.scenario_snapshot is None:
-        raise ValueError("方案缺少业务快照")
-    scenario = plan.scenario_snapshot
+    scenario = _validate_analysis_input(plan, provider)
     schedule = plan.selected
     seed = scenario.seed if request.seed is None else request.seed
     rng = random.Random(seed)
@@ -362,15 +553,20 @@ def simulate_plan_risk(
                 failed = True
                 continue
             current = technician.shift_start + emergency_delay.get(technician_id, 0)
+            current_location = technician.start_location
             for assignment in route:
                 order = orders[assignment.work_order_id]
                 delay_percent = rng.randint(0, request.travel_delay_max_percent)
-                travel = (assignment.travel_minutes * (100 + delay_percent) + 99) // 100
+                planned_travel = provider.minutes(current_location, order.location, current)
+                travel = (planned_travel * (100 + delay_percent) + 99) // 100
                 arrival = current + travel
                 start = max(arrival, order.window_start, order.reported_at or 0)
+                if request.execution_policy is RiskExecutionPolicy.follow_published_schedule:
+                    start = max(start, assignment.start_time)
                 if rng.randrange(10_000) < request.customer_no_show_basis_points:
                     unserved += 1
                     current = start + 10
+                    current_location = order.location
                     failed = True
                     continue
                 jitter = request.service_duration_jitter_percent
@@ -384,8 +580,9 @@ def simulate_plan_risk(
                 if start > order.window_end:
                     failed = True
                 current = finish
+                current_location = order.location
             if route:
-                return_minutes = int(route[-1].evidence.get("route_return_travel_minutes", 0))
+                return_minutes = provider.minutes(current_location, technician.start_location, current)
                 delay_percent = rng.randint(0, request.travel_delay_max_percent)
                 current += (return_minutes * (100 + delay_percent) + 99) // 100
                 overtime = max(0, current - technician.shift_end)
@@ -404,26 +601,45 @@ def simulate_plan_risk(
         "schedule_signature": schedule_signature(schedule),
         "request": request.model_dump(mode="json"),
         "resolved_seed": seed,
+        "travel_model_fingerprint": provider.fingerprint,
+        "analysis_code_version": __version__,
     }
+    mean_sla = sum(sla_rates) / request.trials
+    standard_error = statistics.pstdev(sla_rates) / math.sqrt(request.trials)
+    ci_low = max(0.0, mean_sla - 1.96 * standard_error)
+    ci_high = min(1.0, mean_sla + 1.96 * standard_error)
+    disruption_probability = round(failed_trials / request.trials, 4)
+    expected_total_unserved = round(sum(unserved_totals) / request.trials, 2)
     return RiskSimulationResult(
         scenario_id=plan.scenario_id,
         plan_version_id=plan.id,
         plan_number=plan.number,
         scenario_snapshot_hash=plan.scenario_snapshot_hash,
+        schedule_signature=schedule_signature(schedule),
+        analysis_scope=DecisionAnalysisScope.full_day_plan,
+        travel_model_fingerprint=provider.fingerprint,
+        execution_policy=request.execution_policy,
+        analysis_code_version=__version__,
         simulation_input_hash=content_hash(input_payload),
         seed=seed,
         trials=request.trials,
-        expected_sla_on_time_rate=round(sum(sla_rates) / request.trials, 4),
+        expected_sla_on_time_rate=round(mean_sla, 4),
+        sla_rate_ci_low=round(ci_low, 4),
+        sla_rate_ci_high=round(ci_high, 4),
         late_minutes_p50=_percentile(late_totals, 0.5),
         late_minutes_p90=_percentile(late_totals, 0.9),
         late_minutes_p95=_percentile(late_totals, 0.95),
         expected_overtime_minutes=round(sum(overtime_totals) / request.trials, 2),
-        plan_failure_probability=round(failed_trials / request.trials, 4),
-        expected_unserved_orders=round(sum(unserved_totals) / request.trials, 2),
+        additional_disruption_probability=disruption_probability,
+        baseline_unserved_orders=initially_unserved,
+        expected_total_unserved_orders=expected_total_unserved,
+        plan_failure_probability=disruption_probability,
+        expected_unserved_orders=expected_total_unserved,
         assumptions=[
             "旅行延误和服务时长波动使用离散整数比例，固定 seed 可复现。",
             "技师缺勤会使其整条路线失效；客户不在场按 10 分钟现场处置后离开。",
             "突发工单以 30–90 分钟的随机容量占用表示，不生成正式方案版本。",
-            "计划中已知的未分配工单计入 SLA 和预计未服务数，但不重复计为随机失效。",
+            "默认服从已发布开始时刻；只有显式 EARLIEST_FEASIBLE_EXECUTION 才按最早可行时刻执行。",
+            "已知未分配需求与新增扰动概率分开列示，不把原有缺口称为随机失效。",
         ],
     )

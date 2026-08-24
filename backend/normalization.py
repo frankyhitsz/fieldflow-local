@@ -110,13 +110,13 @@ def normalize_schedule(
                 index == 0 and projection is not None and assignment.work_order_id not in frozen_started_ids
             )
             first_is_started = index == 0 and assignment.work_order_id in frozen_started_ids
-            previous_point = (
-                projection.effective_location
-                if first_uses_execution_origin
-                else technician.start_location
-                if index == 0
-                else orders[route[index - 1].work_order_id].location
-            )
+            if first_uses_execution_origin:
+                assert projection is not None
+                previous_point = projection.effective_location
+            elif index == 0:
+                previous_point = technician.start_location
+            else:
+                previous_point = orders[route[index - 1].work_order_id].location
             next_point = (
                 technician.start_location
                 if index == len(route) - 1

@@ -13,7 +13,8 @@ TRAVEL_MODEL_VERSION = "EUCLIDEAN_GRID_V2"
 
 
 class TravelTimeProvider(Protocol):
-    version: str
+    @property
+    def version(self) -> str: ...
 
     @property
     def fingerprint(self) -> str: ...

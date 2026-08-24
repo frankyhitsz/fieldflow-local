@@ -1,6 +1,6 @@
 import type {
-  CapacityAnalysis, Comparison, CostAnalysis, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
-  ExecutionEvent, ExecutionResult, StrategyProfile, StrategyWeights, Technician, WorkOrder,
+  CapacityAnalysis, Comparison, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
+  ExecutionEvent, ExecutionResult, ManualReassignmentResult, StrategyProfile, StrategyWeights, Technician, WorkOrder,
 } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -53,6 +53,10 @@ export const api = {
     request<Scenario>(`/api/scenarios/${scenarioId}/lock`, {
       method: 'POST', body: JSON.stringify({ work_order_id: orderId, technician_id: technicianId, locked }),
     }),
+  manualReassignment: (scenarioId: string, orderId: string, technicianId: string, planningTime: number, expectedRevision: number, idempotencyKey: string) =>
+    request<ManualReassignmentResult>(`/api/scenarios/${scenarioId}/manual-reassignment`, {
+      method: 'POST', body: JSON.stringify({ work_order_id: orderId, technician_id: technicianId, planning_time: planningTime, expected_revision: expectedRevision, idempotency_key: idempotencyKey }),
+    }),
   comparison: (id: string, before?: string, after?: string) => {
     const query = new URLSearchParams()
     if (before) query.set('before', before)
@@ -70,11 +74,12 @@ export const api = {
   createWorkOrder: (scenarioId: string, order: WorkOrder) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders`, { method: 'POST', body: JSON.stringify(order) }),
   updateWorkOrder: (scenarioId: string, orderId: string, order: Partial<WorkOrder>) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', body: JSON.stringify(order) }),
   deleteWorkOrder: (scenarioId: string, orderId: string) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'DELETE' }),
-  executeWorkOrder: (scenarioId: string, orderId: string, action: 'start' | 'complete', technicianId: string, occurredAt: number, expectedRevision: number, idempotencyKey: string, options?: { earlyStartOverrideReason?: string; note?: string }) => request<ExecutionResult>(`/api/scenarios/${scenarioId}/work-orders/${orderId}/${action}`, { method: 'POST', body: JSON.stringify({ technician_id: technicianId, occurred_at: occurredAt, expected_revision: expectedRevision, idempotency_key: idempotencyKey, early_start_override_reason: options?.earlyStartOverrideReason || null, note: options?.note || '' }) }),
+  executeWorkOrder: (scenarioId: string, orderId: string, action: 'start' | 'complete', technicianId: string, occurredAt: number, expectedRevision: number, idempotencyKey: string, options?: { earlyStartOverrideReason?: string; estimatedRemainingMinutes?: number; note?: string }) => request<ExecutionResult>(`/api/scenarios/${scenarioId}/work-orders/${orderId}/${action}`, { method: 'POST', body: JSON.stringify({ technician_id: technicianId, occurred_at: occurredAt, expected_revision: expectedRevision, idempotency_key: idempotencyKey, early_start_override_reason: options?.earlyStartOverrideReason || null, estimated_remaining_minutes: action === 'start' ? options?.estimatedRemainingMinutes ?? null : null, note: options?.note || '' }) }),
   executionEvents: (scenarioId: string) => request<ExecutionEvent[]>(`/api/scenarios/${scenarioId}/execution-events`),
   costAnalysis: (scenarioId: string, versionId: string) => request<CostAnalysis>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/cost-analysis`),
-  capacityAnalysis: (scenarioId: string, versionId: string) => request<CapacityAnalysis>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/capacity-analysis`, { method: 'POST', body: JSON.stringify({}) }),
+  capacityAnalysis: (scenarioId: string, versionId: string, referenceMode: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION' = 'SELECTED_PLAN_DELTA') => request<CapacityAnalysis>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/capacity-analysis`, { method: 'POST', body: JSON.stringify({ reference_mode: referenceMode }) }),
   riskSimulation: (scenarioId: string, versionId: string, seed?: number, trials = 500) => request<RiskSimulation>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/risk-simulation`, { method: 'POST', body: JSON.stringify({ seed: seed ?? null, trials }) }),
+  createDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, versionId: string, analysisType: 'COST' | 'CAPACITY' | 'RISK', options?: { referenceMode?: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'; seed?: number; trials?: number }) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, capacity_request: { reference_mode: options?.referenceMode || 'SELECTED_PLAN_DELTA' }, risk_request: { seed: options?.seed ?? null, trials: options?.trials ?? 500 } }) }),
   createTechnician: (scenarioId: string, technician: Technician) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians`, { method: 'POST', body: JSON.stringify(technician) }),
   updateTechnician: (scenarioId: string, technicianId: string, technician: Partial<Technician>) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians/${technicianId}`, { method: 'PUT', body: JSON.stringify(technician) }),
 }

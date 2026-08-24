@@ -8,10 +8,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from .fixtures import all_fixtures
 from .hashing import content_hash
 from .models import (
+    DecisionAnalysisRun,
     ExecutionSourceAssignment,
     ExecutionSourceContext,
     PlanCoverageStatus,
@@ -39,7 +41,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 
 
 def _upgrade_technician_costs(payload: object) -> bool:
@@ -409,6 +411,29 @@ class Store:
                     UNIQUE(scenario_id, number),
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS plan_applicability (
+                    plan_version_id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                    coverage_status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS decision_analysis_runs (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    plan_version_id TEXT NOT NULL,
+                    analysis_type TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(scenario_id, number),
+                    UNIQUE(plan_version_id, analysis_type, input_hash),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
+                    FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS schedule_artifacts (
                     id TEXT PRIMARY KEY,
                     plan_version_id TEXT,
@@ -465,6 +490,7 @@ class Store:
                     status TEXT NOT NULL,
                     resource_type TEXT,
                     resource_id TEXT,
+                    publication_key TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -497,6 +523,13 @@ class Store:
             event_columns = {row[1] for row in con.execute("PRAGMA table_info(work_order_execution_events)")}
             if "sequence" not in event_columns:
                 con.execute("ALTER TABLE work_order_execution_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
+            command_columns = {row[1] for row in con.execute("PRAGMA table_info(command_keys)")}
+            if "publication_key" not in command_columns:
+                con.execute("ALTER TABLE command_keys ADD COLUMN publication_key TEXT")
+                con.execute("UPDATE command_keys SET publication_key=key WHERE namespace='schedule-solve'")
+                con.execute(
+                    "UPDATE command_keys SET publication_key=namespace || ':' || key WHERE namespace LIKE '%:replan'"
+                )
             if version < 7:
                 scenario_rows = con.execute(
                     "SELECT DISTINCT scenario_id FROM work_order_execution_events ORDER BY scenario_id"
@@ -584,6 +617,21 @@ class Store:
                                 f"UPDATE {table} SET payload=? WHERE rowid=?",
                                 (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), row["rowid"]),
                             )
+            if version < 12:
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO plan_applicability(
+                        plan_version_id, scenario_id, active, coverage_status, updated_at
+                    )
+                    SELECT p.id,
+                           p.scenario_id,
+                           CASE WHEN s.active_plan_version_id=p.id THEN 1 ELSE 0 END,
+                           COALESCE(json_extract(p.payload, '$.coverage_status'), 'CURRENT_AND_COMPLETE'),
+                           CURRENT_TIMESTAMP
+                    FROM plan_versions p
+                    JOIN scenarios s ON s.id=p.scenario_id
+                    """
+                )
             if version < SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             duplicate_run = con.execute(
@@ -597,6 +645,9 @@ class Store:
                 """
                 CREATE INDEX IF NOT EXISTS idx_schedules_scenario ON schedules(scenario_id, version);
                 CREATE INDEX IF NOT EXISTS idx_plan_versions_scenario ON plan_versions(scenario_id, number);
+                CREATE INDEX IF NOT EXISTS idx_plan_applicability_scenario ON plan_applicability(scenario_id, active);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_applicability_active_unique ON plan_applicability(scenario_id) WHERE active=1;
+                CREATE INDEX IF NOT EXISTS idx_decision_analysis_plan ON decision_analysis_runs(plan_version_id, number);
                 CREATE INDEX IF NOT EXISTS idx_revisions_scenario ON scenario_revisions(scenario_id, number);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_plan ON schedule_artifacts(plan_version_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
@@ -624,12 +675,17 @@ class Store:
                     (run.status.value, run.model_dump_json(), run.id),
                 )
             abandoned_commands = con.execute(
-                "SELECT namespace, key, payload FROM command_keys WHERE status IN ('RUNNING', 'REPLAN_RUNNING')"
+                """
+                SELECT namespace, key, publication_key, payload
+                FROM command_keys
+                WHERE status IN ('RUNNING', 'REPLAN_RUNNING')
+                   OR (status='INTAKE_COMMITTED' AND publication_key IS NOT NULL)
+                """
             ).fetchall()
             for command in abandoned_commands:
                 publication = con.execute(
                     "SELECT plan_version_id FROM publication_keys WHERE key=?",
-                    (command["key"],),
+                    (command["publication_key"] or command["key"],),
                 ).fetchone()
                 if publication:
                     con.execute(
@@ -709,6 +765,56 @@ class Store:
         )
         return revision
 
+    @staticmethod
+    def _set_plan_applicability(
+        con: sqlite3.Connection,
+        plan_version_id: str,
+        scenario_id: str,
+        *,
+        active: bool | None = None,
+        coverage_status: PlanCoverageStatus | None = None,
+    ) -> None:
+        existing = con.execute(
+            "SELECT active, coverage_status FROM plan_applicability WHERE plan_version_id=?",
+            (plan_version_id,),
+        ).fetchone()
+        resolved_active = int(active if active is not None else bool(existing and existing["active"]))
+        resolved_coverage = (
+            coverage_status.value
+            if coverage_status is not None
+            else existing["coverage_status"]
+            if existing
+            else PlanCoverageStatus.current_and_complete.value
+        )
+        con.execute(
+            """
+            INSERT INTO plan_applicability(plan_version_id, scenario_id, active, coverage_status, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(plan_version_id) DO UPDATE SET
+                active=excluded.active,
+                coverage_status=excluded.coverage_status,
+                updated_at=excluded.updated_at
+            """,
+            (plan_version_id, scenario_id, resolved_active, resolved_coverage, _now()),
+        )
+
+    @staticmethod
+    def _overlay_plan_applicability(con: sqlite3.Connection, plan: PlanVersion) -> PlanVersion:
+        row = con.execute(
+            "SELECT active, coverage_status FROM plan_applicability WHERE plan_version_id=?",
+            (plan.id,),
+        ).fetchone()
+        if row:
+            plan.active = bool(row["active"])
+            plan.coverage_status = PlanCoverageStatus(row["coverage_status"])
+        else:
+            active = con.execute(
+                "SELECT active_plan_version_id FROM scenarios WHERE id=?",
+                (plan.scenario_id,),
+            ).fetchone()
+            plan.active = bool(active and active["active_plan_version_id"] == plan.id)
+        return plan
+
     def list_scenarios(self) -> list[ScheduleScenario]:
         with self._connect() as con:
             rows = con.execute("SELECT payload FROM scenarios ORDER BY id").fetchall()
@@ -770,17 +876,13 @@ class Store:
                         (scenario.id,),
                     ).fetchone()
                     if active and active["active_plan_version_id"]:
-                        plan_row = con.execute(
-                            "SELECT payload FROM plan_versions WHERE id=?",
-                            (active["active_plan_version_id"],),
-                        ).fetchone()
-                        if plan_row:
-                            plan = PlanVersion.model_validate_json(plan_row["payload"])
-                            plan.coverage_status = PlanCoverageStatus.stale_data_changed
-                            con.execute(
-                                "UPDATE plan_versions SET payload=? WHERE id=?",
-                                (plan.model_dump_json(), plan.id),
-                            )
+                        self._set_plan_applicability(
+                            con,
+                            active["active_plan_version_id"],
+                            scenario.id,
+                            active=True,
+                            coverage_status=PlanCoverageStatus.stale_data_changed,
+                        )
                     con.execute(
                         "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                         (scenario.model_dump_json(), scenario.id),
@@ -790,15 +892,13 @@ class Store:
                         "SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario.id,)
                     ).fetchone()
                     if active and active["active_plan_version_id"]:
-                        plan_row = con.execute(
-                            "SELECT payload FROM plan_versions WHERE id=?", (active["active_plan_version_id"],)
-                        ).fetchone()
-                        if plan_row:
-                            plan = PlanVersion.model_validate_json(plan_row["payload"])
-                            plan.coverage_status = PlanCoverageStatus.stale_data_changed
-                            con.execute(
-                                "UPDATE plan_versions SET payload=? WHERE id=?", (plan.model_dump_json(), plan.id)
-                            )
+                        self._set_plan_applicability(
+                            con,
+                            active["active_plan_version_id"],
+                            scenario.id,
+                            active=False,
+                            coverage_status=PlanCoverageStatus.stale_data_changed,
+                        )
                     con.execute(
                         "UPDATE scenarios SET payload=?, active_plan_version_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                         (scenario.model_dump_json(), scenario.id),
@@ -821,6 +921,7 @@ class Store:
             "status": row["status"],
             "resource_type": row["resource_type"],
             "resource_id": row["resource_id"],
+            "publication_key": row["publication_key"],
             "payload": json.loads(row["payload"]),
         }
 
@@ -872,11 +973,13 @@ class Store:
                 self._insert_revision(con, scenario, f"接收突发工单 {order.id}")
                 active_plan_id = scenario_row["active_plan_version_id"]
                 if active_plan_id:
-                    plan_row = con.execute("SELECT payload FROM plan_versions WHERE id=?", (active_plan_id,)).fetchone()
-                    if plan_row:
-                        plan = PlanVersion.model_validate_json(plan_row["payload"])
-                        plan.coverage_status = PlanCoverageStatus.partial_new_demand
-                        con.execute("UPDATE plan_versions SET payload=? WHERE id=?", (plan.model_dump_json(), plan.id))
+                    self._set_plan_applicability(
+                        con,
+                        active_plan_id,
+                        scenario.id,
+                        active=True,
+                        coverage_status=PlanCoverageStatus.partial_new_demand,
+                    )
             now = _now()
             payload = json.dumps(
                 {"work_order_id": order.id, "scenario_revision": scenario.revision},
@@ -903,6 +1006,7 @@ class Store:
         resource_type: str | None,
         resource_id: str | None,
         payload: dict,
+        publication_key: str | None = None,
     ) -> None:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -919,11 +1023,12 @@ class Store:
                     return
                 raise PublicationConflict("幂等命令已进入终态，不能覆盖")
             con.execute(
-                "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, payload=?, updated_at=? WHERE namespace=? AND key=?",
+                "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, publication_key=COALESCE(?, publication_key), payload=?, updated_at=? WHERE namespace=? AND key=?",
                 (
                     status,
                     resource_type,
                     resource_id,
+                    publication_key,
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                     _now(),
                     namespace,
@@ -941,6 +1046,7 @@ class Store:
         resource_type: str | None,
         resource_id: str | None,
         payload: dict,
+        publication_key: str | None = None,
     ) -> bool:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -953,11 +1059,12 @@ class Store:
                     raise PublicationConflict("相同幂等键对应了不同请求")
                 if row["status"] == "FAILED_RETRYABLE":
                     con.execute(
-                        "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, payload=?, updated_at=? WHERE namespace=? AND key=?",
+                        "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, publication_key=COALESCE(?, publication_key), payload=?, updated_at=? WHERE namespace=? AND key=?",
                         (
                             status,
                             resource_type,
                             resource_id,
+                            publication_key,
                             json.dumps(payload, ensure_ascii=False, sort_keys=True),
                             _now(),
                             namespace,
@@ -969,8 +1076,8 @@ class Store:
             now = _now()
             con.execute(
                 """
-                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, payload, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, publication_key, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     namespace,
@@ -979,6 +1086,7 @@ class Store:
                     status,
                     resource_type,
                     resource_id,
+                    publication_key,
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                     now,
                     now,
@@ -990,7 +1098,7 @@ class Store:
         self,
         scenario_id: str,
         work_order_id: str,
-        action: str,
+        action: Literal["start", "complete"],
         request: WorkOrderExecutionRequest,
         *,
         request_fingerprint: str,
@@ -1214,6 +1322,7 @@ class Store:
                 ),
                 actual_late_start_minutes=(max(0, request.occurred_at - order.window_end) if action == "start" else 0),
                 early_start_override_reason=(request.early_start_override_reason if action == "start" else None),
+                estimated_remaining_minutes=(request.estimated_remaining_minutes if action == "start" else None),
                 note=request.note,
             )
             result = WorkOrderExecutionResult(scenario=scenario, event=event)
@@ -1332,7 +1441,8 @@ class Store:
                 planned_start_at=start_event.planned_start_at or identity_assignment.start_time,
                 planned_finish_at=start_event.planned_finish_at or identity_assignment.finish_time,
                 actual_start_at=start_event.occurred_at,
-                projected_available_at=start_event.occurred_at + order.service_duration,
+                projected_available_at=start_event.occurred_at
+                + (start_event.estimated_remaining_minutes or order.service_duration),
             )
             if order.status is WorkOrderStatus.started:
                 started_sources.append(source)
@@ -1365,7 +1475,7 @@ class Store:
                 continue
             state = "started" if order.status is WorkOrderStatus.started else "completed"
             available_at = (
-                event.occurred_at + order.service_duration
+                event.occurred_at + (event.estimated_remaining_minutes or order.service_duration)
                 if state == "started" and event.action == "start"
                 else event.occurred_at
             )
@@ -1377,6 +1487,9 @@ class Store:
                     effective_location=order.location,
                     available_at=available_at,
                     execution_event_sequence=event.sequence,
+                    estimated_remaining_minutes=(
+                        event.estimated_remaining_minutes or order.service_duration if state == "started" else 0
+                    ),
                 )
             )
         return ExecutionSourceContext(
@@ -1492,11 +1605,19 @@ class Store:
         self,
         scenario: ScheduleScenario,
         selected: ScheduleResult,
-        action: str,
+        action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish"],
         *,
         artifacts: list[ScheduleArtifact] | None = None,
         source_version_id: str | None = None,
-        relation: str = "new",
+        relation: Literal[
+            "new",
+            "optimized_from",
+            "replanned_from",
+            "reactivated_from",
+            "restored_from",
+            "published_from_experiment",
+            "fresh_after_data_change",
+        ] = "new",
         label: str | None = None,
         replace_scenario: bool = False,
         expected_revision: int | None = None,
@@ -1538,11 +1659,7 @@ class Store:
                             "UPDATE strategy_experiments SET payload=? WHERE id=?",
                             (experiment.model_dump_json(), experiment.id),
                         )
-                    active = con.execute(
-                        "SELECT active_plan_version_id FROM scenarios WHERE id=?", (plan.scenario_id,)
-                    ).fetchone()
-                    plan.active = bool(active and active["active_plan_version_id"] == plan.id)
-                    return plan
+                    return self._overlay_plan_applicability(con, plan)
             current_row = con.execute(
                 "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?", (scenario.id,)
             ).fetchone()
@@ -1630,10 +1747,23 @@ class Store:
                     raise PublicationConflict("候选方案引用了另一个来源版本")
             elif candidate.source_plan_version_id:
                 raise PublicationConflict("候选方案声明了来源版本，但发布请求未携带来源")
+            verification_source = publication_source
+            if selected.kind == "replan" and action in {"activate", "restore"} and publication_source:
+                stability_baseline_id = (
+                    publication_source.stability_baseline_version_id or publication_source.source_version_id
+                )
+                if stability_baseline_id:
+                    stability_row = con.execute(
+                        "SELECT payload FROM plan_versions WHERE id=? AND scenario_id=?",
+                        (stability_baseline_id, scenario.id),
+                    ).fetchone()
+                    if not stability_row:
+                        raise PublicationConflict("稳定性基准方案不存在")
+                    verification_source = PlanVersion.model_validate_json(stability_row["payload"])
             transaction_verification = verify_schedule(
                 scenario,
                 selected,
-                publication_source.selected if publication_source and selected.kind == "replan" else None,
+                verification_source.selected if verification_source and selected.kind == "replan" else None,
                 candidate.planning_context,
                 self.travel_provider,
                 self._execution_source_context(
@@ -1680,6 +1810,14 @@ class Store:
                 label=label or self._version_label(action, chosen.strategy, number),
                 data_revision=scenario.revision,
                 source_version_id=source_version_id,
+                lineage_source_version_id=source_version_id,
+                stability_baseline_version_id=(
+                    (publication_source.stability_baseline_version_id or publication_source.source_version_id)
+                    if chosen.kind == "replan" and action in {"activate", "restore"} and publication_source
+                    else source_version_id
+                    if chosen.kind == "replan"
+                    else None
+                ),
                 relation=relation,
                 active=True,
                 created_at=_now(),
@@ -1691,11 +1829,21 @@ class Store:
                 source_plan_snapshot_hash=source_hash,
             )
             con.execute(
-                "UPDATE plan_versions SET payload=json_set(payload, '$.active', 0) WHERE scenario_id=?", (scenario.id,)
+                "UPDATE plan_applicability SET active=0, updated_at=? WHERE scenario_id=? AND active=1",
+                (_now(), scenario.id),
             )
+            persisted_plan = plan.model_copy(deep=True)
+            persisted_plan.active = False
             con.execute(
                 "INSERT INTO plan_versions(id, scenario_id, number, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (plan.id, plan.scenario_id, number, plan.model_dump_json(), plan.created_at),
+                (plan.id, plan.scenario_id, number, persisted_plan.model_dump_json(), plan.created_at),
+            )
+            self._set_plan_applicability(
+                con,
+                plan.id,
+                scenario.id,
+                active=True,
+                coverage_status=PlanCoverageStatus.current_and_complete,
             )
             con.execute(
                 "INSERT INTO schedules(id, scenario_id, kind, version, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1856,6 +2004,74 @@ class Store:
             row = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
         return ScheduleCandidate.model_validate_json(row["payload"]) if row else None
 
+    def save_decision_analysis_run(self, run: DecisionAnalysisRun) -> DecisionAnalysisRun:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            existing = con.execute(
+                """
+                SELECT payload FROM decision_analysis_runs
+                WHERE plan_version_id=? AND analysis_type=? AND input_hash=?
+                """,
+                (run.plan_version_id, run.analysis_type, run.input_hash),
+            ).fetchone()
+            if existing:
+                return DecisionAnalysisRun.model_validate_json(existing["payload"])
+            plan = con.execute(
+                "SELECT 1 FROM plan_versions WHERE id=? AND scenario_id=?",
+                (run.plan_version_id, run.scenario_id),
+            ).fetchone()
+            if not plan:
+                raise PublicationConflict("经营分析引用的方案不存在")
+            row = con.execute(
+                "SELECT COALESCE(MAX(number), 0) + 1 AS number FROM decision_analysis_runs WHERE scenario_id=?",
+                (run.scenario_id,),
+            ).fetchone()
+            saved = run.model_copy(deep=True)
+            saved.number = int(row["number"])
+            saved.id = f"AN-{saved.scenario_id}-{saved.number}-{uuid.uuid4().hex[:6]}"
+            con.execute(
+                """
+                INSERT INTO decision_analysis_runs(
+                    id, scenario_id, number, plan_version_id, analysis_type, input_hash, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    saved.id,
+                    saved.scenario_id,
+                    saved.number,
+                    saved.plan_version_id,
+                    saved.analysis_type,
+                    saved.input_hash,
+                    saved.model_dump_json(),
+                    saved.created_at,
+                ),
+            )
+            return saved
+
+    def list_decision_analysis_runs(self, scenario_id: str, plan_version_id: str) -> list[DecisionAnalysisRun]:
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT payload FROM decision_analysis_runs
+                WHERE scenario_id=? AND plan_version_id=? ORDER BY number
+                """,
+                (scenario_id, plan_version_id),
+            ).fetchall()
+        return [DecisionAnalysisRun.model_validate_json(row["payload"]) for row in rows]
+
+    def get_decision_analysis_run(self, scenario_id: str, analysis_id: str) -> DecisionAnalysisRun | None:
+        normalized = analysis_id[1:] if analysis_id.upper().startswith("A") else analysis_id
+        numeric = int(normalized) if normalized.isdigit() else -1
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT payload FROM decision_analysis_runs
+                WHERE scenario_id=? AND (id=? OR number=?)
+                """,
+                (scenario_id, analysis_id, numeric),
+            ).fetchone()
+        return DecisionAnalysisRun.model_validate_json(row["payload"]) if row else None
+
     def published_for_key(self, key: str, fingerprint: str) -> PlanVersion | None:
         with self._connect() as con:
             row = con.execute(
@@ -1869,27 +2085,20 @@ class Store:
             if not plan_row:
                 raise PublicationConflict("幂等发布记录引用的方案不存在")
             plan = PlanVersion.model_validate_json(plan_row["payload"])
-            active = con.execute(
-                "SELECT active_plan_version_id FROM scenarios WHERE id=?", (plan.scenario_id,)
-            ).fetchone()
-        plan.active = bool(active and active["active_plan_version_id"] == plan.id)
-        return plan
+            return self._overlay_plan_applicability(con, plan)
 
     def list_plan_versions(self, scenario_id: str, include_snapshots: bool = False) -> list[PlanVersion]:
         with self._connect() as con:
             rows = con.execute(
                 "SELECT payload FROM plan_versions WHERE scenario_id=? ORDER BY number", (scenario_id,)
             ).fetchall()
-            active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
-        active_id = active["active_plan_version_id"] if active else None
-        plans = []
-        for row in rows:
-            plan = PlanVersion.model_validate_json(row["payload"])
-            plan.active = plan.id == active_id
-            if not include_snapshots:
-                plan.scenario_snapshot = None
-                plan.artifacts = []
-            plans.append(plan)
+            plans = []
+            for row in rows:
+                plan = self._overlay_plan_applicability(con, PlanVersion.model_validate_json(row["payload"]))
+                if not include_snapshots:
+                    plan.scenario_snapshot = None
+                    plan.artifacts = []
+                plans.append(plan)
         return plans
 
     def get_plan_version(self, scenario_id: str, version_id: str) -> PlanVersion | None:
@@ -1900,12 +2109,9 @@ class Store:
                 "SELECT payload FROM plan_versions WHERE scenario_id=? AND (id=? OR number=?)",
                 (scenario_id, version_id, numeric),
             ).fetchone()
-            active = con.execute("SELECT active_plan_version_id FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
-        if not row:
-            return None
-        plan = PlanVersion.model_validate_json(row["payload"])
-        plan.active = bool(active and active["active_plan_version_id"] == plan.id)
-        return plan
+            if not row:
+                return None
+            return self._overlay_plan_applicability(con, PlanVersion.model_validate_json(row["payload"]))
 
     def active_plan_version(self, scenario_id: str) -> PlanVersion | None:
         with self._connect() as con:

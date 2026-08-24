@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import json
 
-from backend.decision import capacity_analysis, cost_analysis, simulate_plan_risk
+from backend._version import __version__
+from backend.decision import (
+    DecisionAnalysisError,
+    capacity_analysis,
+    cost_analysis,
+    schedule_signature,
+    simulate_plan_risk,
+)
 from backend.fixtures import get_fixture
 from backend.hashing import content_hash
-from backend.models import CapacityAnalysisRequest, PlanVersion, RiskSimulationRequest, Skill
+from backend.models import (
+    CapacityAnalysisRequest,
+    CapacityReferenceMode,
+    PlanVersion,
+    RiskExecutionPolicy,
+    RiskSimulationRequest,
+    Skill,
+    WorkOrderStatus,
+)
 from backend.scheduler import baseline_schedule
+from backend.travel import EuclideanTravelTimeProvider
 from backend.verification import verify_schedule
 
 
@@ -78,10 +94,77 @@ rows.append(
 scenario, plan = plan_for("main")
 cost = cost_analysis(plan)
 capacity = capacity_analysis(plan, CapacityAnalysisRequest())
-risk = simulate_plan_risk(plan, RiskSimulationRequest(seed=20260824, trials=50))
-assert cost.breakdown.total_cost_cents > 0
+risk_request = RiskSimulationRequest(seed=20260824, trials=50)
+risk = simulate_plan_risk(plan, risk_request)
+controlled_capacity = capacity_analysis(
+    plan,
+    CapacityAnalysisRequest(reference_mode=CapacityReferenceMode.controlled_reoptimization),
+)
+assert cost.breakdown.total_economic_impact_cents > 0
+assert cost.breakdown.total_economic_impact_cents == (
+    cost.breakdown.cash_operating_cost_cents + cost.breakdown.service_failure_loss_cents
+)
 assert len(capacity.options) == 6
+assert capacity.selected_plan_signature == schedule_signature(plan.selected)
+assert capacity.reference_schedule_signature == capacity.selected_plan_signature
+assert capacity.reference_mode is CapacityReferenceMode.selected_plan_delta
+assert controlled_capacity.reference_mode is CapacityReferenceMode.controlled_reoptimization
+assert controlled_capacity.reference_solver_policy_fingerprint
+assert all(item.option_id != "add_service_depot" for item in capacity.options)
 assert risk.late_minutes_p50 <= risk.late_minutes_p90 <= risk.late_minutes_p95
+assert risk.execution_policy is RiskExecutionPolicy.follow_published_schedule
+assert risk.sla_rate_ci_low <= risk.expected_sla_on_time_rate <= risk.sla_rate_ci_high
+
+delayed_plan = plan.model_copy(deep=True)
+assert delayed_plan.scenario_snapshot is not None
+delayed_assignment = delayed_plan.selected.assignments[0]
+delayed_order = next(
+    item for item in delayed_plan.scenario_snapshot.work_orders if item.id == delayed_assignment.work_order_id
+)
+delayed_assignment.start_time = delayed_order.sla_deadline
+delayed_assignment.finish_time = delayed_assignment.start_time + delayed_order.service_duration
+zero_noise = {
+    "seed": 7,
+    "trials": 50,
+    "travel_delay_max_percent": 0,
+    "service_duration_jitter_percent": 0,
+    "technician_absence_basis_points": 0,
+    "emergency_order_basis_points": 0,
+    "customer_no_show_basis_points": 0,
+}
+follow = simulate_plan_risk(
+    delayed_plan,
+    RiskSimulationRequest(**zero_noise, execution_policy=RiskExecutionPolicy.follow_published_schedule),
+)
+earliest = simulate_plan_risk(
+    delayed_plan,
+    RiskSimulationRequest(**zero_noise, execution_policy=RiskExecutionPolicy.earliest_feasible_execution),
+)
+assert follow.late_minutes_p50 > earliest.late_minutes_p50
+
+try:
+    capacity_analysis(
+        plan,
+        CapacityAnalysisRequest(),
+        EuclideanTravelTimeProvider(minutes_per_grid_unit=0.72),
+    )
+except DecisionAnalysisError as error:
+    assert error.code == "TRAVEL_MODEL_NOT_AVAILABLE"
+else:
+    raise AssertionError("capacity analysis accepted a mismatched travel model")
+
+started_plan = plan.model_copy(deep=True)
+assert started_plan.scenario_snapshot is not None
+started_id = started_plan.selected.assignments[0].work_order_id
+next(
+    item for item in started_plan.scenario_snapshot.work_orders if item.id == started_id
+).status = WorkOrderStatus.started
+try:
+    cost_analysis(started_plan)
+except DecisionAnalysisError as error:
+    assert error.code == "EXECUTION_ANALYSIS_CONTEXT_REQUIRED"
+else:
+    raise AssertionError("decision analysis accepted started work without an execution context")
 
 rows.extend(
     [
@@ -120,9 +203,13 @@ print(
     json.dumps(
         {
             "benchmark_version": "FIELD_SERVICE_BENCHMARK_V1",
+            "fieldflow_version": __version__,
             "decision_checks": {
-                "cost_total_cents": cost.breakdown.total_cost_cents,
+                "cost_total_economic_impact_cents": cost.breakdown.total_economic_impact_cents,
                 "capacity_options": len(capacity.options),
+                "capacity_reference_mode": capacity.reference_mode.value,
+                "controlled_reference_mode": controlled_capacity.reference_mode.value,
+                "risk_execution_policy": risk.execution_policy.value,
                 "risk_input_hash": risk.simulation_input_hash,
             },
             "scenarios": rows,

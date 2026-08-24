@@ -46,6 +46,7 @@ def verify_schedule(
         execution_context, _ = execution_context_for_planning(
             execution_context,
             planning_context.planning_time,
+            scenario.solver_config.active_service_default_remaining_minutes,
         )
 
     def error(code: str, message: str, work_order_id: str | None = None, technician_id: str | None = None) -> None:
@@ -457,8 +458,13 @@ def verify_schedule(
                 else None
             )
             execution_origin = projection is not None and first.work_order_id not in frozen_started_ids
-            first_origin = projection.effective_location if execution_origin else technician.start_location
-            first_available = projection.available_at if execution_origin else technician.shift_start
+            if execution_origin:
+                assert projection is not None
+                first_origin = projection.effective_location
+                first_available = projection.available_at
+            else:
+                first_origin = technician.start_location
+                first_available = technician.shift_start
             first_travel = provider.minutes(first_origin, orders[first.work_order_id].location)
             first_is_started = first.work_order_id in frozen_started_ids
             if not first_is_started and first.travel_minutes != first_travel:

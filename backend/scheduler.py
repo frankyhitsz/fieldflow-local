@@ -918,7 +918,16 @@ def optimized_schedule(
         if locked_to:
             eligible_vehicles = [i for i in eligible_vehicles if technicians[i].id == locked_to]
         if eligible_vehicles:
-            routing.SetAllowedVehiclesForIndex(eligible_vehicles, index)
+            # OR-Tools 9.15 exposes this method through an absl::Span binding
+            # that no longer accepts a normal Python list on every supported
+            # interpreter. Removing disallowed vehicle values is equivalent
+            # while deliberately retaining -1 so a disjunction can still drop
+            # an optional order.
+            vehicle_var = routing.VehicleVar(index)
+            eligible_vehicle_ids = set(eligible_vehicles)
+            for vehicle in range(len(technicians)):
+                if vehicle not in eligible_vehicle_ids:
+                    vehicle_var.RemoveValue(vehicle)
         else:
             precheck_unassigned.add(order.id)
             routing.ActiveVar(index).SetValue(0)

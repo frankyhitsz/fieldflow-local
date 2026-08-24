@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  python-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install -r requirements.txt
+      - name: Check Python 3.11 compatibility
+        run: |
+          .venv/bin/python -m ruff check backend tests scripts
+          .venv/bin/python -m pyright
+          make test
+
   fieldflow:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -27,6 +44,8 @@ jobs:
         working-directory: frontend
       - name: Run static checks
         run: make lint
+      - name: Audit dependencies
+        run: make audit
       - name: Test backend and API
         run: make test
       - name: Test React components

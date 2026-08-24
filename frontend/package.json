@@ -1,10 +1,10 @@
 {
   "name": "fieldflow-console",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
+    "dev": "vite --host 127.0.0.1",
     "typecheck": "tsc -b --pretty false",
     "build": "tsc -b && vite build",
     "test": "vitest run src/test",
