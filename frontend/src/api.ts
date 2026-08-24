@@ -1,6 +1,6 @@
 import type {
   Comparison, PlanVersion, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
-  StrategyProfile, StrategyWeights, Technician, WorkOrder,
+  ExecutionEvent, ExecutionResult, StrategyProfile, StrategyWeights, Technician, WorkOrder,
 } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -70,6 +70,8 @@ export const api = {
   createWorkOrder: (scenarioId: string, order: WorkOrder) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders`, { method: 'POST', body: JSON.stringify(order) }),
   updateWorkOrder: (scenarioId: string, orderId: string, order: Partial<WorkOrder>) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', body: JSON.stringify(order) }),
   deleteWorkOrder: (scenarioId: string, orderId: string) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'DELETE' }),
+  executeWorkOrder: (scenarioId: string, orderId: string, action: 'start' | 'complete', technicianId: string, occurredAt: number, expectedRevision: number, idempotencyKey: string) => request<ExecutionResult>(`/api/scenarios/${scenarioId}/work-orders/${orderId}/${action}`, { method: 'POST', body: JSON.stringify({ technician_id: technicianId, occurred_at: occurredAt, expected_revision: expectedRevision, idempotency_key: idempotencyKey }) }),
+  executionEvents: (scenarioId: string) => request<ExecutionEvent[]>(`/api/scenarios/${scenarioId}/execution-events`),
   createTechnician: (scenarioId: string, technician: Technician) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians`, { method: 'POST', body: JSON.stringify(technician) }),
   updateTechnician: (scenarioId: string, technicianId: string, technician: Partial<Technician>) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians/${technicianId}`, { method: 'PUT', body: JSON.stringify(technician) }),
 }

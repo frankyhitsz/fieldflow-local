@@ -475,10 +475,18 @@ def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(mo
     with TestClient(main_module.app) as client:
         client.post("/api/scenarios/main/baseline")
         source = client.get("/api/scenarios/main/plan-versions").json()[0]
-        assert client.put(
-            "/api/scenarios/main/work-orders/WO-1021",
-            json={"status": "completed"},
-        ).status_code == 200
+        assignment = next(item for item in source["selected"]["assignments"] if item["work_order_id"] == "WO-1021")
+        revision = client.get("/api/scenarios/main").json()["revision"]
+        started = client.post(
+            "/api/scenarios/main/work-orders/WO-1021/start",
+            json={"technician_id": assignment["technician_id"], "occurred_at": assignment["start_time"], "expected_revision": revision, "idempotency_key": "rollback-start-001"},
+        )
+        assert started.status_code == 200
+        completed = client.post(
+            "/api/scenarios/main/work-orders/WO-1021/complete",
+            json={"technician_id": assignment["technician_id"], "occurred_at": assignment["finish_time"], "expected_revision": started.json()["scenario"]["revision"], "idempotency_key": "rollback-complete-001"},
+        )
+        assert completed.status_code == 200
         preview = client.get(
             f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview"
         ).json()
@@ -486,7 +494,7 @@ def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(mo
         blocked = client.post(
             f"/api/scenarios/main/plan-versions/{source['id']}/restore",
             json={
-                "expected_revision": 1,
+                "expected_revision": completed.json()["scenario"]["revision"],
                 "confirmation_token": preview["confirmation_token"],
                 "reason": "测试保护",
                 "idempotency_key": "rollback-guard-001",
@@ -658,7 +666,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -707,7 +715,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"
@@ -740,7 +748,7 @@ def test_plan_publication_rolls_back_as_one_transaction(tmp_path):
     assert store.active_plan_version("main").id == first_plan.id
 
 
-def test_storage_rechecks_candidate_instead_of_trusting_saved_report(tmp_path):
+def test_saved_candidates_are_immutable_and_publish_is_rechecked(tmp_path):
     store = Store(tmp_path / "forged-report.db")
     scenario = store.get_scenario("main")
     assert scenario is not None
@@ -751,7 +759,9 @@ def test_storage_rechecks_candidate_instead_of_trusting_saved_report(tmp_path):
     forged = original.model_copy(deep=True)
     forged.assignments.pop()
     candidate.schedule = forged
-    store.save_schedule_candidate(candidate)
-    with pytest.raises(PublicationConflict, match="发布事务复核失败"):
-        store.publish_plan(scenario, forged, "baseline", candidate_id=candidate.id)
-    assert store.list_plan_versions("main") == []
+    with pytest.raises(PublicationConflict, match="不可修改"):
+        store.save_schedule_candidate(candidate)
+    stored = store.get_schedule_candidate(candidate.id)
+    assert stored is not None and stored.schedule.model_dump() == original.model_dump()
+    published = store.publish_plan(scenario, original, "baseline", candidate_id=candidate.id)
+    assert published.number == 1

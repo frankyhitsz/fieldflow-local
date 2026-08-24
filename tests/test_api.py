@@ -108,10 +108,13 @@ def test_started_work_requires_local_replan_and_keeps_committed_assignment(monke
     with TestClient(main_module.app) as client:
         original = client.post("/api/scenarios/main/optimize", json={"time_limit_seconds": 1}).json()
         started = min(original["assignments"], key=lambda item: item["start_time"])
-        assert client.put(
-            f"/api/scenarios/main/work-orders/{started['work_order_id']}",
-            json={"status": "started"},
-        ).status_code == 200
+        scenario = client.get("/api/scenarios/main").json()
+        started_response = client.post(
+            f"/api/scenarios/main/work-orders/{started['work_order_id']}/start",
+            json={"technician_id": started["technician_id"], "occurred_at": started["start_time"], "expected_revision": scenario["revision"], "idempotency_key": "start-work-order-001"},
+        )
+        assert started_response.status_code == 200
+        assert started_response.json()["event"]["action"] == "start"
         assert client.post("/api/scenarios/main/baseline").status_code == 409
         assert client.post("/api/scenarios/main/optimize").status_code == 409
         replanned = client.post("/api/scenarios/main/replan", json={"current_time": started["start_time"] + 1, "time_limit_seconds": 1})

@@ -303,6 +303,7 @@ class ScheduleResult(BaseModel):
     scenario_snapshot_hash: str = ""
     solver_config_hash: str = ""
     travel_model_version: str = "EUCLIDEAN_GRID_V2"
+    travel_model_fingerprint: str = "EUCLIDEAN_GRID_V2"
     metric_policy_version: str = "FIELD_SERVICE_METRICS_V2"
     solver_name: str = "fieldflow-greedy"
     solver_version: str = "1"
@@ -333,6 +334,7 @@ class ReplanRequest(BaseModel):
     strategy: Literal["balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload", "stable"] = "stable"
     profile_id: str | None = None
     idempotency_key: IdempotencyKey | None = None
+    intake_idempotency_key: IdempotencyKey | None = None
 
     @model_validator(mode="after")
     def resolve_planning_time(self) -> ReplanRequest:
@@ -376,6 +378,31 @@ class WorkOrderUpdate(BaseModel):
         if invalid_nulls:
             raise ValueError(f"字段不能为 null: {', '.join(sorted(invalid_nulls))}")
         return self
+
+
+class WorkOrderExecutionRequest(BaseModel):
+    technician_id: Identifier
+    occurred_at: int = Field(ge=0, le=2280)
+    expected_revision: int = Field(ge=0)
+    idempotency_key: IdempotencyKey
+
+
+class WorkOrderExecutionEvent(BaseModel):
+    id: str
+    scenario_id: str
+    work_order_id: str
+    technician_id: str
+    action: Literal["start", "complete"]
+    occurred_at: int
+    scenario_revision: int
+    plan_version_id: str
+    idempotency_key: str
+    created_at: str
+
+
+class WorkOrderExecutionResult(BaseModel):
+    scenario: ScheduleScenario
+    event: WorkOrderExecutionEvent
 
 
 class TechnicianUpdate(BaseModel):
@@ -575,6 +602,7 @@ class StrategyExperiment(BaseModel):
     scenario_snapshot_hash: str = ""
     score_policy_version: str = "FIELD_SERVICE_SCORE_V2"
     travel_model_version: str = "EUCLIDEAN_GRID_V2"
+    travel_model_fingerprint: str = "EUCLIDEAN_GRID_V2"
     solver_version: str = ""
     candidate_errors: dict[str, str] = Field(default_factory=dict)
     finished_at: str | None = None

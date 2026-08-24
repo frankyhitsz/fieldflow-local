@@ -10,6 +10,12 @@ export type WorkOrder = {
   status: 'pending' | 'started' | 'completed'; vip: boolean; is_emergency: boolean
   reported_at: number | null; note: string
 }
+export type ExecutionEvent = {
+  id: string; scenario_id: string; work_order_id: string; technician_id: string
+  action: 'start' | 'complete'; occurred_at: number; scenario_revision: number
+  plan_version_id: string; idempotency_key: string; created_at: string
+}
+export type ExecutionResult = { scenario: Scenario; event: ExecutionEvent }
 export type Scenario = {
   id: string; name: string; description: string; planning_date: string; seed: number
   technicians: Technician[]; work_orders: WorkOrder[]
@@ -55,7 +61,7 @@ export type Schedule = {
   solver_status_code: number | null; termination_reason: string | null; solution_found: boolean
   solver_objective_value: number | null; business_score: number | null
   business_score_policy_version: string; scenario_snapshot_hash: string; solver_config_hash: string
-  travel_model_version: string; metric_policy_version: string; solver_name: string; solver_version: string
+  travel_model_version: string; travel_model_fingerprint: string; metric_policy_version: string; solver_name: string; solver_version: string
 }
 export type Comparison = {
   scenario_id: string; before: Schedule; after: Schedule
@@ -109,7 +115,7 @@ export type StrategyExperiment = {
   error: string | null; created_at: string; profile_ids: string[]
   requested_time_limit_seconds: number | null; candidates: StrategyCandidate[]
   fingerprint: string; scenario_snapshot_hash: string; score_policy_version: string
-  travel_model_version: string; solver_version: string; candidate_errors: Record<string, string>
+  travel_model_version: string; travel_model_fingerprint: string; solver_version: string; candidate_errors: Record<string, string>
   finished_at: string | null; cancel_requested_at: string | null
   winner_candidate_id: string | null; winner_plan_version_id: string | null; published_at: string | null
 }

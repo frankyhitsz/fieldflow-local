@@ -25,7 +25,7 @@ from .models import (
     UnassignedWorkOrder,
     WorkOrder,
 )
-from .timeutils import hhmm
+from .timeutils import hhmm, service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
 BUSINESS_SCORE_POLICY_VERSION = "FIELD_SERVICE_SCORE_V2"
@@ -48,7 +48,8 @@ def solver_status_from_routing(status_code: int, solution_found: bool) -> Solver
     if status_code == 7 and solution_found:
         return SolverStatus.optimal
     if status_code == 2 and solution_found:
-        return SolverStatus.time_limit_feasible
+        # This partial-search status does not identify the stopping condition.
+        return SolverStatus.feasible
     if status_code == 1 and solution_found:
         return SolverStatus.feasible
     if status_code == 4:
@@ -101,10 +102,11 @@ def _diagnose_unassigned(
     individually_feasible = []
     for tech in eligible:
         arrive = tech.shift_start + provider.minutes(tech.start_location, order.location)
-        start = max(arrive, order.window_start)
+        start = max(arrive, service_ready_at(order))
         finish = start + order.service_duration
         if start <= order.window_end:
-            individually_feasible.append((tech, finish))
+            return_at = finish + provider.minutes(order.location, tech.start_location)
+            individually_feasible.append((tech, return_at))
     if not individually_feasible:
         if locked_to:
             return UnassignedWorkOrder(
@@ -121,7 +123,7 @@ def _diagnose_unassigned(
             suggestions=["与客户协商放宽时间窗", "调整技师班次开始时间"],
             evidence={"eligible_technician_ids": [item.id for item in eligible], "window_start": order.window_start, "window_end": order.window_end},
         )
-    if all(finish > tech.shift_end + tech.overtime_limit for tech, finish in individually_feasible):
+    if all(return_at > tech.shift_end + tech.overtime_limit for tech, return_at in individually_feasible):
         if locked_to:
             return UnassignedWorkOrder(
                 work_order_id=order.id,
@@ -216,6 +218,10 @@ def _attach_route_insertion_evidence(
 
     for technician_id, route in grouped.items():
         technician = technicians[technician_id]
+        last_order = orders[route[-1].work_order_id]
+        return_travel = provider.minutes(last_order.location, technician.start_location)
+        route_return_at = route[-1].finish_time + return_travel
+        route_overtime = max(0, route_return_at - technician.shift_end)
         for index, assignment in enumerate(route):
             order = orders[assignment.work_order_id]
             previous_point = technician.start_location if index == 0 else orders[route[index - 1].work_order_id].location
@@ -233,6 +239,20 @@ def _attach_route_insertion_evidence(
             assignment.evidence["route_insertion_travel_delta_minutes"] = insertion_delta
             assignment.evidence["alternative_route_travel_delta_minutes"] = alternatives
             assignment.evidence["alternative_delta_scope"] = "travel_only_without_rescheduling"
+            assignment.evidence["reported_at"] = order.reported_at
+            assignment.evidence["service_ready_at"] = service_ready_at(order)
+            assignment.evidence["route_return_travel_minutes"] = return_travel
+            assignment.evidence["route_return_at"] = route_return_at
+            assignment.evidence["overtime_minutes"] = route_overtime
+            overtime_text = (
+                "不会产生加班"
+                if route_overtime == 0
+                else f"含返程预计产生 {route_overtime} 分钟加班，未超过上限"
+            )
+            for explanation_index, line in enumerate(assignment.explanation):
+                if line == "不会产生加班" or line.startswith("产生 "):
+                    assignment.explanation[explanation_index] = overtime_text
+                    break
             assignment.explanation.append(f"在当前路线的前后工单之间插入此单，行程净增 {insertion_delta} 分钟")
             if alternatives:
                 assignment.explanation.append(
@@ -246,11 +266,10 @@ def _mark_replan_changes(
     relevant_order_ids: set[str],
 ) -> None:
     previous_items = [item for item in previous.assignments if item.work_order_id in relevant_order_ids]
-    previous_ids = {item.work_order_id for item in previous_items}
     old_predecessor: dict[str, str | None] = {}
     new_predecessor: dict[str, str | None] = {}
     old_by_id = {item.work_order_id: item for item in previous_items}
-    for source, target in ((previous_items, old_predecessor), ([item for item in assignments if item.work_order_id in previous_ids], new_predecessor)):
+    for source, target in ((previous_items, old_predecessor), (assignments, new_predecessor)):
         grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
         for item in source:
             grouped[item.technician_id].append(item)
@@ -497,6 +516,7 @@ def _result(
         scenario_snapshot_hash=content_hash(scenario),
         solver_config_hash=content_hash(scenario.solver_config),
         travel_model_version=provider.version,
+        travel_model_fingerprint=provider.fingerprint,
         metric_policy_version=METRIC_POLICY_VERSION,
         solver_name=solver_name,
         solver_version=solver_version,
@@ -534,6 +554,7 @@ def recompute_business_result(
     rebound.business_score_policy_version = BUSINESS_SCORE_POLICY_VERSION
     rebound.metric_policy_version = METRIC_POLICY_VERSION
     rebound.travel_model_version = provider.version
+    rebound.travel_model_fingerprint = provider.fingerprint
     return rebound
 
 
@@ -601,7 +622,7 @@ def baseline_schedule(
             available, point = state[tech.id]
             travel = provider.minutes(point, order.location)
             arrival = available + travel
-            start = max(arrival, order.window_start)
+            start = max(arrival, service_ready_at(order))
             finish = start + order.service_duration
             return_time = provider.minutes(order.location, tech.start_location)
             if start <= order.window_end and finish + return_time <= tech.shift_end + tech.overtime_limit:
@@ -626,6 +647,8 @@ def baseline_schedule(
                 "eligible_technician_ids": [item.id for item in scenario.technicians if _eligible(item, order)],
                 "window_start": order.window_start,
                 "window_end": order.window_end,
+                "reported_at": order.reported_at,
+                "service_ready_at": service_ready_at(order),
                 "arrival_time": arrival,
                 "start_time": start,
                 "finish_time": finish,
@@ -761,7 +784,8 @@ def optimized_schedule(
     for order in active_orders:
         node = order_nodes[order.id]
         index = manager.NodeToIndex(node)
-        time_dimension.CumulVar(index).SetRange(order.window_start, order.window_end)
+        ready_at = service_ready_at(order)
+        time_dimension.CumulVar(index).SetRange(ready_at, order.window_end)
         eligible_vehicles = [i for i, tech in enumerate(technicians) if vehicle_available[i] and _eligible(tech, order)]
         locked_to = locked.get(order.id)
         if locked_to:
@@ -778,7 +802,7 @@ def optimized_schedule(
         # insufficient because a disjunction would still let the solver drop it.
         if not locked_to:
             routing.AddDisjunction([index], penalty)
-        latest_on_time_start = max(order.window_start, order.sla_deadline - order.service_duration)
+        latest_on_time_start = max(ready_at, order.sla_deadline - order.service_duration)
         time_dimension.SetCumulVarSoftUpperBound(index, latest_on_time_start, scenario.solver_config.sla_late_weight)
 
     search = pywrapcp.DefaultRoutingSearchParameters()
@@ -855,6 +879,8 @@ def optimized_schedule(
                         "eligible_technician_ids": [item.id for item in scenario.technicians if _eligible(item, order)],
                         "window_start": order.window_start,
                         "window_end": order.window_end,
+                        "reported_at": order.reported_at,
+                        "service_ready_at": service_ready_at(order),
                         "arrival_time": arrival,
                         "start_time": start,
                         "finish_time": finish,
@@ -888,7 +914,7 @@ def optimized_schedule(
     return _result(
         scenario, kind, version, mapped_status, runtime_ms, assignments, unassigned, previous,
         note=(
-            f"“{strategy_names.get(strategy, strategy)}”策略在 {effective_limit_ms / 1000:g} 秒时限内找到了可执行方案；"
+            f"“{strategy_names.get(strategy, strategy)}”策略在本次搜索预算内找到了可执行方案；"
             f"终止原因：{termination_reason}。{optimality_note}"
         ),
         strategy=strategy,

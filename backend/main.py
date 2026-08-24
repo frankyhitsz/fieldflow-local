@@ -51,6 +51,9 @@ from .models import (
     Technician,
     TechnicianUpdate,
     WorkOrder,
+    WorkOrderExecutionEvent,
+    WorkOrderExecutionRequest,
+    WorkOrderExecutionResult,
     WorkOrderStatus,
     WorkOrderUpdate,
 )
@@ -303,6 +306,15 @@ def build_planning_context(
     inferred: list[str] = []
     for order in scenario.work_orders:
         assignment = source_assignments.get(order.id)
+        if not assignment and order.status in {WorkOrderStatus.started, WorkOrderStatus.completed}:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "执行状态缺少来源方案分配，不能安全重排",
+                    "code": "STARTED_WORK_ORDER_SOURCE_ASSIGNMENT_MISSING" if order.status is WorkOrderStatus.started else "COMPLETED_WORK_ORDER_SOURCE_ASSIGNMENT_MISSING",
+                    "work_order_id": order.id,
+                },
+            )
         if not assignment:
             continue
         if order.status in {WorkOrderStatus.started, WorkOrderStatus.completed}:
@@ -485,13 +497,8 @@ def update_work_order(scenario_id: str, work_order_id: str, request: WorkOrderUp
     if updates.get("note") is None and "note" in updates:
         updates["note"] = ""
     requested_status = updates.get("status")
-    allowed_transitions = {
-        WorkOrderStatus.pending: {WorkOrderStatus.pending, WorkOrderStatus.started, WorkOrderStatus.completed},
-        WorkOrderStatus.started: {WorkOrderStatus.started, WorkOrderStatus.completed},
-        WorkOrderStatus.completed: {WorkOrderStatus.completed},
-    }
-    if requested_status is not None and requested_status not in allowed_transitions[original.status]:
-        raise HTTPException(409, f"工单状态不能从 {original.status.value} 回退到 {requested_status.value}")
+    if requested_status is not None and requested_status is not original.status:
+        raise HTTPException(409, "工单状态只能通过开始服务或完成服务操作变更")
     if original.status.value in {"started", "completed"}:
         immutable_fields = {"customer_name", "title", "required_skills", "location", "service_duration", "window_start", "window_end", "sla_deadline", "priority", "drop_penalty", "vip", "is_emergency", "reported_at"}
         if any(key in updates and updates[key] != original.model_dump().get(key) for key in immutable_fields):
@@ -507,9 +514,51 @@ def update_work_order(scenario_id: str, work_order_id: str, request: WorkOrderUp
         scenario.work_orders[index] = normalize_order(WorkOrder.model_validate(payload))
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
-    if requested_status is WorkOrderStatus.completed:
-        scenario.locked_assignments = [item for item in scenario.locked_assignments if item.work_order_id != work_order_id]
     return save_scenario_change(scenario, f"更新工单 {work_order_id}")
+
+
+def execute_work_order_transition(
+    scenario_id: str,
+    work_order_id: str,
+    action: str,
+    request: WorkOrderExecutionRequest,
+) -> WorkOrderExecutionResult:
+    fingerprint = content_hash({
+        "scenario_id": scenario_id,
+        "work_order_id": work_order_id,
+        "action": action,
+        "request": request,
+    })
+    try:
+        return require_store().transition_work_order(
+            scenario_id,
+            work_order_id,
+            action,
+            request,
+            request_fingerprint=fingerprint,
+        )
+    except KeyError as error:
+        raise HTTPException(404, str(error)) from error
+    except ScenarioRevisionConflict as error:
+        raise HTTPException(409, detail={"message": "业务数据已变化，请刷新后重试", "expected_revision": error.expected, "current_revision": error.current}) from error
+    except PublicationConflict as error:
+        raise HTTPException(409, detail={"message": str(error)}) from error
+
+
+@router.post("/api/scenarios/{scenario_id}/work-orders/{work_order_id}/start", response_model=WorkOrderExecutionResult)
+def start_work_order(scenario_id: str, work_order_id: str, request: WorkOrderExecutionRequest) -> WorkOrderExecutionResult:
+    return execute_work_order_transition(scenario_id, work_order_id, "start", request)
+
+
+@router.post("/api/scenarios/{scenario_id}/work-orders/{work_order_id}/complete", response_model=WorkOrderExecutionResult)
+def complete_work_order(scenario_id: str, work_order_id: str, request: WorkOrderExecutionRequest) -> WorkOrderExecutionResult:
+    return execute_work_order_transition(scenario_id, work_order_id, "complete", request)
+
+
+@router.get("/api/scenarios/{scenario_id}/execution-events", response_model=list[WorkOrderExecutionEvent])
+def list_execution_events(scenario_id: str) -> list[WorkOrderExecutionEvent]:
+    require_scenario(scenario_id)
+    return require_store().list_execution_events(scenario_id)
 
 
 @router.delete("/api/scenarios/{scenario_id}/work-orders/{work_order_id}", response_model=ScheduleScenario)
@@ -707,6 +756,8 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
     idempotency_key = request.idempotency_key or (f"emergency-replan:{scenario_id}:{incoming.id}" if incoming else None)
     request_fingerprint = content_hash({"scenario_id": scenario_id, "request": request.model_dump(mode="json")}) if idempotency_key else None
     command_namespace = f"{scenario_id}:replan"
+    intake_namespace = f"{scenario_id}:emergency-intake"
+    intake_key = request.intake_idempotency_key or (f"emergency-intake:{incoming.id}" if incoming else None)
     if not incoming and idempotency_key and request_fingerprint:
         try:
             existing_publication = require_store().published_for_key(
@@ -731,14 +782,24 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
             raise HTTPException(int(payload.get("http_status", 422)), detail=payload.get("detail", payload))
     if incoming:
         normalized = normalize_order(incoming.model_copy(deep=True))
-        assert idempotency_key and request_fingerprint
+        assert idempotency_key and request_fingerprint and intake_key
+        intake_fingerprint = content_hash({"scenario_id": scenario_id, "work_order": normalized})
         try:
             scenario, _ = require_store().intake_emergency_work_order(
                 scenario_id,
                 normalized,
-                namespace=command_namespace,
-                idempotency_key=idempotency_key,
-                request_fingerprint=request_fingerprint,
+                namespace=intake_namespace,
+                idempotency_key=intake_key,
+                request_fingerprint=intake_fingerprint,
+            )
+            require_store().begin_command_record(
+                command_namespace,
+                idempotency_key,
+                request_fingerprint,
+                status="INTAKE_COMMITTED",
+                resource_type="work_order",
+                resource_id=normalized.id,
+                payload={"work_order_id": normalized.id, "scenario_revision": scenario.revision, "intake_key": intake_key},
             )
         except PublicationConflict as error:
             raise HTTPException(409, str(error)) from error
@@ -1050,7 +1111,13 @@ def activate_plan_version(
         source.selected if selected.kind == "replan" else None,
         provider=require_store().travel_provider,
     )
-    run = start_schedule_run(current, "activate", source=source, solver_name="plan-activation")
+    run = start_schedule_run(
+        current,
+        "activate",
+        source=source,
+        solver_name="plan-activation",
+        solver_config_hash=selected.solver_config_hash,
+    )
     published = publish_selected(
         current,
         selected,
@@ -1157,7 +1224,13 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
     selected = normalize_schedule(
         restored, selected, provider=require_store().travel_provider
     )
-    run = start_schedule_run(restored, "restore", source=source, solver_name="plan-restore")
+    run = start_schedule_run(
+        restored,
+        "restore",
+        source=source,
+        solver_name="plan-restore",
+        solver_config_hash=selected.solver_config_hash,
+    )
     verification = validate_result(restored, selected)
     candidate = ScheduleCandidate(
         id=f"CAND-{uuid.uuid4().hex[:12]}", run_id=run.id, scenario_id=scenario_id,
@@ -1556,6 +1629,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
         "time_limit_seconds": request.time_limit_seconds,
         "solver_version": ortools.__version__,
         "travel_model_version": require_store().travel_provider.version,
+        "travel_model_fingerprint": require_store().travel_provider.fingerprint,
         "score_policy_version": "FIELD_SERVICE_SCORE_V2",
         "seed": scenario.seed,
     })
@@ -1575,6 +1649,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
         scenario_snapshot_hash=scenario_snapshot_hash,
         score_policy_version="FIELD_SERVICE_SCORE_V2",
         travel_model_version=require_store().travel_provider.version,
+        travel_model_fingerprint=require_store().travel_provider.fingerprint,
         solver_version=ortools.__version__,
     )
     if experiment_executor is None or experiment_slots is None:
@@ -1652,9 +1727,6 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
     schedule_candidate = require_store().get_schedule_candidate(candidate.schedule_candidate_id) if candidate.schedule_candidate_id else None
     if not schedule_candidate:
         raise HTTPException(409, "候选方案缺少可追溯的求解记录，请重新运行实验")
-    schedule_candidate.verification_report = verification
-    schedule_candidate.publishable = verification.publishable
-    require_store().save_schedule_candidate(schedule_candidate)
     source = require_store().active_plan_version(scenario_id)
     try:
         published = require_store().publish_plan(

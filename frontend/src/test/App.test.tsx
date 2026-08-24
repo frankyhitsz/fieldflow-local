@@ -21,7 +21,7 @@ const schedule: Schedule = {
   requested_time_limit_ms: 1000, effective_time_limit_ms: 1000, solver_status_code: 1,
   termination_reason: 'ROUTING_SUCCESS', solution_found: true, solver_objective_value: 100,
   business_score: 100, business_score_policy_version: 'FIELD_SERVICE_SCORE_V2',
-  scenario_snapshot_hash: 'test', solver_config_hash: 'test', travel_model_version: 'EUCLIDEAN_GRID_V2',
+  scenario_snapshot_hash: 'test', solver_config_hash: 'test', travel_model_version: 'EUCLIDEAN_GRID_V2', travel_model_fingerprint: 'test',
   metric_policy_version: 'FIELD_SERVICE_METRICS_V2', solver_name: 'test', solver_version: '1',
   kpis: { completion_rate: 1, sla_on_time_rate: 1, sla_late_count: 0, total_travel_minutes: 10, total_service_minutes: 30, total_overtime_minutes: 0, average_utilization: .5, unassigned_count: 0, high_priority_missed: 0, workload_stddev: 0, stability_rate: null, assigned_on_time_rate: 1, committed_on_time_rate: 1, total_late_minutes: 0, p90_late_minutes: 0, total_waiting_minutes: 0, average_occupied_utilization: .67, workload_range: 0, normalized_workload_range: 0, same_technician_rate: null, adjacency_preservation_rate: null, start_time_shift_median: null, start_time_shift_p90: null, start_time_shift_over_15m_count: null, customer_notification_count: null, technician: [{ technician_id: 'TECH-01', service_minutes: 30, travel_minutes: 10, overtime_minutes: 0, utilization: .5, assignment_count: 1, waiting_minutes: 0, occupied_minutes: 40, service_utilization: .5, occupied_utilization: .67, travel_ratio: .25, waiting_ratio: 0, overtime_ratio: 0, normalized_workload: .67 }] },
 }

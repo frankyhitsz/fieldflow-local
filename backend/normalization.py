@@ -5,7 +5,7 @@ from collections import defaultdict
 from .hashing import content_hash
 from .models import ScheduleAssignment, ScheduleResult, ScheduleScenario
 from .scheduler import BUSINESS_SCORE_POLICY_VERSION, METRIC_POLICY_VERSION, calculate_kpis, objective_breakdown
-from .timeutils import hhmm
+from .timeutils import hhmm, service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
 
@@ -33,7 +33,9 @@ def _change_flags(
         return answer
 
     before = predecessors(source_items)
-    after = predecessors([item for item in assignments if item.work_order_id in source_by_id])
+    # A newly inserted stop changes the immediate predecessor of the following
+    # committed stop and therefore counts as a customer-visible route change.
+    after = predecessors(assignments)
     return {
         item.work_order_id: bool(
             (old := source_by_id.get(item.work_order_id))
@@ -81,6 +83,10 @@ def normalize_schedule(
 
     for technician_id, route in grouped.items():
         technician = technicians[technician_id]
+        last_order = orders[route[-1].work_order_id]
+        return_travel = provider.minutes(last_order.location, technician.start_location)
+        route_return_at = route[-1].finish_time + return_travel
+        route_overtime = max(0, route_return_at - technician.shift_end)
         for index, assignment in enumerate(route):
             order = orders[assignment.work_order_id]
             previous_point = technician.start_location if index == 0 else orders[route[index - 1].work_order_id].location
@@ -112,8 +118,8 @@ def normalize_schedule(
                 explanation.append(f"共有 {len(eligible)} 名技师满足技能要求；路线计算选择 {technician.id}")
             explanation.append(
                 "不会产生加班"
-                if assignment.finish_time <= technician.shift_end
-                else f"产生 {assignment.finish_time - technician.shift_end} 分钟加班，未超过上限"
+                if route_overtime == 0
+                else f"含返程预计产生 {route_overtime} 分钟加班，未超过上限"
             )
             if locked:
                 explanation.append("人工锁定已生效，本次求解保持指定技师")
@@ -135,11 +141,15 @@ def normalize_schedule(
                 "eligible_technician_ids": eligible,
                 "window_start": order.window_start,
                 "window_end": order.window_end,
+                "reported_at": order.reported_at,
+                "service_ready_at": service_ready_at(order),
                 "arrival_time": assignment.arrival_time,
                 "start_time": assignment.start_time,
                 "finish_time": assignment.finish_time,
                 "leg_travel_minutes": travel,
-                "overtime_minutes": max(0, assignment.finish_time - technician.shift_end),
+                "route_return_travel_minutes": return_travel,
+                "route_return_at": route_return_at,
+                "overtime_minutes": route_overtime,
                 "route_insertion_travel_delta_minutes": insertion_delta,
                 "alternative_route_travel_delta_minutes": alternatives,
                 "alternative_delta_scope": "travel_only_without_rescheduling",
@@ -157,6 +167,7 @@ def normalize_schedule(
         or content_hash(scenario.solver_config)
     )
     normalized.travel_model_version = provider.version
+    normalized.travel_model_fingerprint = provider.fingerprint
     normalized.metric_policy_version = METRIC_POLICY_VERSION
     normalized.business_score_policy_version = BUSINESS_SCORE_POLICY_VERSION
     normalized.kpis = calculate_kpis(

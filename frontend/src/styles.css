@@ -306,3 +306,11 @@ nav { display: grid; gap: 5px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+.readonly-field { display: flex; align-items: center; min-height: 36px; color: var(--ink); font-size: 14px; font-weight: 650; }
+.execution-status { display: inline-flex; align-items: center; min-height: 28px; margin: 0 0 12px; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; font-weight: 650; }
+.execution-status.started { border-color: #9b6d24; color: #765019; background: #f7eedb; }
+.execution-status.completed { border-color: #6e8a7e; color: #315c4b; background: #e8f0eb; }
+.execution-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.execution-actions .lock-action { margin: 0; }
+.start-action, .complete-action { display: flex; align-items: center; justify-content: center; gap: 7px; width: 100%; min-height: 40px; border: 1px solid #315c4b; color: #fff; background: #315c4b; font-size: 14px; font-weight: 650; }
+.complete-action { margin-top: 12px; }

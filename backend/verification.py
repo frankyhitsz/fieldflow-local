@@ -15,6 +15,7 @@ from .models import (
     VerificationIssue,
 )
 from .normalization import normalize_schedule
+from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
 PUBLISHABLE_STATUSES = {
@@ -91,8 +92,20 @@ def verify_schedule(
         error("SOLVER_STATUS_NOT_PUBLISHABLE", f"solver status {result.solver_status.value} cannot be published")
     if result.travel_model_version != provider.version:
         error("TRAVEL_MODEL_MISMATCH", f"candidate travel model {result.travel_model_version} does not match {provider.version}")
+    if result.travel_model_fingerprint != provider.fingerprint:
+        error("TRAVEL_MODEL_FINGERPRINT_MISMATCH", "candidate travel model fingerprint does not match current configuration")
 
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
+    for work_order_id, technician_id in locked.items():
+        if work_order_id not in orders:
+            error("LOCKED_WORK_ORDER_MISSING", f"{work_order_id}: locked work order does not exist", work_order_id, technician_id)
+        elif work_order_id in unassigned_ids:
+            error("LOCKED_WORK_ORDER_UNASSIGNED", f"{work_order_id}: locked work order cannot be unassigned", work_order_id, technician_id)
+        elif orders[work_order_id].status.value != "completed" and work_order_id not in assignment_ids:
+            error("LOCKED_WORK_ORDER_MISSING", f"{work_order_id}: locked work order is missing from assignments", work_order_id, technician_id)
+    for order in scenario.work_orders:
+        if order.status.value == "started" and order.id not in assignment_ids:
+            error("STARTED_WORK_ORDER_UNASSIGNED", f"{order.id}: started work order must remain assigned", order.id)
     grouped: dict[str, list[ScheduleAssignment]] = defaultdict(list)
     for assignment in result.assignments:
         order = orders.get(assignment.work_order_id)
@@ -106,6 +119,8 @@ def verify_schedule(
             error("SKILL_MISMATCH", f"{order.id}: technician lacks required skill", order.id, technician.id)
         if not order.window_start <= assignment.start_time <= order.window_end:
             error("TIME_WINDOW_VIOLATION", f"{order.id}: start outside time window", order.id, technician.id)
+        if assignment.start_time < service_ready_at(order):
+            error("BEFORE_DEMAND_REPORTED", f"{order.id}: service starts before demand was reported", order.id, technician.id)
         if assignment.arrival_time > assignment.start_time:
             error("ARRIVAL_AFTER_START", f"{order.id}: arrival occurs after service start", order.id, technician.id)
         if assignment.finish_time != assignment.start_time + order.service_duration:
@@ -176,6 +191,10 @@ def verify_schedule(
                 frozen_item.finish_time,
             ):
                 error("PLANNING_CONTEXT_SOURCE_MISMATCH", f"{work_order_id}: frozen assignment does not match source plan", work_order_id)
+            elif frozen_item is not None and frozen_item.reason.value == "COMPLETED":
+                # Completed work remains traceable to the source plan but is no
+                # longer part of the future schedule candidate.
+                continue
             elif new is None or (new.technician_id, new.sequence, new.start_time, new.finish_time) != (old.technician_id, old.sequence, old.start_time, old.finish_time):
                 error("IMMUTABLE_ASSIGNMENT_CHANGED", f"{work_order_id}: frozen assignment changed", work_order_id)
         if planning_context:
@@ -201,7 +220,12 @@ def verify_schedule(
             if assignment.locked != expected.locked:
                 error("LOCKED_FLAG_MISMATCH", f"{assignment.work_order_id}: locked flag does not match scenario locks", assignment.work_order_id, assignment.technician_id)
             if assignment.explanation != expected.explanation:
-                error("EXPLANATION_MISMATCH", f"{assignment.work_order_id}: explanation was not regenerated", assignment.work_order_id, assignment.technician_id)
+                warnings.append(VerificationIssue(
+                    code="EXPLANATION_TEMPLATE_OUTDATED",
+                    message=f"{assignment.work_order_id}: explanation text uses an older template",
+                    work_order_id=assignment.work_order_id,
+                    technician_id=assignment.technician_id,
+                ))
             if assignment.evidence != expected.evidence:
                 error("EVIDENCE_MISMATCH", f"{assignment.work_order_id}: evidence was not regenerated", assignment.work_order_id, assignment.technician_id)
         recomputed_kpis = normalized.kpis

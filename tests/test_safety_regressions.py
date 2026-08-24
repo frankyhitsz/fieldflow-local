@@ -9,9 +9,16 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from backend.fixtures import get_fixture
-from backend.models import SolverStatus, UnassignedReason, UnassignedWorkOrder
+from backend.models import (
+    LockedAssignment,
+    SolverStatus,
+    StrategyExperiment,
+    UnassignedReason,
+    UnassignedWorkOrder,
+    WorkOrderStatus,
+)
 from backend.normalization import normalize_schedule
-from backend.scheduler import baseline_schedule, solver_status_from_routing
+from backend.scheduler import baseline_schedule, optimized_schedule, solver_status_from_routing
 from backend.storage import Store
 from backend.travel import EuclideanTravelTimeProvider, MatrixTravelTimeProvider
 from backend.verification import verify_schedule
@@ -19,6 +26,10 @@ from backend.verification import verify_schedule
 
 def _codes(report) -> set[str]:
     return {item.code for item in report.errors}
+
+
+def _warning_codes(report) -> set[str]:
+    return {item.code for item in report.warnings}
 
 
 def test_verifier_rejects_missing_duplicate_overlap_and_forged_kpis():
@@ -51,6 +62,28 @@ def test_verifier_rejects_missing_duplicate_overlap_and_forged_kpis():
     assert "KPI_MISMATCH" in _codes(verify_schedule(scenario, forged))
 
 
+def test_verifier_rejects_unassigned_locks_and_started_work_without_assignment():
+    scenario = get_fixture("main")
+    original = normalize_schedule(scenario, baseline_schedule(scenario, 0))
+    assignment = original.assignments[0]
+    scenario.locked_assignments = [LockedAssignment(
+        work_order_id=assignment.work_order_id,
+        technician_id=assignment.technician_id,
+    )]
+    missing = original.model_copy(deep=True)
+    missing.assignments = [item for item in missing.assignments if item.work_order_id != assignment.work_order_id]
+    missing.unassigned.append(UnassignedWorkOrder(
+        work_order_id=assignment.work_order_id,
+        reason=UnassignedReason.locked_plan_conflict,
+        detail="test",
+    ))
+    assert "LOCKED_WORK_ORDER_UNASSIGNED" in _codes(verify_schedule(scenario, missing))
+
+    next(item for item in scenario.work_orders if item.id == assignment.work_order_id).status = WorkOrderStatus.started
+    scenario.locked_assignments = []
+    assert "STARTED_WORK_ORDER_UNASSIGNED" in _codes(verify_schedule(scenario, missing))
+
+
 def test_normalizer_overwrites_and_verifier_rejects_forged_assignment_facts():
     scenario = get_fixture("main")
     original = normalize_schedule(scenario, baseline_schedule(scenario, 0))
@@ -66,9 +99,9 @@ def test_normalizer_overwrites_and_verifier_rejects_forged_assignment_facts():
         "CHANGED_FLAG_MISMATCH",
         "LOCKED_FLAG_MISMATCH",
         "TRAVEL_TIME_MISMATCH",
-        "EXPLANATION_MISMATCH",
         "EVIDENCE_MISMATCH",
     }.issubset(_codes(report))
+    assert "EXPLANATION_TEMPLATE_OUTDATED" in _warning_codes(report)
 
     normalized = normalize_schedule(scenario, forged)
     assert normalized.assignments[0].changed is False
@@ -110,7 +143,7 @@ def test_non_publishable_solver_result_keeps_current_plan(monkeypatch, tmp_path)
 
 def test_solver_limit_and_status_contract(monkeypatch, tmp_path):
     assert solver_status_from_routing(7, True) is SolverStatus.optimal
-    assert solver_status_from_routing(2, True) is SolverStatus.time_limit_feasible
+    assert solver_status_from_routing(2, True) is SolverStatus.feasible
     assert solver_status_from_routing(4, False) is SolverStatus.time_limit_no_solution
     assert solver_status_from_routing(6, False) is SolverStatus.infeasible
 
@@ -200,6 +233,105 @@ def test_same_travel_provider_is_used_by_scheduler_normalizer_and_verifier():
     assert result.kpis.total_travel_minutes == 64
     assert verify_schedule(scenario, result, provider=provider).publishable
     assert "TRAVEL_MODEL_MISMATCH" in _codes(verify_schedule(scenario, result))
+    changed_provider = MatrixTravelTimeProvider(
+        matrix={
+            ("DEPOT", "DEPOT"): 0,
+            ("DEPOT", "JOB"): 42,
+            ("JOB", "DEPOT"): 23,
+            ("JOB", "JOB"): 0,
+        },
+        point_ids={(depot.x, depot.y): "DEPOT", (job.x, job.y): "JOB"},
+        version="TEST_ASYMMETRIC_MATRIX",
+    )
+    assert provider.fingerprint != changed_provider.fingerprint
+    assert "TRAVEL_MODEL_FINGERPRINT_MISMATCH" in _codes(
+        verify_schedule(scenario, result, provider=changed_provider)
+    )
+
+
+def test_reported_at_is_a_hard_earliest_start_for_every_solver_path():
+    scenario = get_fixture("main")
+    original = scenario.work_orders[0]
+    scenario.work_orders = [original.model_validate({
+        **original.model_dump(),
+        "is_emergency": True,
+        "reported_at": original.window_start + 45,
+    })]
+    baseline = baseline_schedule(scenario, 0)
+    optimized = optimized_schedule(scenario, 0, baseline, time_limit_seconds=1)
+    ready_at = scenario.work_orders[0].reported_at
+    assert ready_at is not None
+    assert baseline.assignments[0].start_time >= ready_at
+    assert optimized.assignments[0].start_time >= ready_at
+
+    forged = normalize_schedule(scenario, baseline)
+    forged.assignments[0].start_time = ready_at - 1
+    forged.assignments[0].finish_time = ready_at - 1 + scenario.work_orders[0].service_duration
+    assert "BEFORE_DEMAND_REPORTED" in _codes(verify_schedule(scenario, forged))
+
+
+def test_inserting_new_work_marks_the_following_committed_stop_changed():
+    scenario = get_fixture("main")
+    previous = normalize_schedule(scenario, baseline_schedule(scenario, 0))
+    technician_id = next(
+        technician.id
+        for technician in scenario.technicians
+        if sum(item.technician_id == technician.id for item in previous.assignments) >= 2
+    )
+    route = sorted(
+        [item for item in previous.assignments if item.technician_id == technician_id],
+        key=lambda item: item.sequence,
+    )
+    following = route[1]
+    template = next(item for item in scenario.work_orders if item.id == following.work_order_id)
+    inserted_order = template.model_copy(deep=True)
+    inserted_order.id = "WO-INSERTED-CHANGE"
+    scenario.work_orders.append(inserted_order)
+
+    candidate = previous.model_copy(deep=True)
+    candidate.kind = "replan"
+    for assignment in candidate.assignments:
+        if assignment.technician_id == technician_id and assignment.sequence >= following.sequence:
+            assignment.sequence += 1
+    inserted = following.model_copy(deep=True)
+    inserted.work_order_id = inserted_order.id
+    inserted.sequence = following.sequence
+    candidate.assignments.append(inserted)
+
+    normalized = normalize_schedule(scenario, candidate, previous)
+    changed = next(item for item in normalized.assignments if item.work_order_id == following.work_order_id)
+    assert changed.changed is True
+
+
+def test_experiment_cancel_cannot_be_overwritten_by_a_stale_worker(tmp_path):
+    store = Store(tmp_path / "cancel-race.db")
+    experiment = StrategyExperiment(
+        id="EXP-CANCEL-RACE",
+        scenario_id="main",
+        dataset="current",
+        data_revision=0,
+        status="RUNNING",
+        progress=10,
+        created_at="2026-08-24T00:00:00+00:00",
+    )
+    store.save_experiment(experiment)
+    stale_worker = experiment.model_copy(deep=True)
+    requested = store.request_experiment_cancel(experiment.id)
+    assert requested is not None and requested.status == "CANCEL_REQUESTED"
+
+    stale_worker.progress = 50
+    store.save_experiment(stale_worker)
+    assert store.get_experiment(experiment.id).status == "CANCEL_REQUESTED"
+
+    stale_worker.status = "COMPLETED"
+    stale_worker.progress = 100
+    store.save_experiment(stale_worker)
+    cancelled = store.get_experiment(experiment.id)
+    assert cancelled is not None and cancelled.status == "CANCELLED"
+    assert cancelled.cancel_requested_at == requested.cancel_requested_at
+    stale_worker.status = "FAILED"
+    store.save_experiment(stale_worker)
+    assert store.get_experiment(experiment.id).status == "CANCELLED"
 
 
 def test_app_and_publication_use_the_store_travel_provider(tmp_path):
@@ -247,23 +379,58 @@ def test_scenario_aggregate_and_work_order_state_machine(monkeypatch, tmp_path):
     import backend.main as main_module
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
-        assert client.put("/api/scenarios/main/work-orders/WO-1021", json={"status": "started"}).status_code == 200
-        rollback = client.put("/api/scenarios/main/work-orders/WO-1021", json={"status": "pending"})
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assigned = baseline["assignments"][0]
+        assert client.put(f"/api/scenarios/main/work-orders/{assigned['work_order_id']}", json={"status": "started"}).status_code == 409
+        locked = client.post(
+            "/api/scenarios/main/lock",
+            json={"work_order_id": assigned["work_order_id"], "technician_id": assigned["technician_id"], "locked": True},
+        )
+        assert locked.status_code == 200
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assigned = next(item for item in baseline["assignments"] if item["work_order_id"] == assigned["work_order_id"])
+        wrong_technician = next(
+            item["id"] for item in client.get("/api/scenarios/main").json()["technicians"]
+            if item["id"] != assigned["technician_id"]
+        )
+        assert client.post(
+            f"/api/scenarios/main/work-orders/{assigned['work_order_id']}/start",
+            json={"technician_id": wrong_technician, "occurred_at": assigned["start_time"], "expected_revision": locked.json()["revision"], "idempotency_key": "state-wrong-tech-001"},
+        ).status_code == 409
+        assert client.post(
+            f"/api/scenarios/main/work-orders/{assigned['work_order_id']}/complete",
+            json={"technician_id": assigned["technician_id"], "occurred_at": assigned["finish_time"], "expected_revision": locked.json()["revision"], "idempotency_key": "state-early-complete-001"},
+        ).status_code == 409
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{assigned['work_order_id']}/start",
+            json={"technician_id": assigned["technician_id"], "occurred_at": assigned["start_time"], "expected_revision": locked.json()["revision"], "idempotency_key": "state-start-001"},
+        )
+        assert started.status_code == 200
+        assert client.post(
+            f"/api/scenarios/main/work-orders/{assigned['work_order_id']}/start",
+            json={"technician_id": assigned["technician_id"], "occurred_at": assigned["start_time"], "expected_revision": locked.json()["revision"], "idempotency_key": "state-start-001"},
+        ).json() == started.json()
+        rollback = client.put(f"/api/scenarios/main/work-orders/{assigned['work_order_id']}", json={"status": "pending"})
         assert rollback.status_code == 409
-        immutable = client.put("/api/scenarios/main/work-orders/WO-1021", json={"title": "rewrite"})
+        immutable = client.put(f"/api/scenarios/main/work-orders/{assigned['work_order_id']}", json={"title": "rewrite"})
         assert immutable.status_code == 409
         started_lock = client.post(
             "/api/scenarios/main/lock",
-            json={"work_order_id": "WO-1021", "technician_id": "TECH-01", "locked": True},
+            json={"work_order_id": assigned["work_order_id"], "technician_id": assigned["technician_id"], "locked": True},
         )
         assert started_lock.status_code == 409
         assert client.post(
-            "/api/scenarios/main/lock",
-            json={"work_order_id": "WO-1022", "technician_id": "TECH-01", "locked": True},
-        ).status_code == 200
-        completed = client.put("/api/scenarios/main/work-orders/WO-1022", json={"status": "completed"})
+            f"/api/scenarios/main/work-orders/{assigned['work_order_id']}/complete",
+            json={"technician_id": assigned["technician_id"], "occurred_at": assigned["finish_time"], "expected_revision": locked.json()["revision"], "idempotency_key": "state-stale-complete-001"},
+        ).status_code == 409
+        completed = client.post(
+            f"/api/scenarios/main/work-orders/{assigned['work_order_id']}/complete",
+            json={"technician_id": assigned["technician_id"], "occurred_at": assigned["finish_time"], "expected_revision": started.json()["scenario"]["revision"], "idempotency_key": "state-complete-001"},
+        )
         assert completed.status_code == 200
-        assert not any(item["work_order_id"] == "WO-1022" for item in completed.json()["locked_assignments"])
+        assert not any(item["work_order_id"] == assigned["work_order_id"] for item in completed.json()["scenario"]["locked_assignments"])
+        events = client.get("/api/scenarios/main/execution-events").json()
+        assert [item["action"] for item in events] == ["start", "complete"]
 
 
 def test_blank_names_labels_and_invalid_colors_are_rejected_as_validation_errors(monkeypatch, tmp_path):
@@ -361,9 +528,10 @@ def test_replan_persists_explicit_frozen_context_and_only_warns_on_planned_depar
     with TestClient(main_module.app) as client:
         baseline = client.post("/api/scenarios/main/baseline").json()
         started = min(baseline["assignments"], key=lambda item: item["start_time"])
-        assert client.put(
-            f"/api/scenarios/main/work-orders/{started['work_order_id']}",
-            json={"status": "started"},
+        revision = client.get("/api/scenarios/main").json()["revision"]
+        assert client.post(
+            f"/api/scenarios/main/work-orders/{started['work_order_id']}/start",
+            json={"technician_id": started["technician_id"], "occurred_at": started["start_time"], "expected_revision": revision, "idempotency_key": "context-start-001"},
         ).status_code == 200
         response = client.post(
             "/api/scenarios/main/replan",
