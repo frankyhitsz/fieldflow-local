@@ -31,8 +31,8 @@
 - [x] 不可执行容量行用 `—` 隐藏正式数字，可展开全部违规；“回本”改为“经济影响抵消天数”。
 - [x] 失败和中断 A 在页面提供显式重试按钮，并说明原记录会保留。
 - [x] 补充成本、容量单位、无效方案、共同随机场景、冻结损坏、状态码、retry、Artifact 和 Saga 终态测试。
-- [x] 更新 OpenAPI 快照并完成 Ruff、Pyright、TypeScript、后端、React、构建、Demo、Benchmark 和依赖审计；Playwright API 流程通过，本机 Chromium 其余用例受系统 SIGTRAP 阻止，等待 Linux CI 补证。
-- [ ] 提交、推送并确认 GitHub Actions 最新提交全部通过。
+- [x] 更新 OpenAPI 快照并完成 Ruff、Pyright、TypeScript、后端、React、构建、Demo、Benchmark 和依赖审计；本机 Chromium 的 SIGTRAP 由 Linux Playwright 5 项全通过补证。
+- [x] 核心提交 `51b6c87` 已推送；GitHub Actions `32730300122` 的 `python-compat` 与 `fieldflow` 均通过，Linux Playwright 补齐页面验证。
 
 ## 后续版本范围
 
@@ -53,5 +53,6 @@ React 组件                        10 passed
 Demo check                       通过
 Benchmark smoke                  通过（严格完整性检查暴露的无效延迟 Fixture 已修正）
 Playwright API 生命周期           1 passed
-Playwright 浏览器页面             本机 Chromium 启动后被系统 SIGTRAP 终止；非断言失败，等待 Linux CI
+Playwright 浏览器页面             本机 Chromium 被系统 SIGTRAP 终止；Linux CI 5 tests success
+GitHub Actions 32730300122       python-compat success；fieldflow success；Linux Playwright success
 ```
