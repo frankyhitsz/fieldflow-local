@@ -18,12 +18,17 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ._version import __version__
+from .decision import capacity_analysis, cost_analysis, simulate_plan_risk
+from .execution import execution_context_for_planning
 from .fixtures import get_fixture
 from .hashing import content_hash
 from .models import (
     ActivatePlanRequest,
+    CapacityAnalysis,
+    CapacityAnalysisRequest,
     CloneScenarioRequest,
     Comparison,
+    CostAnalysis,
     ExecutionSourceContext,
     ExperimentPublishRequest,
     FreezeReason,
@@ -36,6 +41,8 @@ from .models import (
     PlanVersionPatch,
     ReplanRequest,
     RestoreRequest,
+    RiskSimulationRequest,
+    RiskSimulationResult,
     RollbackPreview,
     ScenarioCreate,
     ScheduleArtifact,
@@ -150,6 +157,9 @@ def save_scenario_change(
         scenario = ScheduleScenario.model_validate(scenario.model_dump())
     except ValueError as error:
         raise HTTPException(422, detail={"message": "场景数据不完整", "error": str(error)}) from error
+    current = require_store().get_scenario(scenario.id)
+    if current and current.model_dump(mode="json") == scenario.model_dump(mode="json"):
+        return current
     expected_revision = scenario.revision
     scenario.revision += 1
     preserve_active_plan = preserve_active_plan or any(
@@ -189,9 +199,11 @@ def bind_solver_policy(
     effective_scenario: ScheduleScenario,
     profile: StrategyProfile | None,
     strategy_key: str,
+    original_scenario: ScheduleScenario | None = None,
 ) -> ScheduleResult:
     result.solver_policy = build_solver_policy_snapshot(
         effective_scenario,
+        original_scenario=original_scenario or effective_scenario,
         strategy=strategy_key,
         requested_time_limit_ms=result.requested_time_limit_ms,
         solver_name=result.solver_name,
@@ -199,6 +211,58 @@ def bind_solver_policy(
         profile_name=profile.name if profile else strategy_key,
         profile_snapshot=profile.model_dump(mode="json") if profile else {},
         unassigned_penalty_scale=profile.weights.unassigned_penalty_scale if profile else 1.0,
+    )
+    return result
+
+
+def bind_replayed_solver_policy(
+    result: ScheduleResult,
+    scenario: ScheduleScenario,
+    solver_name: str,
+) -> ScheduleResult:
+    """Describe a history replay as a replay, without pretending to rerun OR-Tools.
+
+    The source policy remains useful provenance for the strategy weights and
+    effective drop penalties.  Its routing time limit, however, belongs to the
+    original solve and must not be attached to an activation or restore run.
+    """
+    source_policy = result.solver_policy
+    source_solver_name = result.solver_name
+    effective = scenario.model_copy(deep=True)
+    if source_policy is not None:
+        effective.solver_config = source_policy.solver_config.model_copy(deep=True)
+        effective_penalties = source_policy.effective_drop_penalties
+        for order in effective.work_orders:
+            order.drop_penalty = effective_penalties.get(order.id, order.drop_penalty)
+        profile_id = source_policy.profile_id
+        profile_name = source_policy.profile_name
+        profile_snapshot = source_policy.profile_snapshot
+        penalty_scale = source_policy.unassigned_penalty_scale
+    else:
+        profile_id = result.strategy
+        profile_name = result.strategy
+        profile_snapshot = {}
+        penalty_scale = 1.0
+    result.solver_name = solver_name
+    result.solver_version = "1"
+    result.runtime_ms = 0
+    result.requested_time_limit_ms = None
+    result.effective_time_limit_ms = None
+    result.solver_status_code = None
+    result.termination_reason = "VERIFIED_PLAN_REPLAY"
+    result.solver_objective_value = None
+    result.solver_note = f"历史计划已按当前快照重新验证；本次操作未重新运行求解器。原方案由 {source_solver_name} 生成。"
+    result.solver_config_hash = content_hash(effective.solver_config)
+    result.solver_policy = build_solver_policy_snapshot(
+        effective,
+        original_scenario=scenario,
+        strategy=result.strategy,
+        requested_time_limit_ms=None,
+        solver_name=solver_name,
+        profile_id=profile_id,
+        profile_name=profile_name,
+        profile_snapshot=profile_snapshot,
+        unassigned_penalty_scale=penalty_scale,
     )
     return result
 
@@ -353,7 +417,7 @@ def prepare_replan_run(
             strategy="balanced",
             provider=require_store().travel_provider,
         )
-        previous = bind_solver_policy(previous, base_effective, balanced, "balanced")
+        previous = bind_solver_policy(previous, base_effective, balanced, "balanced", scenario)
         internal.append(artifact("candidate", previous, "balanced"))
     profile = profile_for_request(request.strategy, request.profile_id, request.time_limit_seconds)
     effective = scenario_for_profile(scenario, profile)
@@ -447,35 +511,52 @@ def build_planning_context(
     execution_source_context: ExecutionSourceContext | None = None,
 ) -> PlanningContext:
     source_assignments = {item.work_order_id: item for item in source.selected.assignments} if source else {}
+    execution_context, execution_warnings = (
+        execution_context_for_planning(execution_source_context, planning_time)
+        if execution_source_context
+        else (None, [])
+    )
+    execution_sources = (
+        {item.work_order_id: item for item in execution_context.started_assignments} if execution_context else {}
+    )
     frozen: list[FrozenAssignment] = []
     inferred: list[str] = []
     for order in scenario.work_orders:
         assignment = source_assignments.get(order.id)
-        if not assignment and order.status in {WorkOrderStatus.started, WorkOrderStatus.completed}:
+        if not assignment and order.status is WorkOrderStatus.started:
             raise HTTPException(
                 409,
                 detail={
                     "message": "执行状态缺少来源方案分配，不能安全重排",
-                    "code": "STARTED_WORK_ORDER_SOURCE_ASSIGNMENT_MISSING"
-                    if order.status is WorkOrderStatus.started
-                    else "COMPLETED_WORK_ORDER_SOURCE_ASSIGNMENT_MISSING",
+                    "code": "STARTED_WORK_ORDER_SOURCE_ASSIGNMENT_MISSING",
                     "work_order_id": order.id,
                 },
             )
         if not assignment:
             continue
         if order.status is WorkOrderStatus.started:
+            execution_source = execution_sources.get(order.id)
             frozen.append(
                 FrozenAssignment(
                     work_order_id=order.id,
-                    technician_id=assignment.technician_id,
+                    technician_id=(execution_source.technician_id if execution_source else assignment.technician_id),
                     sequence=assignment.sequence,
-                    start_time=assignment.start_time,
-                    finish_time=assignment.finish_time,
+                    start_time=(execution_source.planned_start_at if execution_source else assignment.start_time),
+                    finish_time=(execution_source.planned_finish_at if execution_source else assignment.finish_time),
                     reason=FreezeReason(order.status.value.upper()),
+                    source_sequence=(
+                        execution_source.source_sequence
+                        if execution_source and execution_source.source_sequence
+                        else assignment.source_sequence or assignment.sequence
+                    ),
+                    source_assignment_hash=(
+                        execution_source.source_assignment_hash
+                        if execution_source
+                        else assignment.source_assignment_hash
+                    ),
                 )
             )
-        elif (
+        elif order.status is WorkOrderStatus.pending and (
             assignment.start_time <= planning_time
             or assignment.arrival_time - assignment.travel_minutes <= planning_time
         ):
@@ -485,9 +566,10 @@ def build_planning_context(
         source_plan_version_id=source.id if source else None,
         source_plan_snapshot_hash=source.scenario_snapshot_hash if source else None,
         scenario_revision=scenario.revision,
-        execution_source_context=execution_source_context,
+        execution_source_context=execution_context,
         frozen_assignments=sorted(frozen, key=lambda item: item.work_order_id),
         inferred_departure_warnings=sorted(inferred),
+        execution_warnings=sorted(execution_warnings),
     )
 
 
@@ -746,7 +828,10 @@ def execute_work_order_transition(
             },
         ) from error
     except PublicationConflict as error:
-        raise HTTPException(409, detail={"message": str(error)}) from error
+        raise HTTPException(
+            409,
+            detail={"message": str(error), "code": error.code, **error.details},
+        ) from error
 
 
 @router.post("/api/scenarios/{scenario_id}/work-orders/{work_order_id}/start", response_model=WorkOrderExecutionResult)
@@ -967,8 +1052,9 @@ def run_optimize(
             effective,
             profile,
             strategy_key,
+            scenario,
         )
-        result = bind_solver_policy(result, effective, profile, strategy_key)
+        result = bind_solver_policy(result, effective, profile, strategy_key, scenario)
         baseline = normalize_schedule(
             scenario,
             solver_baseline,
@@ -1206,7 +1292,7 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
             planning_context=planning_context,
             provider=require_store().travel_provider,
         )
-        result = bind_solver_policy(result, effective, profile, strategy_key)
+        result = bind_solver_policy(result, effective, profile, strategy_key, scenario)
         result = normalize_schedule(
             scenario,
             result,
@@ -1329,6 +1415,59 @@ def rename_plan_version(scenario_id: str, version_id: str, request: PlanVersionP
     if not plan:
         raise HTTPException(404, "方案版本不存在")
     return plan
+
+
+@router.get(
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/cost-analysis",
+    response_model=CostAnalysis,
+)
+def get_cost_analysis(scenario_id: str, version_id: str) -> CostAnalysis:
+    require_scenario(scenario_id)
+    plan = require_store().get_plan_version(scenario_id, version_id)
+    if not plan:
+        raise HTTPException(404, "方案版本不存在")
+    try:
+        return cost_analysis(plan)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@router.post(
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/capacity-analysis",
+    response_model=CapacityAnalysis,
+)
+def post_capacity_analysis(
+    scenario_id: str,
+    version_id: str,
+    request: CapacityAnalysisRequest,
+) -> CapacityAnalysis:
+    require_scenario(scenario_id)
+    plan = require_store().get_plan_version(scenario_id, version_id)
+    if not plan:
+        raise HTTPException(404, "方案版本不存在")
+    try:
+        return capacity_analysis(plan, request, require_store().travel_provider)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@router.post(
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/risk-simulation",
+    response_model=RiskSimulationResult,
+)
+def post_risk_simulation(
+    scenario_id: str,
+    version_id: str,
+    request: RiskSimulationRequest,
+) -> RiskSimulationResult:
+    require_scenario(scenario_id)
+    plan = require_store().get_plan_version(scenario_id, version_id)
+    if not plan:
+        raise HTTPException(404, "方案版本不存在")
+    try:
+        return simulate_plan_risk(plan, request)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
 
 
 def schedule_change_rows(
@@ -1501,8 +1640,7 @@ def activate_plan_version(
     selected.source_schedule_id = source.selected.id
     selected.scenario_revision = current.revision
     selected.solution_found = True
-    if selected.solver_policy is None:
-        selected = bind_solver_policy(selected, current, None, selected.strategy)
+    selected = bind_replayed_solver_policy(selected, current, "plan-activation")
     selected = normalize_schedule(
         current,
         selected,
@@ -1676,8 +1814,7 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
     selected.source_schedule_id = source.selected.id
     selected.scenario_revision = restored.revision
     selected.solution_found = True
-    if selected.solver_policy is None:
-        selected = bind_solver_policy(selected, restored, None, selected.strategy)
+    selected = bind_replayed_solver_policy(selected, restored, "plan-restore")
     selected = normalize_schedule(restored, selected, provider=require_store().travel_provider)
     run = start_schedule_run(
         restored,
@@ -2012,7 +2149,7 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                     strategy=strategy_key,
                     provider=require_store().travel_provider,
                 )
-                result = bind_solver_policy(result, effective, profile, strategy_key)
+                result = bind_solver_policy(result, effective, profile, strategy_key, scenario)
                 result = normalize_schedule(
                     scenario,
                     result,

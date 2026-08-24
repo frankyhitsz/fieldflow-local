@@ -94,8 +94,16 @@ class Technician(BaseModel):
     shift_end: int = Field(ge=0, le=1800)
     start_location: Point
     overtime_limit: int = Field(default=60, ge=0, le=240)
-    cost_per_minute: float = Field(default=1.0, gt=0)
+    cost_per_minute_cents: int = Field(default=100, gt=0, le=10_000)
     color: HexColor = "#315c4b"
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_cost(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "cost_per_minute_cents" not in value and "cost_per_minute" in value:
+            value = dict(value)
+            value["cost_per_minute_cents"] = max(1, round(float(value.pop("cost_per_minute")) * 100))
+        return value
 
     @model_validator(mode="after")
     def validate_shift_and_skills(self) -> Technician:
@@ -156,14 +164,15 @@ class SolverConfig(BaseModel):
 
 
 class SolverPolicySnapshot(BaseModel):
-    policy_version: str = "FIELD_SERVICE_SOLVER_POLICY_V1"
+    policy_version: str = "FIELD_SERVICE_SOLVER_POLICY_V2"
     profile_id: str | None = None
     profile_name: str
     profile_snapshot: dict[str, Any] = Field(default_factory=dict)
     solver_config: SolverConfig
     unassigned_penalty_scale: float | None = None
+    original_drop_penalties: dict[str, int] = Field(default_factory=dict)
     effective_drop_penalties: dict[str, int] = Field(default_factory=dict)
-    time_limit_ms: int
+    time_limit_ms: int | None = None
     solution_limit: int | None = None
     first_solution_strategy: str | None = None
     local_search_metaheuristic: str | None = None
@@ -241,6 +250,9 @@ class ScheduleAssignment(BaseModel):
     evidence: dict[str, Any] = Field(default_factory=dict)
     locked: bool = False
     changed: bool = False
+    source_sequence: int | None = Field(default=None, ge=1)
+    source_assignment_hash: str | None = None
+    planning_fingerprint: str | None = None
 
 
 class UnassignedWorkOrder(BaseModel):
@@ -408,6 +420,8 @@ class WorkOrderExecutionRequest(BaseModel):
     occurred_at: int = Field(ge=0, le=2280)
     expected_revision: int = Field(ge=0)
     idempotency_key: IdempotencyKey
+    early_start_override_reason: ShortDescription | None = None
+    note: ShortDescription = ""
 
 
 class WorkOrderExecutionEvent(BaseModel):
@@ -422,6 +436,15 @@ class WorkOrderExecutionEvent(BaseModel):
     plan_version_id: str
     idempotency_key: str
     created_at: str
+    booking_id: str = ""
+    source_assignment_hash: str = ""
+    source_sequence: int = Field(default=0, ge=0)
+    planned_start_at: int | None = Field(default=None, ge=0, le=2280)
+    planned_finish_at: int | None = Field(default=None, ge=0, le=2760)
+    actual_duration_minutes: int | None = Field(default=None, ge=1, le=2280)
+    actual_late_start_minutes: int = Field(default=0, ge=0)
+    early_start_override_reason: str | None = None
+    note: str = ""
 
 
 class WorkOrderExecutionResult(BaseModel):
@@ -436,8 +459,16 @@ class TechnicianUpdate(BaseModel):
     shift_end: int | None = Field(default=None, ge=0, le=1800)
     start_location: Point | None = None
     overtime_limit: int | None = Field(default=None, ge=0, le=240)
-    cost_per_minute: float | None = Field(default=None, gt=0)
+    cost_per_minute_cents: int | None = Field(default=None, gt=0, le=10_000)
     color: HexColor | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_cost(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "cost_per_minute_cents" not in value and "cost_per_minute" in value:
+            value = dict(value)
+            value["cost_per_minute_cents"] = max(1, round(float(value.pop("cost_per_minute")) * 100))
+        return value
 
     @model_validator(mode="after")
     def validate_patch(self) -> TechnicianUpdate:
@@ -661,6 +692,124 @@ class ExperimentPublishRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class DecisionCostPolicy(BaseModel):
+    policy_version: str = "FIELD_SERVICE_COST_V1"
+    currency: Literal["CNY"] = "CNY"
+    travel_cost_per_minute_cents: int = Field(default=35, ge=0, le=100_000)
+    overtime_premium_basis_points: int = Field(default=5_000, ge=0, le=30_000)
+    sla_penalty_per_late_minute_cents: int = Field(default=200, ge=0, le=100_000)
+    unserved_low_revenue_cents: int = Field(default=8_000, ge=0)
+    unserved_normal_revenue_cents: int = Field(default=12_000, ge=0)
+    unserved_high_revenue_cents: int = Field(default=20_000, ge=0)
+    unserved_urgent_revenue_cents: int = Field(default=30_000, ge=0)
+    vip_revenue_premium_cents: int = Field(default=10_000, ge=0)
+    outsourcing_cost_per_order_cents: int = Field(default=25_000, ge=0)
+
+
+class PlanCostBreakdown(BaseModel):
+    labor_cost_cents: int = Field(ge=0)
+    travel_cost_cents: int = Field(ge=0)
+    overtime_cost_cents: int = Field(ge=0)
+    sla_penalty_cents: int = Field(ge=0)
+    unserved_revenue_cents: int = Field(ge=0)
+    outsourcing_cost_cents: int = Field(ge=0)
+    total_cost_cents: int = Field(ge=0)
+    technician_cost_cents: dict[str, int] = Field(default_factory=dict)
+
+
+class CostAnalysis(BaseModel):
+    scenario_id: str
+    plan_version_id: str
+    plan_number: int
+    scenario_snapshot_hash: str
+    policy: DecisionCostPolicy
+    policy_fingerprint: str
+    breakdown: PlanCostBreakdown
+    assumptions: list[str] = Field(default_factory=list)
+
+
+CapacityOptionId = Literal[
+    "add_technician",
+    "add_skill",
+    "extend_shift",
+    "allow_overtime",
+    "outsource_unserved",
+    "add_service_depot",
+]
+
+
+class CapacityAnalysisRequest(BaseModel):
+    option_ids: list[CapacityOptionId] = Field(default_factory=list, max_length=6)
+    cost_policy: DecisionCostPolicy = Field(default_factory=DecisionCostPolicy)
+
+    @model_validator(mode="after")
+    def validate_options(self) -> CapacityAnalysisRequest:
+        if len(set(self.option_ids)) != len(self.option_ids):
+            raise ValueError("容量方案不能重复")
+        return self
+
+
+class CapacityOptionResult(BaseModel):
+    option_id: CapacityOptionId
+    name: str
+    assumption: str
+    feasible: bool
+    completion_rate: float = Field(ge=0, le=1)
+    sla_on_time_rate: float = Field(ge=0, le=1)
+    unassigned_count: int = Field(ge=0)
+    travel_minutes: int = Field(ge=0)
+    overtime_minutes: int = Field(ge=0)
+    completion_improvement_percentage_points: float
+    sla_improvement_percentage_points: float
+    unassigned_delta: int
+    travel_delta_minutes: int
+    overtime_delta_minutes: int
+    fixed_capacity_cost_cents: int = Field(ge=0)
+    marginal_cost_cents: int
+    projected_total_cost_cents: int = Field(ge=0)
+    schedule_signature: str
+
+
+class CapacityAnalysis(BaseModel):
+    scenario_id: str
+    plan_version_id: str
+    plan_number: int
+    scenario_snapshot_hash: str
+    evaluation_method: str
+    base_schedule_signature: str
+    base_cost: PlanCostBreakdown
+    options: list[CapacityOptionResult]
+
+
+class RiskSimulationRequest(BaseModel):
+    seed: int | None = None
+    trials: int = Field(default=500, ge=50, le=5_000)
+    travel_delay_max_percent: int = Field(default=35, ge=0, le=300)
+    service_duration_jitter_percent: int = Field(default=25, ge=0, le=100)
+    technician_absence_basis_points: int = Field(default=300, ge=0, le=10_000)
+    emergency_order_basis_points: int = Field(default=1_200, ge=0, le=10_000)
+    customer_no_show_basis_points: int = Field(default=400, ge=0, le=10_000)
+
+
+class RiskSimulationResult(BaseModel):
+    scenario_id: str
+    plan_version_id: str
+    plan_number: int
+    scenario_snapshot_hash: str
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V1"
+    simulation_input_hash: str
+    seed: int
+    trials: int
+    expected_sla_on_time_rate: float = Field(ge=0, le=1)
+    late_minutes_p50: int = Field(ge=0)
+    late_minutes_p90: int = Field(ge=0)
+    late_minutes_p95: int = Field(ge=0)
+    expected_overtime_minutes: float = Field(ge=0)
+    plan_failure_probability: float = Field(ge=0, le=1)
+    expected_unserved_orders: float = Field(ge=0)
+    assumptions: list[str] = Field(default_factory=list)
+
+
 class VerificationIssue(BaseModel):
     code: str
     message: str
@@ -685,6 +834,8 @@ class FrozenAssignment(BaseModel):
     start_time: int = Field(ge=0, le=1800)
     finish_time: int = Field(ge=0, le=2280)
     reason: FreezeReason
+    source_sequence: int | None = Field(default=None, ge=1)
+    source_assignment_hash: str | None = None
 
 
 class ExecutionSourceAssignment(BaseModel):
@@ -693,6 +844,8 @@ class ExecutionSourceAssignment(BaseModel):
     source_schedule_id: str
     source_assignment_hash: str
     sequence: int = Field(ge=1)
+    source_sequence: int | None = Field(default=None, ge=1)
+    future_sequence: int | None = Field(default=None, ge=1)
     planned_start_at: int = Field(ge=0, le=1800)
     planned_finish_at: int = Field(ge=0, le=2280)
     actual_start_at: int | None = Field(default=None, ge=0, le=2280)
@@ -706,6 +859,8 @@ class TechnicianExecutionProjection(BaseModel):
     effective_location: Point
     available_at: int = Field(ge=0, le=2760)
     execution_event_sequence: int = Field(ge=1)
+    overrun: bool = False
+    estimated_remaining_minutes: int = Field(default=0, ge=0, le=480)
 
 
 class ExecutionSourceContext(BaseModel):
@@ -714,6 +869,7 @@ class ExecutionSourceContext(BaseModel):
     active_schedule_id: str | None = None
     execution_event_sequence: int = Field(ge=0)
     started_assignments: list[ExecutionSourceAssignment] = Field(default_factory=list)
+    completed_assignments: list[ExecutionSourceAssignment] = Field(default_factory=list)
     technician_projections: list[TechnicianExecutionProjection] = Field(default_factory=list)
 
 
@@ -725,6 +881,7 @@ class PlanningContext(BaseModel):
     execution_source_context: ExecutionSourceContext | None = None
     frozen_assignments: list[FrozenAssignment] = Field(default_factory=list)
     inferred_departure_warnings: list[Identifier] = Field(default_factory=list)
+    execution_warnings: list[str] = Field(default_factory=list)
 
 
 class ScheduleVerificationReport(BaseModel):

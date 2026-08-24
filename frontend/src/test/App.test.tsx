@@ -7,7 +7,7 @@ import type { PlanVersion, Scenario, Schedule, StrategyProfile } from '../types'
 const scenario: Scenario = {
   id: 'main', name: '今日调度测试', description: '交互验收', planning_date: '2026-08-23', seed: 1, revision: 0,
   locked_assignments: [],
-  technicians: [{ id: 'TECH-01', name: '林乔', skills: ['electrical'], shift_start: 480, shift_end: 1020, start_location: { x: 48, y: 52 }, overtime_limit: 60, cost_per_minute: 1, color: '#315c4b' }],
+  technicians: [{ id: 'TECH-01', name: '林乔', skills: ['electrical'], shift_start: 480, shift_end: 1020, start_location: { x: 48, y: 52 }, overtime_limit: 60, cost_per_minute_cents: 100, color: '#315c4b' }],
   work_orders: [{ id: 'WO-1', customer_name: '测试客户', title: '线路检修', required_skills: ['electrical'], location: { x: 55, y: 60 }, service_duration: 30, window_start: 540, window_end: 660, sla_deadline: 630, priority: 'normal', drop_penalty: 2500, status: 'pending', vip: false, is_emergency: false, reported_at: null, note: '' }],
 }
 const mediumScenario: Scenario = { ...scenario, id: 'strategy-medium', name: '策略中型数据' }
@@ -39,14 +39,17 @@ const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', descripti
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-function mockApi() {
+function mockApi(activePlan: PlanVersion = plan) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
     const body = url.endsWith('/api/scenarios') ? [scenario]
       : url.endsWith('/api/strategy-profiles') ? profiles
       : url.endsWith('/api/scenarios/strategy-medium') ? mediumScenario
-      : url.endsWith('/plan-versions') ? [plan]
-      : url.includes('/plan-versions/') ? plan
+      : url.endsWith('/cost-analysis') ? { scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', policy: {}, policy_fingerprint: 'cost', assumptions: [], breakdown: { labor_cost_cents: 100000, travel_cost_cents: 10000, overtime_cost_cents: 2000, sla_penalty_cents: 5000, unserved_revenue_cents: 6400, outsourcing_cost_cents: 0, total_cost_cents: 123400, technician_cost_cents: { 'TECH-01': 102000 } } }
+      : url.endsWith('/risk-simulation') ? { scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', simulation_policy_version: 'V1', simulation_input_hash: 'risk', seed: 7, trials: 500, expected_sla_on_time_rate: .875, late_minutes_p50: 10, late_minutes_p90: 28, late_minutes_p95: 35, expected_overtime_minutes: 4.5, plan_failure_probability: .125, expected_unserved_orders: .25, assumptions: [] }
+      : url.endsWith('/capacity-analysis') ? { scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', evaluation_method: 'DETERMINISTIC_GREEDY_WHAT_IF_V1', base_schedule_signature: 'base', base_cost: {}, options: [{ option_id: 'add_technician', name: '增加一名复合技能技师', assumption: '测算假设', feasible: true, completion_rate: 1, sla_on_time_rate: 1, unassigned_count: 0, travel_minutes: 8, overtime_minutes: 0, completion_improvement_percentage_points: 5, sla_improvement_percentage_points: 8, unassigned_delta: -1, travel_delta_minutes: -2, overtime_delta_minutes: 0, fixed_capacity_cost_cents: 60000, marginal_cost_cents: 50000, projected_total_cost_cents: 173400, schedule_signature: 'capacity' }] }
+      : url.endsWith('/plan-versions') ? [activePlan]
+      : url.includes('/plan-versions/') ? activePlan
       : url.endsWith('/schedules') ? [schedule]
       : url.endsWith('/baseline') ? { ...schedule, id: 'SCH-BASE', kind: 'baseline', version: 1, strategy: 'baseline' }
       : scenario
@@ -120,5 +123,35 @@ describe('FieldFlow navigation and render safety', () => {
 
     fireEvent.change(screen.getByLabelText('按动作筛选'), { target: { value: 'baseline' } })
     expect(screen.getByText('当前筛选下没有方案。生成基线、优化或发布实验候选后会从 V001 开始记录。')).toBeInTheDocument()
+  })
+
+  it('uses an independent actual execution time instead of the replan cutoff', async () => {
+    const validSchedule: Schedule = {
+      ...schedule,
+      assignments: [{ ...schedule.assignments[0], work_order_id: 'WO-1', arrival_time: 550, start_time: 560, finish_time: 590 }],
+    }
+    const validPlan: PlanVersion = { ...plan, selected: validSchedule }
+    mockApi(validPlan)
+    render(<App />)
+    await screen.findByRole('heading', { name: '今日调度测试' })
+    fireEvent.change(screen.getByLabelText('重排时点（当日起分钟数）'), { target: { value: '900' } })
+    fireEvent.click(screen.getByRole('button', { name: '全部' }))
+    fireEvent.click(screen.getByText('WO-1'))
+    fireEvent.click(screen.getByRole('button', { name: '开始服务' }))
+    expect(screen.getByRole('dialog', { name: '登记开始服务' })).toBeInTheDocument()
+    expect(screen.getByLabelText('实际发生时间')).toHaveValue(560)
+    expect(screen.getByText('09:20，与重排时点相互独立')).toBeInTheDocument()
+  })
+
+  it('loads frozen cost and risk analysis and runs capacity what-if', async () => {
+    mockApi(); render(<App />)
+    await screen.findByRole('heading', { name: '今日调度测试' })
+    fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
+    expect(await screen.findByText(/1,234\.00/)).toBeInTheDocument()
+    expect(screen.getByText('88%')).toBeInTheDocument()
+    expect(screen.getByText('35 分钟')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '测算六种容量方案' }))
+    expect(await screen.findByText('增加一名复合技能技师')).toBeInTheDocument()
+    expect(screen.getByText('+5pp')).toBeInTheDocument()
   })
 })

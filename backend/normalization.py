@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from .hashing import content_hash
 from .models import PlanningContext, ScheduleAssignment, ScheduleResult, ScheduleScenario
+from .planning import assignment_planning_fingerprint, assignment_source_fingerprint
 from .scheduler import BUSINESS_SCORE_POLICY_VERSION, METRIC_POLICY_VERSION, calculate_kpis, objective_breakdown
 from .timeutils import hhmm, service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
@@ -108,6 +109,7 @@ def normalize_schedule(
             first_uses_execution_origin = (
                 index == 0 and projection is not None and assignment.work_order_id not in frozen_started_ids
             )
+            first_is_started = index == 0 and assignment.work_order_id in frozen_started_ids
             previous_point = (
                 projection.effective_location
                 if first_uses_execution_origin
@@ -120,7 +122,7 @@ def normalize_schedule(
                 if index == len(route) - 1
                 else orders[route[index + 1].work_order_id].location
             )
-            travel = provider.minutes(previous_point, order.location)
+            travel = assignment.travel_minutes if first_is_started else provider.minutes(previous_point, order.location)
             locked = locks.get(order.id) == technician_id
             changed = changes.get(order.id, False)
             eligible = [
@@ -162,6 +164,11 @@ def normalize_schedule(
             assignment.sla_late_minutes = max(0, assignment.finish_time - order.sla_deadline)
             assignment.locked = locked
             assignment.changed = changed
+            assignment.source_sequence = assignment.source_sequence or assignment.sequence
+            assignment.source_assignment_hash = assignment.source_assignment_hash or assignment_source_fingerprint(
+                assignment
+            )
+            assignment.planning_fingerprint = assignment_planning_fingerprint(scenario, assignment, provider)
             assignment.explanation = explanation
             assignment.evidence = {
                 "required_skills": [item.value for item in order.required_skills],
@@ -178,6 +185,9 @@ def normalize_schedule(
                 "route_return_at": route_return_at,
                 "overtime_minutes": route_overtime,
                 "route_insertion_travel_delta_minutes": insertion_delta,
+                "source_sequence": assignment.source_sequence,
+                "source_assignment_hash": assignment.source_assignment_hash,
+                "planning_fingerprint": assignment.planning_fingerprint,
                 "alternative_route_travel_delta_minutes": alternatives,
                 "alternative_delta_scope": "travel_only_without_rescheduling",
             }

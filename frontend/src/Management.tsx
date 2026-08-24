@@ -1,8 +1,9 @@
-import { Component, type ErrorInfo, type ReactNode, useState } from 'react'
+import { Component, type ErrorInfo, type ReactNode, useEffect, useState } from 'react'
 import {
   AlertTriangle, BarChart3, Edit3, Plus, Save, ShieldCheck, Trash2, X, Zap,
 } from 'lucide-react'
-import type { PlanVersion, Scenario, Schedule, Technician, WorkOrder } from './types'
+import { api } from './api'
+import type { CapacityAnalysis, CostAnalysis, PlanVersion, RiskSimulation, Scenario, Schedule, Technician, WorkOrder } from './types'
 
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
@@ -17,6 +18,7 @@ const fromClock = (value: string, day: number) => {
   return day * 1440 + h * 60 + m
 }
 const pct = (value: number) => `${Math.round(value * 100)}%`
+const money = (cents: number) => new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' }).format(cents / 100)
 
 function ServiceTimeInput({ value, onChange, allowNextDay = true, disabled = false, label }: { value: number; onChange: (value: number) => void; allowNextDay?: boolean; disabled?: boolean; label: string }) {
   const day = value >= 1440 ? 1 : 0
@@ -90,7 +92,23 @@ export function TechniciansView({ scenario, schedule, onEdit, onAdd }: { scenari
   </section>
 }
 
-export function ReviewView({ schedule, baseline }: { schedule?: Schedule; baseline?: Schedule }) {
+export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { scenarioId: string; planVersionId?: string; schedule?: Schedule; baseline?: Schedule }) {
+  const [cost, setCost] = useState<CostAnalysis>()
+  const [risk, setRisk] = useState<RiskSimulation>()
+  const [capacity, setCapacity] = useState<CapacityAnalysis>()
+  const [decisionError, setDecisionError] = useState<string>()
+  const [loadingDecision, setLoadingDecision] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    setCost(undefined); setRisk(undefined); setCapacity(undefined); setDecisionError(undefined)
+    if (!planVersionId) return () => { cancelled = true }
+    setLoadingDecision(true)
+    Promise.all([api.costAnalysis(scenarioId, planVersionId), api.riskSimulation(scenarioId, planVersionId)])
+      .then(([nextCost, nextRisk]) => { if (!cancelled) { setCost(nextCost); setRisk(nextRisk) } })
+      .catch(error => { if (!cancelled) setDecisionError(error instanceof Error ? error.message : '经营分析失败') })
+      .finally(() => { if (!cancelled) setLoadingDecision(false) })
+    return () => { cancelled = true }
+  }, [scenarioId, planVersionId])
   if (!schedule) return <section className="page-view"><div className="empty-view">请先生成一个方案，再查看运营复盘。</div></section>
   const breakdownLabels: Record<string, string> = { travel: '行程代价', sla_late: 'SLA 延迟代价', overtime: '加班代价', unassigned: '未分配代价', imbalance: '负载不均代价', replan_changes: '方案变更代价' }
   const maxCost = Math.max(1, ...Object.values(schedule.objective_breakdown))
@@ -111,6 +129,17 @@ export function ReviewView({ schedule, baseline }: { schedule?: Schedule; baseli
     <div className="review-summary"><div><small>方案计算用时</small><b>{schedule.runtime_ms}<em> ms</em></b><p>生成本方案所用的时间。</p></div><div><small>业务评分</small><b>{schedule.business_score?.toLocaleString() ?? '—'}</b><p>{schedule.business_score_policy_version} 重算结果；求解器原始目标为 {schedule.solver_objective_value?.toLocaleString() ?? '—'}。</p></div><div><small>计划占用时间</small><b>{schedule.kpis.total_travel_minutes + schedule.kpis.total_waiting_minutes + schedule.kpis.total_service_minutes}<em> 分钟</em></b><p>计划行程、等待和服务时间合计，不代表实际工时。</p></div></div>
     {tradeoffs.length > 0 && <div className="tradeoff-card"><ShieldCheck size={20} /><div><h2>与基线相比</h2><p>{tradeoffs.join('；')}。方案排序依据为当前策略权重。</p></div></div>}
     <div className="review-grid"><article><h2>目标值构成</h2><div className="cost-bars">{Object.entries(schedule.objective_breakdown).map(([key, value]) => <div key={key}><span>{breakdownLabels[key] || key}</span><i><b style={{ width: `${value / maxCost * 100}%` }} /></i><strong>{Math.round(value)}</strong></div>)}</div></article><article><h2>技师工作量</h2>{schedule.kpis.technician.map(item => <div className="util-row" key={item.technician_id}><span>{item.technician_id}</span><i><b style={{ width: `${Math.min(100, item.utilization * 100)}%` }} /></i><strong>{pct(item.utilization)}</strong><small>{item.assignment_count} 单</small></div>)}</article></div>
+    <div className="decision-head"><div><span className="eyebrow">DECISION SUPPORT</span><h2>经营决策测算</h2><p>成本与风险基于 V{String(cost?.plan_number ?? risk?.plan_number ?? schedule.version).padStart(3, '0')} 的冻结快照；结果用于比较，不会生成方案版本。</p></div><button disabled={!planVersionId || loadingDecision} onClick={async () => { if (!planVersionId) return; setLoadingDecision(true); setDecisionError(undefined); try { setCapacity(await api.capacityAnalysis(scenarioId, planVersionId)) } catch (error) { setDecisionError(error instanceof Error ? error.message : '容量分析失败') } finally { setLoadingDecision(false) } }}>测算六种容量方案</button></div>
+    {!planVersionId && <div className="empty-view compact">当前显示的排程尚未对应公开版本，无法冻结经营测算输入。</div>}
+    {loadingDecision && <div className="decision-status">正在计算冻结快照的成本、风险与容量取舍…</div>}
+    {decisionError && <div className="decision-status error">{decisionError}</div>}
+    {(cost || risk) && <div className="decision-summary">
+      <article><small>预计运营成本</small><b>{cost ? money(cost.breakdown.total_cost_cents) : '—'}</b><p>人工 {cost ? money(cost.breakdown.labor_cost_cents) : '—'} · 未服务损失 {cost ? money(cost.breakdown.unserved_revenue_cents) : '—'}</p></article>
+      <article><small>风险调整后 SLA</small><b>{risk ? pct(risk.expected_sla_on_time_rate) : '—'}</b><p>固定 seed {risk?.seed ?? '—'}，{risk?.trials ?? '—'} 次确定性抽样</p></article>
+      <article><small>迟到 P95</small><b>{risk ? `${risk.late_minutes_p95} 分钟` : '—'}</b><p>P50 {risk?.late_minutes_p50 ?? '—'} · P90 {risk?.late_minutes_p90 ?? '—'} 分钟</p></article>
+      <article><small>计划失效概率</small><b>{risk ? pct(risk.plan_failure_probability) : '—'}</b><p>预计未服务 {risk?.expected_unserved_orders ?? '—'} 单；含缺勤、突发单与客户不在场</p></article>
+    </div>}
+    {capacity && <div className="capacity-table-wrap"><table className="capacity-table"><thead><tr><th>容量方案</th><th>完成率改善</th><th>SLA 改善</th><th>未服务变化</th><th>边际成本</th></tr></thead><tbody>{capacity.options.map(item => <tr key={item.option_id}><td><b>{item.name}</b><small>{item.assumption}</small></td><td>{item.completion_improvement_percentage_points > 0 ? '+' : ''}{item.completion_improvement_percentage_points}pp</td><td>{item.sla_improvement_percentage_points > 0 ? '+' : ''}{item.sla_improvement_percentage_points}pp</td><td>{item.unassigned_delta > 0 ? '+' : ''}{item.unassigned_delta} 单</td><td>{money(item.marginal_cost_cents)}</td></tr>)}</tbody></table><p className="decision-note">统一使用确定性贪心作为 what-if 评估器，避免把不同算法的差异误当成容量收益。固定投入与运营成本均以整数分计算。</p></div>}
   </section>
 }
 
@@ -146,7 +175,7 @@ export function WorkOrderEditor({ initial, emergencyPreset, onClose, onSave, onD
   </section></div>
 }
 
-const blankTechnician = (): Technician => ({ id: `TECH-${String(Date.now()).slice(-3)}`, name: '', skills: ['electrical'], shift_start: 480, shift_end: 1020, start_location: { x: 48, y: 52 }, overtime_limit: 60, cost_per_minute: 1, color: '#315c4b' })
+const blankTechnician = (): Technician => ({ id: `TECH-${String(Date.now()).slice(-3)}`, name: '', skills: ['electrical'], shift_start: 480, shift_end: 1020, start_location: { x: 48, y: 52 }, overtime_limit: 60, cost_per_minute_cents: 100, color: '#315c4b' })
 
 export function TechnicianEditor({ initial, onClose, onSave }: { initial?: Technician; onClose: () => void; onSave: (tech: Technician) => Promise<void> }) {
   const [tech, setTech] = useState<Technician>(() => initial ? structuredClone(initial) : blankTechnician())
@@ -154,7 +183,7 @@ export function TechnicianEditor({ initial, onClose, onSave }: { initial?: Techn
   const patch = <K extends keyof Technician>(key: K, value: Technician[K]) => setTech(current => ({ ...current, [key]: value }))
   const valid = tech.name.trim() && tech.skills.length && tech.shift_end > tech.shift_start
   return <div className="modal-backdrop"><section className="editor-modal compact" role="dialog" aria-modal="true" aria-labelledby="technician-editor-title"><div className="editor-head"><div><span className="eyebrow">TECHNICIAN</span><h2 id="technician-editor-title">{initial ? `编辑 ${initial.name}` : '新增技师'}</h2></div><button className="icon-btn" onClick={onClose} aria-label="关闭技师编辑"><X /></button></div>
-    <div className="form-grid"><label>技师编号<input value={tech.id} disabled={!!initial} onChange={e => patch('id', e.target.value)} /></label><label>姓名<input value={tech.name} onChange={e => patch('name', e.target.value)} /></label><fieldset className="span-2"><legend>技能</legend>{Object.entries(skillLabel).map(([key, label]) => <label className="check" key={key}><input type="checkbox" checked={tech.skills.includes(key)} onChange={e => patch('skills', e.target.checked ? [...tech.skills, key] : tech.skills.filter(item => item !== key))} />{label}</label>)}</fieldset><label>班次开始<ServiceTimeInput allowNextDay={false} label="班次开始" value={tech.shift_start} onChange={value => patch('shift_start', value)} /></label><label>班次结束<ServiceTimeInput label="班次结束" value={tech.shift_end} onChange={value => patch('shift_end', value)} /></label><label>加班上限（分钟）<input type="number" min="0" max="240" value={tech.overtime_limit} onChange={e => patch('overtime_limit', Number(e.target.value))} /></label><label>每分钟成本<input type="number" min="0.1" step="0.1" value={tech.cost_per_minute} onChange={e => patch('cost_per_minute', Number(e.target.value))} /></label></div>
+    <div className="form-grid"><label>技师编号<input value={tech.id} disabled={!!initial} onChange={e => patch('id', e.target.value)} /></label><label>姓名<input value={tech.name} onChange={e => patch('name', e.target.value)} /></label><fieldset className="span-2"><legend>技能</legend>{Object.entries(skillLabel).map(([key, label]) => <label className="check" key={key}><input type="checkbox" checked={tech.skills.includes(key)} onChange={e => patch('skills', e.target.checked ? [...tech.skills, key] : tech.skills.filter(item => item !== key))} />{label}</label>)}</fieldset><label>班次开始<ServiceTimeInput allowNextDay={false} label="班次开始" value={tech.shift_start} onChange={value => patch('shift_start', value)} /></label><label>班次结束<ServiceTimeInput label="班次结束" value={tech.shift_end} onChange={value => patch('shift_end', value)} /></label><label>加班上限（分钟）<input type="number" min="0" max="240" value={tech.overtime_limit} onChange={e => patch('overtime_limit', Number(e.target.value))} /></label><label>每分钟人工成本（分）<input type="number" min="1" step="1" value={tech.cost_per_minute_cents} onChange={e => patch('cost_per_minute_cents', Number(e.target.value))} /><small>整数分，180 表示 ¥1.80/分钟</small></label></div>
     <div className="editor-actions"><button onClick={onClose}>取消</button><button className="page-primary" disabled={!valid || saving} onClick={async () => { setSaving(true); try { await onSave(tech) } finally { setSaving(false) } }}><Save size={15} />保存技师</button></div>
   </section></div>
 }

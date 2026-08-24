@@ -34,10 +34,36 @@ from .models import (
     WorkOrderExecutionResult,
     WorkOrderStatus,
 )
+from .planning import assignment_planning_fingerprint, assignment_source_fingerprint
+from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
+
+
+def _upgrade_technician_costs(payload: object) -> bool:
+    """Convert legacy floating currency units to explicit integer cents in snapshots."""
+    changed = False
+    if isinstance(payload, dict):
+        technicians = payload.get("technicians")
+        if isinstance(technicians, list):
+            for technician in technicians:
+                if not isinstance(technician, dict) or not {"id", "skills", "shift_start"} <= technician.keys():
+                    continue
+                if "cost_per_minute_cents" not in technician:
+                    legacy = technician.pop("cost_per_minute", 1.0)
+                    technician["cost_per_minute_cents"] = max(1, round(float(legacy) * 100))
+                    changed = True
+                elif "cost_per_minute" in technician:
+                    technician.pop("cost_per_minute")
+                    changed = True
+        for value in payload.values():
+            changed = _upgrade_technician_costs(value) or changed
+    elif isinstance(payload, list):
+        for value in payload:
+            changed = _upgrade_technician_costs(value) or changed
+    return changed
 
 
 class ScenarioRevisionConflict(RuntimeError):
@@ -48,7 +74,10 @@ class ScenarioRevisionConflict(RuntimeError):
 
 
 class PublicationConflict(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "PUBLICATION_CONFLICT", details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
 
 
 def _now() -> str:
@@ -542,6 +571,19 @@ class Store:
                         ),
                     )
                     self._insert_revision(con, scenario, "v8 旧数据语义升级")
+            if version < 10:
+                # Monetary values used to be serialized as ambiguous floating
+                # units. Preserve their value while making every current and
+                # historical scenario snapshot explicit integer cents.
+                for table in ("scenarios", "scenario_revisions", "plan_versions", "strategy_experiments"):
+                    rows = con.execute(f"SELECT rowid, payload FROM {table}").fetchall()
+                    for row in rows:
+                        payload = json.loads(row["payload"])
+                        if _upgrade_technician_costs(payload):
+                            con.execute(
+                                f"UPDATE {table} SET payload=? WHERE rowid=?",
+                                (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), row["rowid"]),
+                            )
             if version < SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             duplicate_run = con.execute(
@@ -562,6 +604,7 @@ class Store:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_run_unique ON schedule_candidates(run_id);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_execution_events_sequence ON work_order_execution_events(scenario_id, sequence);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_sequence_unique ON work_order_execution_events(scenario_id, sequence);
                 """
             )
             con.execute("PRAGMA journal_mode = WAL")
@@ -580,6 +623,46 @@ class Store:
                     "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
                     (run.status.value, run.model_dump_json(), run.id),
                 )
+            abandoned_commands = con.execute(
+                "SELECT namespace, key, payload FROM command_keys WHERE status IN ('RUNNING', 'REPLAN_RUNNING')"
+            ).fetchall()
+            for command in abandoned_commands:
+                publication = con.execute(
+                    "SELECT plan_version_id FROM publication_keys WHERE key=?",
+                    (command["key"],),
+                ).fetchone()
+                if publication:
+                    con.execute(
+                        "UPDATE command_keys SET status='COMPLETED', resource_type='plan_version', resource_id=?, payload=?, updated_at=? WHERE namespace=? AND key=?",
+                        (
+                            publication["plan_version_id"],
+                            json.dumps(
+                                {"plan_version_id": publication["plan_version_id"], "reconciled": True},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            _now(),
+                            command["namespace"],
+                            command["key"],
+                        ),
+                    )
+                else:
+                    con.execute(
+                        "UPDATE command_keys SET status='FAILED_RETRYABLE', payload=?, updated_at=? WHERE namespace=? AND key=?",
+                        (
+                            json.dumps(
+                                {
+                                    "message": "应用在命令完成前重启；相同幂等键可以重新执行",
+                                    "reconciled": True,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            _now(),
+                            command["namespace"],
+                            command["key"],
+                        ),
+                    )
         self.seed_fixtures()
         self.seed_profiles()
 
@@ -862,12 +945,26 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT request_fingerprint FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT request_fingerprint, status FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, key),
             ).fetchone()
             if row:
                 if row["request_fingerprint"] != fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同请求")
+                if row["status"] == "FAILED_RETRYABLE":
+                    con.execute(
+                        "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, payload=?, updated_at=? WHERE namespace=? AND key=?",
+                        (
+                            status,
+                            resource_type,
+                            resource_id,
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                            _now(),
+                            namespace,
+                            key,
+                        ),
+                    )
+                    return True
                 return False
             now = _now()
             con.execute(
@@ -953,9 +1050,35 @@ class Store:
 
             expected_status = WorkOrderStatus.pending if action == "start" else WorkOrderStatus.started
             target_status = WorkOrderStatus.started if action == "start" else WorkOrderStatus.completed
+            start_event: WorkOrderExecutionEvent | None = None
             if order.status is not expected_status:
                 raise PublicationConflict(f"工单当前为 {order.status.value}，不能执行 {action} 操作")
             if action == "start":
+                snapshot_fingerprint = assignment.planning_fingerprint
+                if not snapshot_fingerprint and plan.scenario_snapshot:
+                    snapshot_fingerprint = assignment_planning_fingerprint(
+                        plan.scenario_snapshot,
+                        assignment,
+                        self.travel_provider,
+                    )
+                current_fingerprint = assignment_planning_fingerprint(
+                    scenario,
+                    assignment,
+                    self.travel_provider,
+                )
+                if not snapshot_fingerprint or snapshot_fingerprint != current_fingerprint:
+                    raise PublicationConflict(
+                        "该待处理工单的规划条件已变化，请先局部重排",
+                        code="PENDING_ASSIGNMENT_STALE",
+                        details={"work_order_id": work_order_id, "plan_version_id": plan.id},
+                    )
+                ready_at = service_ready_at(order)
+                if request.occurred_at < ready_at and not request.early_start_override_reason:
+                    raise PublicationConflict(
+                        f"开始时间早于客户允许时间 {ready_at}；如客户已同意，请填写提前开始原因",
+                        code="EARLY_START_OVERRIDE_REQUIRED",
+                        details={"earliest_customer_time": ready_at},
+                    )
                 assignments_by_order = {item.work_order_id: item for item in plan.selected.assignments}
                 for active_order in scenario.work_orders:
                     if active_order.status is not WorkOrderStatus.started:
@@ -968,21 +1091,26 @@ class Store:
                     key=lambda item: item.sequence,
                 )
                 predecessors = [item for item in route if item.sequence < assignment.sequence]
+                scenario_orders = {item.id: item for item in scenario.work_orders}
+                missing_predecessors = [
+                    item.work_order_id for item in predecessors if item.work_order_id not in scenario_orders
+                ]
+                if missing_predecessors:
+                    raise PublicationConflict(
+                        "当前执行路线引用了已删除的前序工单，请先重新排程",
+                        code="STALE_ROUTE_PREDECESSOR_MISSING",
+                        details={"missing_work_order_ids": missing_predecessors},
+                    )
                 incomplete = [
                     item.work_order_id
                     for item in predecessors
-                    if next(
-                        candidate.status for candidate in scenario.work_orders if candidate.id == item.work_order_id
-                    )
-                    is not WorkOrderStatus.completed
+                    if scenario_orders[item.work_order_id].status is not WorkOrderStatus.completed
                 ]
                 if incomplete:
                     raise PublicationConflict(f"路线前序工单尚未完成：{', '.join(incomplete)}")
                 if predecessors:
                     predecessor = predecessors[-1]
-                    predecessor_order = next(
-                        item for item in scenario.work_orders if item.id == predecessor.work_order_id
-                    )
+                    predecessor_order = scenario_orders[predecessor.work_order_id]
                     completion_row = con.execute(
                         """
                         SELECT payload FROM work_order_execution_events
@@ -1000,12 +1128,24 @@ class Store:
                     )
                 else:
                     technician = next(item for item in scenario.technicians if item.id == request.technician_id)
-                    earliest_start = technician.shift_start + self.travel_provider.minutes(
-                        technician.start_location,
-                        order.location,
+                    execution_context = self._execution_source_context(con, scenario, plan.id)
+                    projection = next(
+                        (
+                            item
+                            for item in execution_context.technician_projections
+                            if item.technician_id == request.technician_id and item.state == "completed"
+                        ),
+                        None,
                     )
+                    origin = projection.effective_location if projection else technician.start_location
+                    available_at = projection.available_at if projection else technician.shift_start
+                    earliest_start = available_at + self.travel_provider.minutes(origin, order.location)
                 if request.occurred_at < earliest_start:
-                    raise PublicationConflict(f"开始时间早于前序服务和行程允许的最早时间 {earliest_start}")
+                    raise PublicationConflict(
+                        f"开始时间早于实际位置和行程允许的最早时间 {earliest_start}",
+                        code="BEFORE_EXECUTION_AVAILABILITY",
+                        details={"earliest_start": earliest_start},
+                    )
             if action == "complete":
                 start_row = con.execute(
                     "SELECT payload FROM work_order_execution_events WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY occurred_at DESC LIMIT 1",
@@ -1016,8 +1156,12 @@ class Store:
                 start_event = WorkOrderExecutionEvent.model_validate_json(start_row["payload"])
                 if start_event.technician_id != request.technician_id:
                     raise PublicationConflict("完成服务的技师与开始服务记录不一致")
-                if request.occurred_at < start_event.occurred_at:
-                    raise PublicationConflict("完成时间不能早于开始时间")
+                if request.occurred_at <= start_event.occurred_at:
+                    raise PublicationConflict(
+                        "完成时间必须严格晚于开始时间",
+                        code="ZERO_OR_NEGATIVE_ACTUAL_DURATION",
+                        details={"actual_start_at": start_event.occurred_at},
+                    )
 
             order.status = target_status
             if target_status is WorkOrderStatus.completed:
@@ -1029,6 +1173,17 @@ class Store:
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM work_order_execution_events WHERE scenario_id=?",
                 (scenario_id,),
             ).fetchone()
+            start_event_for_identity = start_event if action == "complete" else None
+            source_assignment_hash = (
+                start_event_for_identity.source_assignment_hash
+                if start_event_for_identity
+                else assignment.source_assignment_hash or assignment_source_fingerprint(assignment)
+            )
+            source_sequence = (
+                start_event_for_identity.source_sequence
+                if start_event_for_identity
+                else assignment.source_sequence or assignment.sequence
+            )
             event = WorkOrderExecutionEvent(
                 id=f"EXEC-{uuid.uuid4().hex[:12]}",
                 scenario_id=scenario_id,
@@ -1041,6 +1196,25 @@ class Store:
                 plan_version_id=plan.id,
                 idempotency_key=request.idempotency_key,
                 created_at=_now(),
+                booking_id=(
+                    start_event_for_identity.booking_id
+                    if start_event_for_identity and start_event_for_identity.booking_id
+                    else f"BOOK-{uuid.uuid4().hex[:12]}"
+                ),
+                source_assignment_hash=source_assignment_hash,
+                source_sequence=source_sequence,
+                planned_start_at=(
+                    start_event_for_identity.planned_start_at if start_event_for_identity else assignment.start_time
+                ),
+                planned_finish_at=(
+                    start_event_for_identity.planned_finish_at if start_event_for_identity else assignment.finish_time
+                ),
+                actual_duration_minutes=(
+                    request.occurred_at - start_event_for_identity.occurred_at if start_event_for_identity else None
+                ),
+                actual_late_start_minutes=(max(0, request.occurred_at - order.window_end) if action == "start" else 0),
+                early_start_override_reason=(request.early_start_override_reason if action == "start" else None),
+                note=request.note,
             )
             result = WorkOrderExecutionResult(scenario=scenario, event=event)
             con.execute(
@@ -1102,11 +1276,12 @@ class Store:
                 plan = PlanVersion.model_validate_json(plan_row["payload"])
         assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
         started_sources: list[ExecutionSourceAssignment] = []
+        completed_sources: list[ExecutionSourceAssignment] = []
         for order in sorted(scenario.work_orders, key=lambda item: item.id):
-            if order.status is not WorkOrderStatus.started:
+            if order.status not in {WorkOrderStatus.started, WorkOrderStatus.completed}:
                 continue
             assignment = assignments.get(order.id)
-            if not assignment or not plan:
+            if order.status is WorkOrderStatus.started and (not assignment or not plan):
                 continue
             event_row = con.execute(
                 """
@@ -1117,21 +1292,63 @@ class Store:
                 (scenario.id, order.id),
             ).fetchone()
             start_event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"]) if event_row else None
-            started_sources.append(
-                ExecutionSourceAssignment(
-                    work_order_id=order.id,
-                    technician_id=assignment.technician_id,
-                    source_schedule_id=plan.selected.id,
-                    source_assignment_hash=content_hash(assignment),
-                    sequence=assignment.sequence,
-                    planned_start_at=assignment.start_time,
-                    planned_finish_at=assignment.finish_time,
-                    actual_start_at=start_event.occurred_at if start_event else None,
-                    projected_available_at=(start_event.occurred_at + order.service_duration)
-                    if start_event
-                    else assignment.finish_time,
+            if not start_event:
+                continue
+            source_plan: PlanVersion | None = None
+            if start_event.plan_version_id:
+                source_plan_row = con.execute(
+                    "SELECT payload FROM plan_versions WHERE id=? AND scenario_id=?",
+                    (start_event.plan_version_id, scenario.id),
+                ).fetchone()
+                if source_plan_row:
+                    source_plan = PlanVersion.model_validate_json(source_plan_row["payload"])
+            historical_assignment = (
+                next(
+                    (item for item in source_plan.selected.assignments if item.work_order_id == order.id),
+                    None,
                 )
+                if source_plan
+                else None
             )
+            identity_assignment = historical_assignment or assignment
+            if not identity_assignment:
+                continue
+            source = ExecutionSourceAssignment(
+                work_order_id=order.id,
+                technician_id=start_event.technician_id,
+                source_schedule_id=(source_plan.selected.id if source_plan else plan.selected.id if plan else ""),
+                source_assignment_hash=(
+                    start_event.source_assignment_hash
+                    or identity_assignment.source_assignment_hash
+                    or assignment_source_fingerprint(identity_assignment)
+                ),
+                sequence=(
+                    assignment.sequence if assignment else start_event.source_sequence or identity_assignment.sequence
+                ),
+                source_sequence=(
+                    start_event.source_sequence or identity_assignment.source_sequence or identity_assignment.sequence
+                ),
+                future_sequence=assignment.sequence if assignment else None,
+                planned_start_at=start_event.planned_start_at or identity_assignment.start_time,
+                planned_finish_at=start_event.planned_finish_at or identity_assignment.finish_time,
+                actual_start_at=start_event.occurred_at,
+                projected_available_at=start_event.occurred_at + order.service_duration,
+            )
+            if order.status is WorkOrderStatus.started:
+                started_sources.append(source)
+            else:
+                completion_row = con.execute(
+                    """
+                    SELECT payload FROM work_order_execution_events
+                    WHERE scenario_id=? AND work_order_id=? AND action='complete'
+                    ORDER BY sequence DESC LIMIT 1
+                    """,
+                    (scenario.id, order.id),
+                ).fetchone()
+                if completion_row:
+                    completion = WorkOrderExecutionEvent.model_validate_json(completion_row["payload"])
+                    source.projected_available_at = completion.occurred_at
+                completed_sources.append(source)
         event_rows = con.execute(
             "SELECT payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
             (scenario.id,),
@@ -1168,6 +1385,7 @@ class Store:
             active_schedule_id=plan.selected.id if plan else None,
             execution_event_sequence=watermark,
             started_assignments=started_sources,
+            completed_assignments=completed_sources,
             technician_projections=projections,
         )
 
@@ -1381,6 +1599,16 @@ class Store:
                 raise PublicationConflict("求解记录与候选方案的求解配置指纹不一致")
             if candidate_run.solver_policy_fingerprint != candidate.solver_policy_fingerprint:
                 raise PublicationConflict("求解记录与候选方案的求解政策指纹不一致")
+            policy = selected.solver_policy
+            if policy is None:
+                raise PublicationConflict("候选方案缺少求解政策")
+            if selected.solver_config_hash != content_hash(policy.solver_config):
+                raise PublicationConflict("求解政策与实际求解配置不一致")
+            expected_policy_limit = (
+                candidate_run.requested_time_limit_ms if selected.solver_name == "ortools-routing" else None
+            )
+            if policy.time_limit_ms != expected_policy_limit:
+                raise PublicationConflict("求解政策与求解记录的时间限制不一致")
             if candidate_run.action == "replan" and candidate.planning_context is None:
                 raise PublicationConflict("重排候选缺少计划上下文")
             if (

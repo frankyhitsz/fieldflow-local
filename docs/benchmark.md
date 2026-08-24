@@ -1,6 +1,7 @@
 # Benchmark status
 
-Version 0.2.0 does not publish performance claims. The 8-technician/60-work-order and 12-technician/100-work-order fixtures are deterministic product checks, not representative field data.
+The repository does not publish performance claims. The 8-technician/60-work-order and 12-technician/100-work-order fixtures are deterministic product checks, not representative field data.
+
+`make benchmark-smoke` verifies the currently expressible scenario families, the decision-model invariants, and the regression-test links for repeated replanning. It also reports capability gaps instead of treating them as passing cases: Crew visits, cross-day planning and parts inventory are currently unsupported; multi-depot is limited to per-technician origins and a transparent what-if assumption.
 
 A publishable benchmark needs several seeds and scenario families, cold and warm runs, p50/p95 runtime, feasible rate, verifier pass rate, KPI deltas against the greedy baseline, stability results, hardware details, and the solver, metric, travel, and score policy versions.
-

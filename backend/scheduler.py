@@ -26,6 +26,7 @@ from .models import (
     UnassignedWorkOrder,
     WorkOrder,
 )
+from .planning import assignment_planning_fingerprint, assignment_source_fingerprint
 from .timeutils import hhmm, service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
@@ -538,6 +539,20 @@ def _result(
     provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
     solver_policy: SolverPolicySnapshot | None = None,
 ) -> ScheduleResult:
+    # Direct scheduler callers (tests, benchmarks and offline integrations) do
+    # not necessarily pass through the API normalization layer.  Bind every
+    # produced visit to the planning input here as well so that a valid solver
+    # result is immediately verifiable and cannot later be executed against a
+    # silently changed order, technician or travel model.
+    for assignment in assignments:
+        assignment.source_sequence = assignment.source_sequence or assignment.sequence
+        assignment.source_assignment_hash = assignment.source_assignment_hash or assignment_source_fingerprint(
+            assignment
+        )
+        assignment.planning_fingerprint = assignment_planning_fingerprint(scenario, assignment, provider)
+        assignment.evidence["source_sequence"] = assignment.source_sequence
+        assignment.evidence["source_assignment_hash"] = assignment.source_assignment_hash
+        assignment.evidence["planning_fingerprint"] = assignment.planning_fingerprint
     kpis = calculate_kpis(scenario, assignments, unassigned, previous if kind == "replan" else None, provider)
     # Stability is a replanning concern. A normal optimization may be compared
     # with a baseline, but must not pay a penalty merely for improving it.
@@ -589,6 +604,7 @@ def _result(
 def build_solver_policy_snapshot(
     scenario: ScheduleScenario,
     *,
+    original_scenario: ScheduleScenario | None = None,
     strategy: str,
     requested_time_limit_ms: int | None,
     solver_name: str,
@@ -598,19 +614,26 @@ def build_solver_policy_snapshot(
     unassigned_penalty_scale: float | None = None,
 ) -> SolverPolicySnapshot:
     is_routing = solver_name == "ortools-routing"
+    original = original_scenario or scenario
     snapshot = SolverPolicySnapshot(
         profile_id=profile_id or strategy,
         profile_name=profile_name or strategy,
         profile_snapshot=profile_snapshot or {},
         solver_config=scenario.solver_config.model_copy(deep=True),
         unassigned_penalty_scale=unassigned_penalty_scale,
-        effective_drop_penalties={
-            order.id: round(
-                order.drop_penalty * (1.0 if unassigned_penalty_scale is None else unassigned_penalty_scale)
-            )
-            for order in sorted(scenario.work_orders, key=lambda item: item.id)
+        original_drop_penalties={
+            order.id: order.drop_penalty for order in sorted(original.work_orders, key=lambda item: item.id)
         },
-        time_limit_ms=requested_time_limit_ms or int(round(scenario.solver_config.time_limit_seconds * 1000)),
+        effective_drop_penalties={
+            order.id: order.drop_penalty for order in sorted(scenario.work_orders, key=lambda item: item.id)
+        },
+        time_limit_ms=(
+            requested_time_limit_ms
+            if requested_time_limit_ms is not None
+            else int(round(scenario.solver_config.time_limit_seconds * 1000))
+        )
+        if is_routing
+        else None,
         solution_limit=ROUTING_SOLUTION_LIMIT if is_routing else None,
         first_solution_strategy=FIRST_SOLUTION_STRATEGY if is_routing else None,
         local_search_metaheuristic=LOCAL_SEARCH_METAHEURISTIC if is_routing else None,
@@ -1102,14 +1125,29 @@ def replan_schedule(
         else {}
     )
     fixed_by_tech: dict[str, list[ScheduleAssignment]] = defaultdict(list)
+    frozen_context = (
+        {item.work_order_id: item for item in planning_context.frozen_assignments} if planning_context else {}
+    )
     for item in fixed:
         fixed_by_tech[item.technician_id].append(item)
         item.changed = False
+        frozen_item = frozen_context.get(item.work_order_id)
+        source_item = execution_sources.get(item.work_order_id)
+        if frozen_item:
+            item.start_time = frozen_item.start_time
+            item.finish_time = frozen_item.finish_time
+            item.source_sequence = frozen_item.source_sequence or item.source_sequence or item.sequence
+            item.source_assignment_hash = frozen_item.source_assignment_hash or item.source_assignment_hash
+        elif source_item:
+            item.source_sequence = source_item.source_sequence or source_item.sequence
+            item.source_assignment_hash = source_item.source_assignment_hash
         if "本次不调整" not in "".join(item.explanation):
             item.explanation.append("工单已有明确执行状态，本次不调整")
     for tech in scenario_copy.technicians:
         prefix = sorted(fixed_by_tech.get(tech.id, []), key=lambda a: a.sequence)
         if prefix:
+            for future_sequence, item in enumerate(prefix, start=1):
+                item.sequence = future_sequence
             last = prefix[-1]
             tech.start_location = original_orders[last.work_order_id].location
             projected_available = execution_sources.get(last.work_order_id)

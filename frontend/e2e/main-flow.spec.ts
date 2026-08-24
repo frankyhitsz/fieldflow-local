@@ -1,9 +1,15 @@
 import { expect, test } from '@playwright/test'
 
 test('baseline, optimize, compare, arbitrary activation, and version report', async ({ page, request }) => {
+  const created = await request.post('/api/scenarios', { data: { fixture_id: 'main', name: 'E2E 主流程场景' } })
+  expect(created.ok()).toBeTruthy()
+  const scenarioId = (await created.json()).id as string
+
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'FieldFlow' })).toBeHidden()
   await expect(page.getByRole('heading', { name: '今日调度 · 城西片区' })).toBeVisible()
+  await page.getByLabel('业务场景').selectOption(scenarioId)
+  await expect(page.getByRole('heading', { name: 'E2E 主流程场景' })).toBeVisible()
 
   await page.getByRole('button', { name: '生成基线' }).click()
   await expect(page.getByText(/人工基线 · V001/)).toBeVisible({ timeout: 15_000 })
@@ -22,11 +28,11 @@ test('baseline, optimize, compare, arbitrary activation, and version report', as
   await v1.getByRole('button', { name: '重新激活' }).click()
   await expect(page.locator('.command-context').getByText(/V003/)).toBeVisible({ timeout: 15_000 })
 
-  const versions = await request.get('/api/scenarios/main/plan-versions')
+  const versions = await request.get(`/api/scenarios/${scenarioId}/plan-versions`)
   expect(versions.ok()).toBeTruthy()
   const plans = await versions.json()
   expect(plans.map((item: { number: number }) => item.number)).toEqual([1, 2, 3])
-  const report = await request.get(`/api/scenarios/main/plan-versions/${plans[0].id}/report`)
+  const report = await request.get(`/api/scenarios/${scenarioId}/plan-versions/${plans[0].id}/report`)
   expect(report.ok()).toBeTruthy()
   expect(await report.text()).toContain('FieldFlow 调度台')
 })
@@ -59,20 +65,20 @@ test('dispatch workspace keeps its primary regions visible at 1440 by 900', asyn
 })
 
 test('changing a lock marks the displayed plan stale', async ({ page, request }) => {
-  let versions = await request.get('/api/scenarios/main/plan-versions')
-  let plans = await versions.json()
-  let active = plans.find((item: { active: boolean }) => item.active)
-  if (!active) {
-    const baseline = await request.post('/api/scenarios/main/baseline')
-    expect(baseline.ok()).toBeTruthy()
-    versions = await request.get('/api/scenarios/main/plan-versions')
-    plans = await versions.json()
-    active = plans.find((item: { active: boolean }) => item.active)
-  }
+  const created = await request.post('/api/scenarios', { data: { fixture_id: 'main', name: 'E2E 过期门禁场景' } })
+  expect(created.ok()).toBeTruthy()
+  const scenarioId = (await created.json()).id as string
+  const baseline = await request.post(`/api/scenarios/${scenarioId}/baseline`)
+  expect(baseline.ok()).toBeTruthy()
+  const versions = await request.get(`/api/scenarios/${scenarioId}/plan-versions`)
+  const plans = await versions.json()
+  const active = plans.find((item: { active: boolean }) => item.active)
   expect(active).toBeDefined()
   const assignment = active!.selected.assignments[0]
 
   await page.goto('/')
+  await page.getByLabel('业务场景').selectOption(scenarioId)
+  await expect(page.getByRole('heading', { name: 'E2E 过期门禁场景' })).toBeVisible()
   await page.getByRole('button', { name: '全部' }).click()
   await page.getByText(assignment.work_order_id, { exact: false }).first().click()
   await page.getByRole('button', { name: '锁定此工单与技师' }).click()

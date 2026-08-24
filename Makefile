@@ -1,4 +1,4 @@
-.PHONY: setup lint test test-frontend test-e2e build verify demo demo-check clean-data
+.PHONY: setup lint test test-frontend test-e2e build verify demo demo-check benchmark-smoke clean-data
 
 PYTHON := .venv/bin/python
 PYTEST := .venv/bin/pytest
@@ -30,7 +30,10 @@ build:
 demo-check:
 	PYTHONPATH=. FIELDFLOW_DB=/tmp/fieldflow-demo-check.db $(PYTHON) scripts/demo_check.py
 
-verify: lint test test-frontend build demo-check test-e2e
+benchmark-smoke:
+	PYTHONPATH=. $(PYTHON) scripts/benchmark_smoke.py
+
+verify: lint test test-frontend build demo-check benchmark-smoke test-e2e
 
 demo: build
 	@echo "FieldFlow Local → http://127.0.0.1:$(PORT)"

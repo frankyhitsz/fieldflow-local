@@ -13,7 +13,8 @@ const cachedHeadless = (() => {
 })()
 const installedChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
-  || (!process.env.CI && existsSync(installedChrome) ? installedChrome : cachedHeadless)
+  || cachedHeadless
+  || (!process.env.CI && existsSync(installedChrome) ? installedChrome : undefined)
 
 export default defineConfig({
   testDir: './e2e',

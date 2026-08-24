@@ -38,7 +38,7 @@
 
 | 意见 | 结论 |
 | --- | --- |
-| 版本号不一致 | 已修。`backend/_version.py` 是运行时版本源，FastAPI 和健康接口直接读取它；测试约束前端 package 与其一致。当前为 0.2.0。公开方案的 V001/V002 与软件版本没有关系。 |
+| 版本号不一致 | 已修。`backend/_version.py` 是运行时版本源，FastAPI 和健康接口直接读取它；测试约束前端 package 与其一致。本轮核查时为 0.2.0，后续里程碑见 Changelog。公开方案的 V001/V002 与软件版本没有关系。 |
 | `pyproject.toml` 缺依赖 | 已修。运行依赖和 dev extra 已列出，`requirements.txt` 继续作为精确安装清单。 |
 | CI 缺静态门禁 | 已修主要部分。CI 运行 Ruff、TypeScript、后端 75% 覆盖率门槛（当前约 89%）、组件测试、构建、Demo 和 Playwright。Dependabot 检查 pip、npm 和 Actions；`npm install` 当前报告 0 个漏洞。没有为了凑清单同时引入 mypy/Pyright 和 ESLint。 |
 | 开源文件不足 | 部分采纳。已增加 SECURITY、CONTRIBUTING、CODE_OF_CONDUCT、CHANGELOG、架构、指标、限制、数据格式、Benchmark 状态、威胁模型和 ADR。未添加 LICENSE：许可证是仓库所有者的法律选择，不能由实现者代选。Demo GIF 和正式 Benchmark 也不能用合成结果冒充。 |

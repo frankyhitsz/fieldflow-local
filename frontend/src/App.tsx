@@ -21,6 +21,12 @@ const priorityLabel = { urgent: '紧急', high: '高', normal: '普通', low: '�
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
 const commandKey = (action: string) => `${action}:${crypto.randomUUID()}`
+const executionDefaultTime = (scenario: Scenario, assignment: Assignment, action: 'start' | 'complete') => {
+  const now = new Date()
+  const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  if (scenario.planning_date === localDate) return now.getHours() * 60 + now.getMinutes()
+  return action === 'start' ? assignment.start_time : Math.max(assignment.finish_time, assignment.start_time + 1)
+}
 const solverStatusLabel: Record<Schedule['solver_status'], string> = {
   OPTIMAL: '已证明最优', FEASIBLE: '已找到可行解', TIME_LIMIT_FEASIBLE: '限时内可行',
   TIME_LIMIT_NO_SOLUTION: '限时内无解', INFEASIBLE: '已证明无解', NO_SOLUTION: '未找到方案',
@@ -238,6 +244,27 @@ function CompareDrawer({ data, onClose }: { data: Comparison; onClose: () => voi
   </section></div>
 }
 
+function ExecutionDialog({ scenario, assignment, action, onClose, onSubmit }: { scenario: Scenario; assignment: Assignment; action: 'start' | 'complete'; onClose: () => void; onSubmit: (occurredAt: number, earlyStartOverrideReason: string, note: string) => void }) {
+  const order = scenario.work_orders.find(item => item.id === assignment.work_order_id)!
+  const technician = scenario.technicians.find(item => item.id === assignment.technician_id)
+  const [occurredAt, setOccurredAt] = useState(() => executionDefaultTime(scenario, assignment, action))
+  const [overrideReason, setOverrideReason] = useState('')
+  const [note, setNote] = useState('')
+  const customerReadyAt = Math.max(order.window_start, order.reported_at ?? 0)
+  const early = action === 'start' && occurredAt < customerReadyAt
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="editor-modal compact execution-modal" role="dialog" aria-modal="true" aria-labelledby="execution-title" onMouseDown={event => event.stopPropagation()} onSubmit={event => { event.preventDefault(); onSubmit(occurredAt, overrideReason.trim(), note.trim()) }}>
+    <div className="editor-head"><div><span className="eyebrow">ACTUAL EXECUTION</span><h2 id="execution-title">{action === 'start' ? '登记开始服务' : '登记完成服务'}</h2></div><button type="button" className="icon-btn" onClick={onClose} aria-label="关闭执行登记"><X size={18} /></button></div>
+    <div className="execution-summary"><b>{assignment.work_order_id}</b><span>{technician?.name} · 计划 {hhmm(assignment.start_time)}–{hhmm(assignment.finish_time)}</span></div>
+    <div className="form-grid">
+      <label>实际发生时间（当日起分钟）<input aria-label="实际发生时间" type="number" min="0" max="2280" step="1" value={occurredAt} onChange={event => setOccurredAt(Number(event.target.value))} /><small>{hhmm(occurredAt)}，与重排时点相互独立</small></label>
+      <label>执行技师<input aria-label="执行技师" value={technician?.name || assignment.technician_id} disabled /></label>
+      {early && <label className="span-2">提前开始原因<textarea aria-label="提前开始原因" required value={overrideReason} onChange={event => setOverrideReason(event.target.value)} placeholder={`客户允许时间为 ${hhmm(customerReadyAt)}，请记录授权原因`} /></label>}
+      <label className="span-2">执行备注<textarea aria-label="执行备注" value={note} onChange={event => setNote(event.target.value)} placeholder="可记录客户确认、现场情况或偏差原因" /></label>
+    </div>
+    <div className="editor-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit" disabled={early && !overrideReason.trim()}><Check size={15} />确认登记</button></div>
+  </form></div>
+}
+
 export default function App() {
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [scenario, setScenario] = useState<Scenario>()
@@ -257,6 +284,7 @@ export default function App() {
   const [loadError, setLoadError] = useState<string>()
   const [workEditor, setWorkEditor] = useState<{ initial?: WorkOrder; emergencyPreset?: boolean }>()
   const [techEditor, setTechEditor] = useState<{ initial?: Technician }>()
+  const [executionEditor, setExecutionEditor] = useState<{ assignment: Assignment; action: 'start' | 'complete' }>()
   const booted = useRef(false)
   const loadSequence = useRef(0)
   const activeScenarioId = useRef<string | undefined>(undefined)
@@ -274,7 +302,7 @@ export default function App() {
       setScenario(next)
       setPlans(planItems)
       setHistoricalScenario(undefined)
-      setWorkEditor(undefined); setTechEditor(undefined)
+      setWorkEditor(undefined); setTechEditor(undefined); setExecutionEditor(undefined)
       const active = planItems.find(item => item.active)
       setSchedule(active?.selected)
       if (active) {
@@ -512,11 +540,13 @@ export default function App() {
         try {
           const preview = await api.rollbackPreview(scenario.id, item.id)
           if (preview.completed_work_orders_reopened.length) throw new Error(`默认禁止重新打开已完成工单：${preview.completed_work_orders_reopened.join('、')}`)
+          if (preview.started_work_orders_reopened.length) throw new Error(`禁止重新打开服务中工单：${preview.started_work_orders_reopened.join('、')}`)
+          if (preview.executed_work_orders_deleted.length) throw new Error(`禁止删除已有执行记录的工单：${preview.executed_work_orders_deleted.join('、')}`)
           if (preview.removed_work_orders.length) throw new Error(`默认禁止删除历史版本之后新增的工单：${preview.removed_work_orders.join('、')}`)
           const reason = window.prompt('请填写业务回滚原因')?.trim()
           if (!reason) return
           const currentPlan = preview.current_plan_number == null ? '当前没有可执行方案' : `当前 V${String(preview.current_plan_number).padStart(3, '0')}`
-          const message = `将业务数据回滚到 V${String(item.number).padStart(3, '0')} 的快照。\n\n工单：新增 ${preview.added_work_orders.length} 个、删除 ${preview.removed_work_orders.length} 个、修改 ${preview.modified_work_orders.length} 个；技师变化 ${preview.technician_changes.length} 项；锁定变化 ${preview.lock_changes.length} 项。\n${currentPlan} 切换后将有 ${preview.changed_plan_work_orders.length} 个工单的安排发生变化。\n\n这不是普通的计划切换。操作会创建新的 D 和 V，现有历史不会删除。`
+          const message = `将业务数据回滚到 V${String(item.number).padStart(3, '0')} 的快照。\n\n工单：新增 ${preview.added_work_orders.length} 个、删除 ${preview.removed_work_orders.length} 个、修改 ${preview.modified_work_orders.length} 个；技师变化 ${preview.technician_changes.length} 项；锁定变化 ${preview.lock_changes.length} 项；受影响执行事件 ${preview.affected_execution_event_ids.length} 条。\n${currentPlan} 切换后将有 ${preview.changed_plan_work_orders.length} 个工单的安排发生变化。\n\n这不是普通的计划切换。操作会创建新的 D 和 V，现有历史不会删除。`
           if (!window.confirm(message)) return
           const restored = await api.rollbackPlanVersion(scenario.id, item.id, scenario.revision, preview.confirmation_token, reason, commandKey('rollback'))
           if (activeScenarioId.current !== scenario.id) return
@@ -534,20 +564,9 @@ export default function App() {
       }} />}
       {view === 'technicians' && <TechniciansView scenario={scenario} schedule={schedule} onEdit={initial => setTechEditor({ initial })} onAdd={() => setTechEditor({})} />}
       {view === 'lab' && <StrategyLab key={scenario.id} scenario={scenario} profiles={profiles} loadingDataset={!!loadingScenarioId} onSelectDataset={id => { void loadScenario(id); setView('lab') }} onReloadProfiles={async () => setProfiles(await api.strategyProfiles())} onPublished={async plan => { if (activeScenarioId.current !== plan.scenario_id) return; const [fresh, planItems] = await Promise.all([api.scenario(plan.scenario_id), api.planVersions(plan.scenario_id)]); if (activeScenarioId.current !== plan.scenario_id) return; setScenario(fresh); setPlans(planItems); setSchedule(plan.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch') }} onToast={setToast} />}
-      {view === 'review' && <ReviewView schedule={schedule} baseline={baseline} />}
+      {view === 'review' && <ReviewView scenarioId={scenario.id} planVersionId={(plans.find(item => item.selected.id === schedule?.id) || plans.find(item => item.active))?.id} schedule={schedule} baseline={baseline} />}
     </main>
-    {selected && <ExplanationPanel scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={async (assignment, action) => {
-      if (action === 'complete' && !window.confirm(`确认 ${assignment.work_order_id} 已完成服务？`)) return
-      setWorking(action === 'start' ? '正在登记开始服务' : '正在登记完成服务')
-      try {
-        const result = await api.executeWorkOrder(scenario.id, assignment.work_order_id, action, assignment.technician_id, replanTime, scenario.revision, commandKey(`execution-${action}`))
-        if (activeScenarioId.current !== scenario.id) return
-        const planItems = await api.planVersions(scenario.id)
-        if (activeScenarioId.current !== scenario.id) return
-        setScenario(result.scenario); setPlans(planItems); setScenarios(current => current.map(item => item.id === result.scenario.id ? result.scenario : item)); setToast(action === 'start' ? '已登记开始服务；后续重排会保留该安排' : '已登记完成服务')
-      } catch (error) { setToast(error instanceof Error ? error.message : '执行状态登记失败') }
-      finally { setWorking(undefined) }
-    }} onAssign={async (orderId, technicianId) => {
+    {selected && <ExplanationPanel scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
       setWorking('正在改派并局部重排')
       try {
         await api.lock(scenario.id, orderId, technicianId, true)
@@ -576,6 +595,18 @@ export default function App() {
       } catch (e) { setToast(e instanceof Error ? e.message : '锁定失败') } finally { setWorking(undefined) }
     }} />}
     {comparison && <CompareDrawer data={comparison} onClose={() => setComparison(undefined)} />}
+    {executionEditor && <ExecutionDialog scenario={scenario} assignment={executionEditor.assignment} action={executionEditor.action} onClose={() => setExecutionEditor(undefined)} onSubmit={async (occurredAt, earlyStartOverrideReason, note) => {
+      const { assignment, action } = executionEditor
+      setWorking(action === 'start' ? '正在登记开始服务' : '正在登记完成服务')
+      try {
+        const result = await api.executeWorkOrder(scenario.id, assignment.work_order_id, action, assignment.technician_id, occurredAt, scenario.revision, commandKey(`execution-${action}`), { earlyStartOverrideReason, note })
+        if (activeScenarioId.current !== scenario.id) return
+        const planItems = await api.planVersions(scenario.id)
+        if (activeScenarioId.current !== scenario.id) return
+        setExecutionEditor(undefined); setScenario(result.scenario); setPlans(planItems); setScenarios(current => current.map(item => item.id === result.scenario.id ? result.scenario : item)); setToast(action === 'start' ? '已登记实际开始时间；后续重排会保留该安排' : `已登记完成服务${result.event.actual_duration_minutes == null ? '' : `，实际用时 ${result.event.actual_duration_minutes} 分钟`}`)
+      } catch (error) { setToast(error instanceof Error ? error.message : '执行状态登记失败') }
+      finally { setWorking(undefined) }
+    }} />}
     {workEditor && <WorkOrderEditor initial={workEditor.initial} emergencyPreset={workEditor.emergencyPreset} onClose={() => setWorkEditor(undefined)} onSave={saveWorkOrder} onDelete={deleteWorkOrder} />}
     {techEditor && <TechnicianEditor initial={techEditor.initial} onClose={() => setTechEditor(undefined)} onSave={saveTechnician} />}
     {toast && <div className="toast" role="status"><span className="toast-mark" aria-hidden="true" />{toast}<button onClick={() => setToast(undefined)} aria-label="关闭提示"><X size={14} /></button></div>}

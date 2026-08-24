@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.5.0 — unreleased
+
+- Made repeated post-completion replanning safe and separated future route sequence from immutable booking identity.
+- Added actual execution-time contracts, stale-assignment start gates, actual-position travel checks and active-service overrun projection.
+- Added SolverPolicy V2, retryable startup command reconciliation and database-enforced execution sequence uniqueness.
+- Added integer-cent cost analysis, six capacity what-if options, seeded risk simulation and benchmark smoke checks.
+- Migrated current and historical technician cost snapshots from floating units to integer cents in schema v10.
+- Isolated Playwright scenarios and fixed activation/restore provenance for non-solver history operations.
+
+## 0.2.0
 
 - Added verified `ScheduleRun` and `ScheduleCandidate` records before plan publication.
 - Made failed, stale, empty, and infeasible candidates non-publishable.

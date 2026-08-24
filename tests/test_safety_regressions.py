@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from backend.fixtures import get_fixture
 from backend.models import (
     LockedAssignment,
+    Point,
     SolverStatus,
     StrategyExperiment,
     UnassignedReason,
@@ -34,6 +35,914 @@ def _codes(report) -> set[str]:
 
 def _warning_codes(report) -> set[str]:
     return {item.code for item in report.warnings}
+
+
+def _route_with_two_assignments(schedule: dict) -> list[dict]:
+    by_technician: dict[str, list[dict]] = {}
+    for assignment in schedule["assignments"]:
+        by_technician.setdefault(assignment["technician_id"], []).append(assignment)
+    route = next(items for items in by_technician.values() if len(items) >= 2)
+    return sorted(route, key=lambda item: item["sequence"])
+
+
+def _complete_first_assignment(client: TestClient) -> tuple[dict, dict, dict]:
+    baseline = client.post("/api/scenarios/main/baseline").json()
+    first = _route_with_two_assignments(baseline)[0]
+    scenario = client.get("/api/scenarios/main").json()
+    started = client.post(
+        f"/api/scenarios/main/work-orders/{first['work_order_id']}/start",
+        json={
+            "technician_id": first["technician_id"],
+            "occurred_at": first["start_time"],
+            "expected_revision": scenario["revision"],
+            "idempotency_key": f"start-{first['work_order_id']}-m0",
+        },
+    )
+    assert started.status_code == 200, started.text
+    completed = client.post(
+        f"/api/scenarios/main/work-orders/{first['work_order_id']}/complete",
+        json={
+            "technician_id": first["technician_id"],
+            "occurred_at": first["finish_time"],
+            "expected_revision": started.json()["scenario"]["revision"],
+            "idempotency_key": f"complete-{first['work_order_id']}-m0",
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    return baseline, first, completed.json()
+
+
+def _complete_first_and_start_second(client: TestClient) -> tuple[dict, dict, dict, dict]:
+    baseline = client.post("/api/scenarios/main/baseline").json()
+    first, second = _route_with_two_assignments(baseline)[:2]
+    scenario = client.get("/api/scenarios/main").json()
+    started_first = client.post(
+        f"/api/scenarios/main/work-orders/{first['work_order_id']}/start",
+        json={
+            "technician_id": first["technician_id"],
+            "occurred_at": first["start_time"],
+            "expected_revision": scenario["revision"],
+            "idempotency_key": "m0-start-first-001",
+        },
+    )
+    assert started_first.status_code == 200, started_first.text
+    completed_first = client.post(
+        f"/api/scenarios/main/work-orders/{first['work_order_id']}/complete",
+        json={
+            "technician_id": first["technician_id"],
+            "occurred_at": first["finish_time"],
+            "expected_revision": started_first.json()["scenario"]["revision"],
+            "idempotency_key": "m0-complete-first-001",
+        },
+    )
+    assert completed_first.status_code == 200, completed_first.text
+    started_second = client.post(
+        f"/api/scenarios/main/work-orders/{second['work_order_id']}/start",
+        json={
+            "technician_id": second["technician_id"],
+            "occurred_at": second["start_time"],
+            "expected_revision": completed_first.json()["scenario"]["revision"],
+            "idempotency_key": "m0-start-second-001",
+        },
+    )
+    assert started_second.status_code == 200, started_second.text
+    return baseline, first, second, started_second.json()
+
+
+def test_completed_work_can_be_replanned_multiple_times(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "repeated-completion-replan.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, first, _ = _complete_first_assignment(client)
+        first_replan = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": first["finish_time"], "time_limit_seconds": 1},
+        )
+        assert first_replan.status_code == 200, first_replan.text
+        second_replan = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": first["finish_time"] + 1, "time_limit_seconds": 1},
+        )
+        assert second_replan.status_code == 200, second_replan.text
+        assert all(item["work_order_id"] != first["work_order_id"] for item in second_replan.json()["assignments"])
+
+
+def test_completed_work_does_not_require_future_source_assignment(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "completed-source-free.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, first, _ = _complete_first_assignment(client)
+        assert (
+            client.post(
+                "/api/scenarios/main/replan",
+                json={"planning_time": first["finish_time"], "time_limit_seconds": 1},
+            ).status_code
+            == 200
+        )
+        response = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": first["finish_time"] + 5, "time_limit_seconds": 1},
+        )
+        assert response.status_code == 200, response.text
+
+
+def test_completed_work_remains_traceable_through_event(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "completed-trace.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline, first, completed = _complete_first_assignment(client)
+        events = client.get("/api/scenarios/main/execution-events").json()
+        start_event, complete_event = events
+        assert start_event["booking_id"] == complete_event["booking_id"]
+        assert start_event["source_assignment_hash"] == first["source_assignment_hash"]
+        assert start_event["source_sequence"] == first["sequence"]
+        assert start_event["plan_version_id"]
+        assert complete_event["actual_duration_minutes"] == first["finish_time"] - first["start_time"]
+        assert completed["event"]["booking_id"] == start_event["booking_id"]
+        source_plan = next(
+            item
+            for item in client.get("/api/scenarios/main/plan-versions").json()
+            if item["id"] == start_event["plan_version_id"]
+        )
+        historical = next(
+            item for item in source_plan["selected"]["assignments"] if item["work_order_id"] == first["work_order_id"]
+        )
+        assert source_plan["selected"]["id"] == baseline["id"]
+        assert historical["source_assignment_hash"] == start_event["source_assignment_hash"]
+
+
+def test_complete_first_start_second_then_replan(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "started-second-replan.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, first, second, _ = _complete_first_and_start_second(client)
+        response = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": second["start_time"], "time_limit_seconds": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert all(item["work_order_id"] != first["work_order_id"] for item in response.json()["assignments"])
+
+
+def test_started_nonfirst_assignment_becomes_future_sequence_one(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "started-second-sequence.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, second, _ = _complete_first_and_start_second(client)
+        response = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": second["start_time"], "time_limit_seconds": 1},
+        )
+        assert response.status_code == 200, response.text
+        assignment = next(
+            item for item in response.json()["assignments"] if item["work_order_id"] == second["work_order_id"]
+        )
+        assert assignment["sequence"] == 1
+        assert assignment["source_sequence"] == second["sequence"]
+
+
+def test_future_route_sequences_are_contiguous(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "future-contiguous.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, second, _ = _complete_first_and_start_second(client)
+        response = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": second["start_time"], "time_limit_seconds": 1},
+        )
+        assert response.status_code == 200, response.text
+        by_technician: dict[str, list[int]] = {}
+        for assignment in response.json()["assignments"]:
+            by_technician.setdefault(assignment["technician_id"], []).append(assignment["sequence"])
+        for sequences in by_technician.values():
+            assert sorted(sequences) == list(range(1, len(sequences) + 1))
+
+
+def test_started_assignment_identity_survives_sequence_renumbering(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "booking-identity.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, second, started = _complete_first_and_start_second(client)
+        response = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": second["start_time"], "time_limit_seconds": 1},
+        )
+        assignment = next(
+            item for item in response.json()["assignments"] if item["work_order_id"] == second["work_order_id"]
+        )
+        assert assignment["source_assignment_hash"] == started["event"]["source_assignment_hash"]
+        assert assignment["source_sequence"] == started["event"]["source_sequence"]
+        assert assignment["start_time"] == started["event"]["planned_start_at"]
+        assert assignment["finish_time"] == started["event"]["planned_finish_at"]
+
+
+def test_completed_work_never_reappears_in_future_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "completed-never-reappears.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, first, _ = _complete_first_assignment(client)
+        for offset in range(3):
+            response = client.post(
+                "/api/scenarios/main/replan",
+                json={"planning_time": first["finish_time"] + offset, "time_limit_seconds": 1},
+            )
+            assert response.status_code == 200, response.text
+            assert first["work_order_id"] not in {item["work_order_id"] for item in response.json()["assignments"]}
+
+
+def _invalid_sequence_replan(client: TestClient, main_module) -> tuple[dict, object]:
+    baseline = client.post("/api/scenarios/main/baseline").json()
+
+    def invalid_sequence(scenario, version, previous, *args, **kwargs):
+        result = previous.model_copy(deep=True)
+        result.kind = "replan"
+        result.version = version
+        result.scenario_id = scenario.id
+        result.scenario_revision = scenario.revision
+        route = next(
+            items
+            for technician_id in {item.technician_id for item in result.assignments}
+            if len(items := [item for item in result.assignments if item.technician_id == technician_id]) >= 2
+        )
+        route[1].sequence = route[0].sequence
+        return result
+
+    main_module.replan_schedule = invalid_sequence
+    response = client.post(
+        "/api/scenarios/main/replan",
+        json={"planning_time": 600, "time_limit_seconds": 1},
+    )
+    return baseline, response
+
+
+def test_invalid_sequence_candidate_preserves_active_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "invalid-sequence-active.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline, response = _invalid_sequence_replan(client, main_module)
+        assert response.status_code == 422
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert active["selected"]["id"] == baseline["id"]
+
+
+def test_invalid_sequence_candidate_does_not_consume_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "invalid-sequence-version.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, response = _invalid_sequence_replan(client, main_module)
+        assert response.status_code == 422
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
+
+
+def test_execution_cannot_start_before_customer_window(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "early-start.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in baseline["assignments"] if item["arrival_time"] < item["start_time"])
+        order = next(
+            item
+            for item in client.get("/api/scenarios/main").json()["work_orders"]
+            if item["id"] == assignment["work_order_id"]
+        )
+        occurred_at = max(assignment["arrival_time"], order["window_start"] - 1)
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{order['id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": occurred_at,
+                "expected_revision": 0,
+                "idempotency_key": "early-start-blocked-001",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "EARLY_START_OVERRIDE_REQUIRED"
+
+
+def test_early_start_requires_override_reason(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "early-override.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in baseline["assignments"] if item["arrival_time"] < item["start_time"])
+        order = next(
+            item
+            for item in client.get("/api/scenarios/main").json()["work_orders"]
+            if item["id"] == assignment["work_order_id"]
+        )
+        occurred_at = max(assignment["arrival_time"], order["window_start"] - 1)
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{order['id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": occurred_at,
+                "expected_revision": 0,
+                "idempotency_key": "early-start-approved-001",
+                "early_start_override_reason": "客户现场确认可以提前开始",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["event"]["early_start_override_reason"] == "客户现场确认可以提前开始"
+
+
+def test_complete_time_must_be_after_start_time(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "zero-duration.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in baseline["assignments"] if item["sequence"] == 1)
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "zero-duration-start-001",
+            },
+        )
+        assert started.status_code == 200
+        completed = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/complete",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": 1,
+                "idempotency_key": "zero-duration-complete-001",
+            },
+        )
+        assert completed.status_code == 409
+        assert completed.json()["detail"]["code"] == "ZERO_OR_NEGATIVE_ACTUAL_DURATION"
+
+
+def test_actual_duration_is_persisted(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "actual-duration.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, first, completed = _complete_first_assignment(client)
+        assert completed["event"]["actual_duration_minutes"] == first["finish_time"] - first["start_time"]
+
+
+def test_late_actual_start_is_recorded_not_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "late-actual-start.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in baseline["assignments"] if item["sequence"] == 1)
+        order = next(
+            item
+            for item in client.get("/api/scenarios/main").json()["work_orders"]
+            if item["id"] == assignment["work_order_id"]
+        )
+        late_at = order["window_end"] + 7
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{order['id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": late_at,
+                "expected_revision": 0,
+                "idempotency_key": "late-start-recorded-001",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["event"]["actual_late_start_minutes"] == 7
+
+
+def _prepare_stale_assignment_case(client: TestClient) -> tuple[dict, dict, dict]:
+    baseline = client.post("/api/scenarios/main/baseline").json()
+    routes: dict[str, list[dict]] = {}
+    for assignment in baseline["assignments"]:
+        routes.setdefault(assignment["technician_id"], []).append(assignment)
+    ordered_routes = [sorted(route, key=lambda item: item["sequence"]) for route in routes.values()]
+    first = ordered_routes[0][0]
+    other = next(route[0] for route in ordered_routes[1:] if route)
+    started = client.post(
+        f"/api/scenarios/main/work-orders/{first['work_order_id']}/start",
+        json={
+            "technician_id": first["technician_id"],
+            "occurred_at": first["start_time"],
+            "expected_revision": 0,
+            "idempotency_key": "stale-gate-start-active-001",
+        },
+    )
+    assert started.status_code == 200, started.text
+    return baseline, first, other
+
+
+def test_stale_assignment_cannot_start_after_skill_change(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "stale-skill.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, pending = _prepare_stale_assignment_case(client)
+        scenario = client.get("/api/scenarios/main").json()
+        technician = next(item for item in scenario["technicians"] if item["id"] == pending["technician_id"])
+        missing_skill = next(item for item in ["electrical", "hvac", "network"] if item not in technician["skills"])
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}",
+            json={"required_skills": [missing_skill]},
+        )
+        assert edited.status_code == 200
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}/start",
+            json={
+                "technician_id": pending["technician_id"],
+                "occurred_at": pending["start_time"],
+                "expected_revision": edited.json()["revision"],
+                "idempotency_key": "stale-skill-start-001",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+
+
+def test_stale_assignment_cannot_start_after_location_change(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "stale-location.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, pending = _prepare_stale_assignment_case(client)
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}",
+            json={"location": {"x": 2, "y": 98}},
+        )
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}/start",
+            json={
+                "technician_id": pending["technician_id"],
+                "occurred_at": pending["start_time"],
+                "expected_revision": edited.json()["revision"],
+                "idempotency_key": "stale-location-start-001",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+
+
+def test_stale_assignment_cannot_start_after_time_window_change(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "stale-window.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, pending = _prepare_stale_assignment_case(client)
+        order = next(
+            item
+            for item in client.get("/api/scenarios/main").json()["work_orders"]
+            if item["id"] == pending["work_order_id"]
+        )
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}",
+            json={"window_start": order["window_start"] + 1},
+        )
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}/start",
+            json={
+                "technician_id": pending["technician_id"],
+                "occurred_at": pending["start_time"],
+                "expected_revision": edited.json()["revision"],
+                "idempotency_key": "stale-window-start-001",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+
+
+def test_stale_assignment_cannot_violate_new_lock(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "stale-lock.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, pending = _prepare_stale_assignment_case(client)
+        scenario = client.get("/api/scenarios/main").json()
+        order = next(item for item in scenario["work_orders"] if item["id"] == pending["work_order_id"])
+        replacement = next(
+            item
+            for item in scenario["technicians"]
+            if item["id"] != pending["technician_id"] and set(order["required_skills"]).issubset(set(item["skills"]))
+        )
+        locked = client.post(
+            "/api/scenarios/main/lock",
+            json={
+                "work_order_id": pending["work_order_id"],
+                "technician_id": replacement["id"],
+                "locked": True,
+            },
+        )
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}/start",
+            json={
+                "technician_id": pending["technician_id"],
+                "occurred_at": pending["start_time"],
+                "expected_revision": locked.json()["revision"],
+                "idempotency_key": "stale-lock-start-001",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+
+
+def test_metadata_only_edit_does_not_invalidate_pending_assignment(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "metadata-start.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, _, pending = _prepare_stale_assignment_case(client)
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}",
+            json={"note": "仅补充现场联系人说明"},
+        )
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}/start",
+            json={
+                "technician_id": pending["technician_id"],
+                "occurred_at": pending["start_time"],
+                "expected_revision": edited.json()["revision"],
+                "idempotency_key": "metadata-start-allowed-001",
+            },
+        )
+        assert response.status_code == 200, response.text
+
+
+def test_deleted_route_predecessor_returns_structured_conflict_not_500(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "deleted-predecessor.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        routes: dict[str, list[dict]] = {}
+        for assignment in baseline["assignments"]:
+            routes.setdefault(assignment["technician_id"], []).append(assignment)
+        route_list = [sorted(items, key=lambda item: item["sequence"]) for items in routes.values()]
+        active_route = route_list[0]
+        target_route = next(items for items in route_list[1:] if len(items) >= 2)
+        active = active_route[0]
+        assert (
+            client.post(
+                f"/api/scenarios/main/work-orders/{active['work_order_id']}/start",
+                json={
+                    "technician_id": active["technician_id"],
+                    "occurred_at": active["start_time"],
+                    "expected_revision": 0,
+                    "idempotency_key": "deleted-predecessor-active-001",
+                },
+            ).status_code
+            == 200
+        )
+        deleted = client.delete(f"/api/scenarios/main/work-orders/{target_route[0]['work_order_id']}")
+        assert deleted.status_code == 200
+        target = target_route[1]
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{target['work_order_id']}/start",
+            json={
+                "technician_id": target["technician_id"],
+                "occurred_at": target["start_time"],
+                "expected_revision": deleted.json()["revision"],
+                "idempotency_key": "deleted-predecessor-target-001",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "STALE_ROUTE_PREDECESSOR_MISSING"
+
+
+def test_actual_position_first_leg_start_validation(tmp_path):
+    import backend.main as main_module
+
+    scenario = get_fixture("main")
+    scenario.id = "actual-origin"
+    scenario.name = "实际位置开工校验"
+    technician = scenario.technicians[0]
+    technician.shift_start = 480
+    technician.shift_end = 1080
+    technician.start_location = Point(x=50, y=50)
+    first, second = scenario.work_orders[:2]
+    first.id = "WO-ACTUAL-A"
+    first.required_skills = [technician.skills[0]]
+    first.location = Point(x=20, y=20)
+    first.window_start = 490
+    first.window_end = 800
+    first.sla_deadline = 550
+    first.service_duration = 30
+    second.id = "WO-ACTUAL-B"
+    second.required_skills = [technician.skills[0]]
+    second.location = Point(x=80, y=80)
+    second.window_start = 490
+    second.window_end = 1000
+    second.sla_deadline = 900
+    second.service_duration = 30
+    scenario.technicians = [technician]
+    scenario.work_orders = [first, second]
+    scenario.locked_assignments = []
+    matrix = {
+        ("DEPOT", "DEPOT"): 0,
+        ("DEPOT", "A"): 10,
+        ("A", "DEPOT"): 10,
+        ("DEPOT", "B"): 5,
+        ("B", "DEPOT"): 5,
+        ("A", "B"): 40,
+        ("B", "A"): 40,
+        ("A", "A"): 0,
+        ("B", "B"): 0,
+    }
+    provider = MatrixTravelTimeProvider(
+        matrix=matrix,
+        point_ids={(50, 50): "DEPOT", (20, 20): "A", (80, 80): "B"},
+        version="ACTUAL_ORIGIN_V1",
+    )
+    store = Store(tmp_path / "actual-origin.db", travel_provider=provider)
+    store.save_scenario(scenario, "创建实际位置测试")
+    with TestClient(main_module.create_app(store_override=store)) as client:
+        baseline = client.post("/api/scenarios/actual-origin/baseline").json()
+        first_assignment = next(item for item in baseline["assignments"] if item["work_order_id"] == first.id)
+        started = client.post(
+            f"/api/scenarios/actual-origin/work-orders/{first.id}/start",
+            json={
+                "technician_id": technician.id,
+                "occurred_at": first_assignment["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "actual-origin-start-a-001",
+            },
+        )
+        completed_at = first_assignment["finish_time"]
+        completed = client.post(
+            f"/api/scenarios/actual-origin/work-orders/{first.id}/complete",
+            json={
+                "technician_id": technician.id,
+                "occurred_at": completed_at,
+                "expected_revision": started.json()["scenario"]["revision"],
+                "idempotency_key": "actual-origin-complete-a-001",
+            },
+        )
+        assert completed.status_code == 200
+        replanned = client.post(
+            "/api/scenarios/actual-origin/replan",
+            json={"planning_time": completed_at, "time_limit_seconds": 1},
+        )
+        assert replanned.status_code == 200, replanned.text
+        too_early = client.post(
+            f"/api/scenarios/actual-origin/work-orders/{second.id}/start",
+            json={
+                "technician_id": technician.id,
+                "occurred_at": completed_at + 39,
+                "expected_revision": completed.json()["scenario"]["revision"],
+                "idempotency_key": "actual-origin-start-b-early-001",
+            },
+        )
+        assert too_early.status_code == 409
+        assert too_early.json()["detail"]["code"] == "BEFORE_EXECUTION_AVAILABILITY"
+        allowed = client.post(
+            f"/api/scenarios/actual-origin/work-orders/{second.id}/start",
+            json={
+                "technician_id": technician.id,
+                "occurred_at": completed_at + 40,
+                "expected_revision": completed.json()["scenario"]["revision"],
+                "idempotency_key": "actual-origin-start-b-allowed-001",
+            },
+        )
+        assert allowed.status_code == 200, allowed.text
+
+
+def test_active_service_overrun_is_not_silently_available(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "active-overrun.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        route = _route_with_two_assignments(baseline)
+        first = route[0]
+        scenario = client.get("/api/scenarios/main").json()
+        order = next(item for item in scenario["work_orders"] if item["id"] == first["work_order_id"])
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{first['work_order_id']}/start",
+            json={
+                "technician_id": first["technician_id"],
+                "occurred_at": first["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "active-overrun-start-001",
+            },
+        )
+        assert started.status_code == 200
+        planning_time = first["start_time"] + order["service_duration"] + 20
+        replanned = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": planning_time, "time_limit_seconds": 1},
+        )
+        assert replanned.status_code == 200, replanned.text
+        context = client.get("/api/scenarios/main/schedule-runs").json()[-1]["planning_context"]
+        assert context["execution_warnings"] == [f"ACTIVE_SERVICE_OVERRUN:{first['work_order_id']}:15"]
+        projection = next(
+            item
+            for item in context["execution_source_context"]["technician_projections"]
+            if item["technician_id"] == first["technician_id"]
+        )
+        assert projection["overrun"] is True
+        assert projection["available_at"] == planning_time + 15
+
+
+def test_completion_profile_penalty_scaled_exactly_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "policy-completion.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        result = client.post(
+            "/api/scenarios/main/optimize",
+            json={"strategy": "completion", "time_limit_seconds": 1},
+        ).json()
+        policy = result["solver_policy"]
+        for work_order_id, original in policy["original_drop_penalties"].items():
+            assert policy["effective_drop_penalties"][work_order_id] == original * 5
+
+
+def test_low_travel_profile_penalty_scaled_exactly_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "policy-low-travel.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        result = client.post(
+            "/api/scenarios/main/optimize",
+            json={"strategy": "low_travel", "time_limit_seconds": 1},
+        ).json()
+        policy = result["solver_policy"]
+        for work_order_id, original in policy["original_drop_penalties"].items():
+            assert policy["effective_drop_penalties"][work_order_id] == max(1, round(original * 0.8))
+
+
+def test_policy_effective_penalties_match_solver_input(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "policy-input.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        result = client.post(
+            "/api/scenarios/main/optimize",
+            json={"strategy": "fair_workload", "time_limit_seconds": 1},
+        ).json()
+        policy = result["solver_policy"]
+        assert policy["policy_version"] == "FIELD_SERVICE_SOLVER_POLICY_V2"
+        assert policy["solver_config"]
+        candidate = client.get(
+            f"/api/scenarios/main/schedule-candidates/{client.get('/api/scenarios/main/schedule-runs').json()[-1]['candidate_id']}"
+        ).json()
+        assert candidate["solver_policy_fingerprint"] == policy["fingerprint"]
+
+
+def test_greedy_baseline_has_no_routing_time_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "policy-baseline.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        result = client.post("/api/scenarios/main/baseline").json()
+        assert result["solver_name"] == "fieldflow-greedy"
+        assert result["solver_policy"]["time_limit_ms"] is None
+        assert result["solver_policy"]["solution_limit"] is None
+
+
+def test_run_and_policy_time_limits_are_consistent(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "policy-run-limit.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        result = client.post(
+            "/api/scenarios/main/optimize",
+            json={"strategy": "balanced", "time_limit_seconds": 1},
+        ).json()
+        run = client.get("/api/scenarios/main/schedule-runs").json()[-1]
+        assert run["requested_time_limit_ms"] == result["solver_policy"]["time_limit_ms"] == 1000
+        assert run["solver_policy_fingerprint"] == result["solver_policy"]["fingerprint"]
+
+
+def test_running_command_reconciles_to_retryable_after_restart(tmp_path):
+    database = tmp_path / "command-recovery.db"
+    store = Store(database)
+    created = store.begin_command_record(
+        "schedule-solve",
+        "main:optimize:recoverable-command",
+        "fingerprint-001",
+        status="RUNNING",
+        resource_type="schedule_run",
+        resource_id="RUN-ABANDONED",
+        payload={"run_id": "RUN-ABANDONED"},
+    )
+    assert created is True
+    restarted = Store(database)
+    command = restarted.get_command_record(
+        "schedule-solve",
+        "main:optimize:recoverable-command",
+        "fingerprint-001",
+    )
+    assert command["status"] == "FAILED_RETRYABLE"
+    reacquired = restarted.begin_command_record(
+        "schedule-solve",
+        "main:optimize:recoverable-command",
+        "fingerprint-001",
+        status="RUNNING",
+        resource_type=None,
+        resource_id=None,
+        payload={"attempt": 2},
+    )
+    assert reacquired is True
+    assert (
+        restarted.get_command_record(
+            "schedule-solve",
+            "main:optimize:recoverable-command",
+            "fingerprint-001",
+        )["status"]
+        == "RUNNING"
+    )
+
+
+def test_execution_sequence_has_database_unique_constraint(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "execution-sequence-unique.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in baseline["assignments"] if item["sequence"] == 1)
+        response = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "unique-sequence-start-001",
+            },
+        )
+        assert response.status_code == 200
+    with closing(sqlite3.connect(tmp_path / "execution-sequence-unique.db")) as connection, connection:
+        event = response.json()["event"]
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO work_order_execution_events(id, scenario_id, work_order_id, action, sequence, occurred_at, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "EXEC-DUPLICATE-SEQUENCE",
+                    "main",
+                    assignment["work_order_id"],
+                    "start",
+                    event["sequence"],
+                    event["occurred_at"],
+                    "{}",
+                    event["created_at"],
+                ),
+            )
+
+
+def test_noop_work_order_save_does_not_increment_revision(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "noop-save.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        scenario = client.get("/api/scenarios/main").json()
+        order = next(item for item in scenario["work_orders"] if item["id"] == "WO-1021")
+        response = client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            json={"note": order["note"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["revision"] == scenario["revision"]
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert active["selected"]["id"] == baseline["id"]
 
 
 def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp_path):
@@ -66,7 +975,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -946,7 +1855,9 @@ def test_patch_contract_distinguishes_omitted_null_and_clearable_fields(monkeypa
         assert cleared.status_code == 200
         order = next(item for item in cleared.json()["work_orders"] if item["id"] == "WO-1021")
         assert order["note"] == ""
-        assert cleared.json()["revision"] == original["revision"] + 3
+        # The normalized color is unchanged, so the no-op edit must not create
+        # a data revision. Only setting and then clearing the note are changes.
+        assert cleared.json()["revision"] == original["revision"] + 2
 
 
 def test_compound_emergency_replan_is_idempotent(monkeypatch, tmp_path):

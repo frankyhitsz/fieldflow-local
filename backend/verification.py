@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 
+from .execution import execution_context_for_planning
 from .hashing import content_hash
 from .models import (
     CoverageSummary,
@@ -16,6 +17,7 @@ from .models import (
     VerificationIssue,
 )
 from .normalization import normalize_schedule
+from .planning import assignment_planning_fingerprint
 from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 
@@ -40,6 +42,11 @@ def verify_schedule(
 ) -> ScheduleVerificationReport:
     errors: list[VerificationIssue] = []
     warnings: list[VerificationIssue] = []
+    if execution_context is not None and planning_context is not None:
+        execution_context, _ = execution_context_for_planning(
+            execution_context,
+            planning_context.planning_time,
+        )
 
     def error(code: str, message: str, work_order_id: str | None = None, technician_id: str | None = None) -> None:
         errors.append(
@@ -72,6 +79,9 @@ def verify_schedule(
     for item in sorted(unassigned_ids - active_ids):
         if item in orders:
             error("INACTIVE_WORK_ORDER_UNASSIGNED", f"{item}: completed work order cannot be unassigned", item)
+    for item in sorted(assignment_ids - active_ids):
+        if item in orders:
+            error("COMPLETED_WORK_ORDER_ASSIGNED", f"{item}: completed work order cannot appear in a future plan", item)
 
     coverage = CoverageSummary(
         active_work_orders=len(active_ids),
@@ -113,6 +123,26 @@ def verify_schedule(
         result.solver_policy.model_dump(exclude={"fingerprint"}, mode="json")
     ):
         error("SOLVER_POLICY_FINGERPRINT_MISMATCH", "candidate solver policy fingerprint is invalid")
+    else:
+        policy = result.solver_policy
+        if result.solver_config_hash != content_hash(policy.solver_config):
+            error("SOLVER_POLICY_CONFIG_MISMATCH", "solver config hash does not match the policy snapshot")
+        expected_original = {
+            item.id: item.drop_penalty for item in sorted(scenario.work_orders, key=lambda order: order.id)
+        }
+        if policy.original_drop_penalties != expected_original:
+            error("SOLVER_POLICY_ORIGINAL_PENALTY_MISMATCH", "policy original penalties do not match business input")
+        scale = 1.0 if policy.unassigned_penalty_scale is None else policy.unassigned_penalty_scale
+        expected_effective = {
+            item.id: max(1, round(item.drop_penalty * scale))
+            for item in sorted(scenario.work_orders, key=lambda order: order.id)
+        }
+        if policy.effective_drop_penalties != expected_effective:
+            error("SOLVER_POLICY_EFFECTIVE_PENALTY_MISMATCH", "policy penalties do not match solver input")
+        if result.solver_name != "ortools-routing" and policy.time_limit_ms is not None:
+            error("SOLVER_POLICY_TIME_LIMIT_MISMATCH", "non-routing solver must not claim a routing time limit")
+        if result.solver_name == "ortools-routing" and policy.time_limit_ms != result.requested_time_limit_ms:
+            error("SOLVER_POLICY_TIME_LIMIT_MISMATCH", "policy and result time limits differ")
 
     locked = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     for work_order_id, technician_id in locked.items():
@@ -244,18 +274,26 @@ def verify_schedule(
                 )
             if (
                 assignment.technician_id,
-                assignment.sequence,
                 assignment.start_time,
                 assignment.finish_time,
             ) != (
                 expected.technician_id,
-                expected.sequence,
                 expected.planned_start_at,
                 expected.planned_finish_at,
             ):
                 error(
                     "IMMUTABLE_ASSIGNMENT_CHANGED",
                     f"{work_order_id}: started assignment changed",
+                    work_order_id,
+                    assignment.technician_id,
+                )
+            if (
+                assignment.source_assignment_hash != expected.source_assignment_hash
+                or assignment.source_sequence != expected.source_sequence
+            ):
+                error(
+                    "STARTED_ASSIGNMENT_IDENTITY_CHANGED",
+                    f"{work_order_id}: started booking identity changed",
                     work_order_id,
                     assignment.technician_id,
                 )
@@ -361,6 +399,15 @@ def verify_schedule(
             error("OVERTIME_LIMIT_EXCEEDED", f"{order.id}: exceeds overtime limit", order.id, technician.id)
         if locked.get(order.id) and assignment.technician_id != locked[order.id]:
             error("LOCKED_TECHNICIAN_CHANGED", f"{order.id}: locked technician changed", order.id, technician.id)
+        if order.status.value == "pending":
+            expected_planning_fingerprint = assignment_planning_fingerprint(scenario, assignment, provider)
+            if assignment.planning_fingerprint != expected_planning_fingerprint:
+                error(
+                    "PENDING_ASSIGNMENT_STALE",
+                    f"{order.id}: assignment does not match current planning input",
+                    order.id,
+                    technician.id,
+                )
         grouped[technician.id].append(assignment)
 
     for technician_id, route in grouped.items():
@@ -413,14 +460,15 @@ def verify_schedule(
             first_origin = projection.effective_location if execution_origin else technician.start_location
             first_available = projection.available_at if execution_origin else technician.shift_start
             first_travel = provider.minutes(first_origin, orders[first.work_order_id].location)
-            if first.travel_minutes != first_travel:
+            first_is_started = first.work_order_id in frozen_started_ids
+            if not first_is_started and first.travel_minutes != first_travel:
                 error(
                     "FIRST_LEG_TRAVEL_MISMATCH",
                     f"{first.work_order_id}: first-leg travel minutes do not match effective origin",
                     first.work_order_id,
                     technician_id,
                 )
-            if first.arrival_time < first_available + first_travel:
+            if not first_is_started and first.arrival_time < first_available + first_travel:
                 error(
                     "IMPOSSIBLE_DEPOT_DEPARTURE",
                     f"{first.work_order_id}: arrival precedes effective availability and travel",
@@ -457,14 +505,14 @@ def verify_schedule(
                 )
             elif frozen_item is not None and (
                 old.technician_id,
-                old.sequence,
                 old.start_time,
                 old.finish_time,
+                old.source_assignment_hash,
             ) != (
                 frozen_item.technician_id,
-                frozen_item.sequence,
                 frozen_item.start_time,
                 frozen_item.finish_time,
+                frozen_item.source_assignment_hash,
             ):
                 error(
                     "PLANNING_CONTEXT_SOURCE_MISMATCH",
@@ -475,11 +523,11 @@ def verify_schedule(
                 # Completed work remains traceable to the source plan but is no
                 # longer part of the future schedule candidate.
                 continue
-            elif new is None or (new.technician_id, new.sequence, new.start_time, new.finish_time) != (
+            elif new is None or (new.technician_id, new.start_time, new.finish_time, new.source_assignment_hash) != (
                 old.technician_id,
-                old.sequence,
                 old.start_time,
                 old.finish_time,
+                frozen_item.source_assignment_hash if frozen_item is not None else old.source_assignment_hash,
             ):
                 error("IMMUTABLE_ASSIGNMENT_CHANGED", f"{work_order_id}: frozen assignment changed", work_order_id)
         if planning_context:

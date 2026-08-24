@@ -35,6 +35,8 @@ jobs:
         run: make build
       - name: Run demo check
         run: make demo-check
+      - name: Run benchmark smoke
+        run: make benchmark-smoke
       - name: Run Playwright flow
         run: make test-e2e
       - name: Upload browser failure artifacts
