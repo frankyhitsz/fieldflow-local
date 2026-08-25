@@ -33,6 +33,7 @@
 - [x] GitHub Actions #50 由 Linux Chromium 完成 5/5 页面/API E2E；Ubuntu Python 3.11、Ubuntu Python 3.12 全流程和 macOS Python 3.12 三个任务全部通过。
 - [x] 实现提交 `f9b8c40` 已推送 `main`，GitHub Actions #50 全绿。
 - [x] 后续 CI #51 暴露成本结果被较慢风险模拟延迟展示的时序缺陷；两个请求现各自完成即更新界面，并以受控阻塞风险请求的 React 回归测试验证成本结果可先显示。
+- [x] CI #52 验证成本与风险主流程修复后，继续暴露详情抽屉动画导致操作目标位置不稳定；Playwright 现启用产品已有的减少动效模式，并在锁定前显式等待抽屉动画完成，不使用强制点击绕过可交互性检查。
 
 逐项裁决见 `docs/pro-plan-v0.5.10-assessment.md`。
 

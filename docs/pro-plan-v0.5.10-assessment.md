@@ -71,4 +71,4 @@ LICENSE 需要仓库所有者选择 MIT 或 Apache-2.0；分支保护、required
 
 完整验收首先由 [GitHub Actions #50](https://github.com/frankyhitsz/fieldflow-local/actions/runs/32873627146) 完成：Ubuntu Python 3.11、Ubuntu Python 3.12 全流程和 macOS Python 3.12 三个任务全部通过。后端 271 项、覆盖率 88.45%，8/8 mutation smoke、React 15 项、Playwright 5/5，静态检查、runtime/dev/npm 依赖审计、构建、Demo 和 Benchmark 同步通过。实现提交为 `f9b8c40`。
 
-文档提交后的 Actions #51 暴露一个真实的时序问题：成本和风险请求虽然并发发起，界面仍等到较慢的风险模拟结束才显示已完成的成本结果。现已改为每项完成即独立更新，并新增受控延迟风险请求的 React 回归测试；当前前端测试为 16 项。
+文档提交后的 Actions #51 暴露一个真实的时序问题：成本和风险请求虽然并发发起，界面仍等到较慢的风险模拟结束才显示已完成的成本结果。现已改为每项完成即独立更新，并新增受控延迟风险请求的 React 回归测试；当前前端测试为 16 项。#52 已通过该主流程，随后在最后一个用例发现详情抽屉进入动画会令操作目标处于移动状态；测试浏览器现明确启用产品已有的减少动效模式，并在锁定前等待抽屉动画结束，仍保留 Playwright 的真实可交互性检查。

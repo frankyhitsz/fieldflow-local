@@ -28,6 +28,7 @@ export default defineConfig({
     channel: executablePath || process.env.CI ? undefined : 'chrome',
     launchOptions: { executablePath },
     viewport: { width: 1280, height: 720 },
+    contextOptions: { reducedMotion: 'reduce' },
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
