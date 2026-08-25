@@ -30,7 +30,7 @@ markdown-it-py==4.2.0
 mdurl==0.1.2
 msgpack==1.2.1
 nodeenv==1.10.0
-numpy==2.5.2
+numpy==2.4.6
 ortools==9.15.6755
 packageurl-python==0.17.6
 packaging==26.3

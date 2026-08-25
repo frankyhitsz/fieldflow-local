@@ -85,7 +85,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 ## 兼容与迁移
 
 - Schema v10 把技师浮点成本保值迁移为整数分；v11 增加命令发布键；v12 增加方案适用性投影；v13–v17 增加经营分析运行、恢复、重试和 Artifact；v18 增加不可降级证明要求、风险比较、方案元数据和损坏隔离；v19 增加 A 关系型状态机及传递信任；v20 增加多维 PlanApplicability；v21 完成旧覆盖语义回填、复合外键、枚举/JSON 约束和执行事件证明字段；v22 为 ScenarioRevision 回填并强制验证快照哈希和前向证明链。
-- Python 安装使用 `requirements.lock` 固定完整传递依赖，再以 `--no-deps` 安装本项目。决策运行时清单绑定该锁；决策代码指纹只覆盖会改变求解、验证、旅行或经营分析结果的模块。
+- Python 安装使用 `requirements.lock` 固定完整传递依赖，再以 `--no-deps` 安装本项目。锁定版本必须同时可由项目声明的最低 Python 3.11 和开发环境 Python 3.13 解析；决策运行时清单绑定该锁，决策代码指纹只覆盖会改变求解、验证、旅行或经营分析结果的模块。
 - v1 旧方案历史缺少完整业务快照，按已确认的产品决定先生成时间戳备份再重建，当前业务数据保留。
 - 重建前，旧 schedules、plans、artifacts、experiments 和 publication keys 会逐行复制到 quarantine ledger；列表读取遇到损坏记录时跳过坏行并登记，场景、Plan、A、Artifact、ScheduleRun、Candidate、Experiment 和执行事件的关键单项读取返回稳定完整性错误。`GET /api/integrity-issues` 只暴露记录来源和原因，不返回原始业务 payload。
 - 旧 `/schedules` 和同步经营分析接口继续兼容；同步分析接口内部也创建或复用持久 A，不再绕过审计。

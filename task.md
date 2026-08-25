@@ -28,6 +28,7 @@
 - [x] 容量正式 KPI/成本与诊断结果分栏；条件上界不再写入正式反事实字段；完整未分配 disposition 的零路线方案不再触发 `EMPTY_CANDIDATE`。
 - [x] PlanApplicability 多轴字段成为读取时唯一事实，`coverage_status` 只保留为兼容 SQL 投影；新建工单和技师 code 限制为 URL 安全字符，存量 ID 保持可读。
 - [x] 增加完整 Python 传递依赖锁，决策代码指纹缩小到实际决策模块，旧 v1 CAS 写接口声明 2027-03-31 Sunset。
+- [x] GitHub 的 Python 3.11 门禁发现 `numpy==2.5.2` 只支持 Python 3.12+；锁文件收敛到 3.11–3.13 共用的 `numpy==2.4.6`，并通过目标平台解析、全新 Python 3.13 环境安装、`pip check` 和 254 项后端测试。
 - [x] Mutation smoke 从 4 个扩展为 8 个定向 mutant，新增执行事件、活动 V CAS、修订证明、零随机投影、唯一计数和当前需求界面回归。
 - [ ] 完成最终 lint、类型检查、依赖审计、全量后端/前端/E2E、Demo、Benchmark 和 GitHub Actions 验证。
 

@@ -29,7 +29,7 @@
 | P1-09 | 成立，已修复 | 采用审查稿的“安全前缀继续执行”：只禁用 `invalid_assignment_ids`，文案不再声称整份 Plan 都不可执行。 |
 | P1-10 | 成立，未伪装完成 | SQLite 关闭外键并重建关系表需要事务边界；当前每次升级先做不可覆盖的时间戳备份，重建脚本自身使用 `BEGIN IMMEDIATE`。完整维护模式、dry-run 和崩溃注入属于独立迁移 CLI，不能在本轮用删除 `commit` 冒充原子迁移。 |
 | P1-11 | 与已确认产品决策一致，不作为缺陷 | v1 历史没有可恢复业务快照。项目此前明确选择“备份后清空旧方案编号”，迁移同时保存原数据库和 orphan 行；改为保留不可验证的正式历史会违背已确认默认项。 |
-| P1-12 | 成立，已修复 | 新增解析后完整 Python 传递依赖锁；setup/CI 先安装 lock，再 `--no-deps` 安装项目。RuntimeManifest 绑定 lock 内容。 |
+| P1-12 | 成立，已修复 | 新增解析后完整 Python 传递依赖锁；setup/CI 先安装 lock，再 `--no-deps` 安装项目。GitHub 的最低版本门禁进一步发现并修正了 Python 3.12+ 的 NumPy 锁定值，当前锁可由 Python 3.11–3.13 共用。RuntimeManifest 绑定 lock 内容。 |
 | P1-13 | 成立，已修复 | Decision build SHA 只覆盖 decision、scheduler、verification、travel、planning、hashing、models、timeutils 和 provenance；API 文案或报告改动不阻断精确 retry。 |
 | P1-14 | 部分成立 | OpenAPI snapshot 和生成类型继续由 CI 防漂移，WorkOrder、Technician、ExecutionEvent 等核心契约已直接引用生成类型。把所有 UI view model 一次改成生成结构会把展示状态与线格式耦合，当前不为追求“零手写类型”进行高风险机械重写。 |
 | P1-15 | 成立，已修复 | 新建 WorkOrder/Technician 的外部 code 改为 URL 安全 ASCII：首字符字母或数字，后续允许字母、数字、`.`、`_`、`~`、`-`；存量领域模型继续读取旧 ID，避免升级后丢失本地数据。 |
