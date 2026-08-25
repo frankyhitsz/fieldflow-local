@@ -23,6 +23,7 @@ from .models import (
     AnalysisReservationManifest,
     AttestationRequirement,
     CapacityCounterfactualArtifact,
+    CurrentWorkOrderDisposition,
     DecisionAnalysisArtifact,
     DecisionAnalysisContext,
     DecisionAnalysisRun,
@@ -31,16 +32,23 @@ from .models import (
     ExecutionSourceContext,
     FieldImpact,
     FrozenBookingIdentity,
+    OperationalMetrics,
+    OperationalWorkOrderView,
     PlanApplicability,
     PlanCoverageStatus,
+    PlanningContext,
+    PlanningReservation,
     PlanUseCase,
     PlanVersion,
     PublicationPlanningContext,
     PublicationVerificationArtifact,
     ReattestationMode,
+    RevisionChainStatus,
+    RevisionProofOrigin,
     RiskComparisonRun,
     RiskTrialOutcomeArtifact,
     RouteEntryContext,
+    ScenarioOperationalView,
     ScenarioRevision,
     ScheduleArtifact,
     ScheduleCandidate,
@@ -67,7 +75,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 _INTEGRITY_RANK = {
     AnalysisIntegrityStatus.failed: 0,
@@ -179,10 +187,20 @@ class PublicationConflict(RuntimeError):
 
 
 class DecisionAnalysisIntegrityError(RuntimeError):
-    def __init__(self, message: str, *, record_id: str, record_type: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        record_id: str,
+        record_type: str,
+        code: str = "RECORD_INTEGRITY_FAILED",
+        details: dict | None = None,
+    ):
         super().__init__(message)
         self.record_id = record_id
         self.record_type = record_type
+        self.code = code
+        self.details = details or {}
 
 
 def _now() -> str:
@@ -204,9 +222,33 @@ def _execution_event_content_hash(event: WorkOrderExecutionEvent) -> str:
 def _scenario_revision_hash(revision: ScenarioRevision) -> str:
     return content_hash(
         revision.model_dump(
-            exclude={"revision_hash", "self_integrity", "effective_integrity"},
+            exclude={
+                "revision_hash",
+                "proof_origin",
+                "chain_status",
+                "self_integrity",
+                "effective_integrity",
+            },
             mode="json",
         )
+    )
+
+
+def _planning_reservation_hash(reservation: PlanningReservation) -> str:
+    return content_hash(reservation.model_dump(exclude={"reservation_hash"}, mode="json"))
+
+
+def _plan_applicability_hash(
+    plan_version_id: str,
+    scenario_id: str,
+    applicability: PlanApplicability,
+) -> str:
+    return content_hash(
+        {
+            "plan_version_id": plan_version_id,
+            "scenario_id": scenario_id,
+            "applicability": applicability.model_dump(exclude={"projection_hash"}, mode="json"),
+        }
     )
 
 
@@ -504,7 +546,9 @@ class Store:
                    s.updated_at
             FROM scenarios s;
             INSERT INTO schedules_new SELECT s.* FROM schedules s WHERE EXISTS (SELECT 1 FROM scenarios x WHERE x.id=s.scenario_id);
-            INSERT INTO scenario_revisions_new SELECT r.* FROM scenario_revisions r WHERE EXISTS (SELECT 1 FROM scenarios x WHERE x.id=r.scenario_id);
+            INSERT INTO scenario_revisions_new(id, scenario_id, number, reason, payload, created_at)
+            SELECT r.id, r.scenario_id, r.number, r.reason, r.payload, r.created_at
+            FROM scenario_revisions r WHERE EXISTS (SELECT 1 FROM scenarios x WHERE x.id=r.scenario_id);
             INSERT INTO plan_versions_new(id, scenario_id, number, payload, created_at)
             SELECT p.id, p.scenario_id, p.number, p.payload, p.created_at
             FROM plan_versions p WHERE EXISTS (SELECT 1 FROM scenarios x WHERE x.id=p.scenario_id);
@@ -548,6 +592,53 @@ class Store:
         if violations:
             raise sqlite3.IntegrityError(f"foreign key check failed after migration: {violations[:3]}")
 
+    def _rehash_migrated_revision_chains(self, con: sqlite3.Connection, *, reason: str) -> None:
+        """Rebuild proofs only for a contiguous, relationally valid legacy chain."""
+        for scenario_row in con.execute(
+            "SELECT DISTINCT scenario_id FROM scenario_revisions ORDER BY scenario_id"
+        ).fetchall():
+            previous_hash: str | None = None
+            expected_number = 0
+            ancestor_invalid = False
+            for revision_row in con.execute(
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number, created_at, id",
+                (scenario_row["scenario_id"],),
+            ).fetchall():
+                try:
+                    revision = ScenarioRevision.model_validate_json(revision_row["payload"])
+                    relation_valid = (
+                        not ancestor_invalid
+                        and revision.id == revision_row["id"]
+                        and revision.scenario_id == revision_row["scenario_id"]
+                        and revision.number == revision_row["number"]
+                        and revision.number == expected_number
+                        and revision.reason == revision_row["reason"]
+                        and revision.created_at == revision_row["created_at"]
+                        and revision.scenario.id == revision.scenario_id
+                        and revision.scenario.revision == revision.number
+                    )
+                    if not relation_valid:
+                        raise ValueError("legacy revision identity or continuity mismatch")
+                except (TypeError, ValueError):
+                    ancestor_invalid = True
+                    self._record_read_isolation(
+                        con,
+                        "scenario_revisions",
+                        str(revision_row["id"]),
+                        str(revision_row["payload"]),
+                        reason,
+                    )
+                    continue
+                revision.scenario_snapshot_hash = content_hash(revision.scenario)
+                revision.previous_revision_hash = previous_hash
+                revision.revision_hash = _scenario_revision_hash(revision)
+                con.execute(
+                    "UPDATE scenario_revisions SET payload=? WHERE id=?",
+                    (revision.model_dump_json(), revision.id),
+                )
+                previous_hash = revision.revision_hash
+                expected_number += 1
+
     def _init(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as con:
@@ -565,6 +656,10 @@ class Store:
                     id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     active_plan_version_id TEXT,
+                    current_snapshot_hash TEXT NOT NULL DEFAULT '',
+                    latest_revision_number INTEGER NOT NULL DEFAULT -1,
+                    latest_revision_hash TEXT NOT NULL DEFAULT '',
+                    proof_origin TEXT NOT NULL DEFAULT 'NATIVE_ATTESTED' CHECK(proof_origin IN ('NATIVE_ATTESTED', 'MIGRATION_BACKFILLED', 'LEGACY_UNATTESTED')),
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(active_plan_version_id) REFERENCES plan_versions(id) DEFERRABLE INITIALLY DEFERRED
                 );
@@ -583,6 +678,8 @@ class Store:
                     number INTEGER NOT NULL,
                     reason TEXT NOT NULL,
                     payload TEXT NOT NULL,
+                    proof_origin TEXT NOT NULL DEFAULT 'NATIVE_ATTESTED' CHECK(proof_origin IN ('NATIVE_ATTESTED', 'MIGRATION_BACKFILLED', 'LEGACY_UNATTESTED')),
+                    chain_status TEXT NOT NULL DEFAULT 'VERIFIED' CHECK(chain_status IN ('VERIFIED', 'ROOT_INVALID', 'GAP_DETECTED', 'ANCESTOR_INVALID')),
                     created_at TEXT NOT NULL,
                     UNIQUE(scenario_id, number),
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
@@ -610,6 +707,10 @@ class Store:
                     commercial_current INTEGER NOT NULL DEFAULT 1 CHECK(commercial_current IN (0, 1)),
                     reoptimization_opportunity INTEGER NOT NULL DEFAULT 0 CHECK(reoptimization_opportunity IN (0, 1)),
                     invalid_assignment_ids TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(invalid_assignment_ids) AND json_type(invalid_assignment_ids)='array'),
+                    evaluated_scenario_revision INTEGER,
+                    evaluated_scenario_snapshot_hash TEXT NOT NULL DEFAULT '',
+                    reducer_policy_version TEXT NOT NULL DEFAULT 'FIELD_SERVICE_PLAN_APPLICABILITY_V2',
+                    projection_hash TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(plan_version_id, scenario_id) REFERENCES plan_versions(id, scenario_id) ON DELETE CASCADE,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
@@ -733,6 +834,14 @@ class Store:
                     FOREIGN KEY(run_id) REFERENCES schedule_runs(id) ON DELETE CASCADE,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS planning_reservations (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    reservation_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS command_keys (
                     namespace TEXT NOT NULL,
                     key TEXT NOT NULL,
@@ -815,7 +924,7 @@ class Store:
                             event_row["rowid"],
                         ),
                     )
-            if version < 22:
+            if 10 <= version < 22:
                 for scenario_row in con.execute(
                     "SELECT DISTINCT scenario_id FROM scenario_revisions ORDER BY scenario_id"
                 ).fetchall():
@@ -854,6 +963,170 @@ class Store:
                             (revision.model_dump_json(), revision.id),
                         )
                         previous_hash = revision.revision_hash
+            # v21 already has the constrained applicability table, so its v23
+            # proof backfill can run before the legacy v21 repair below.
+            if 21 <= version < 23:
+                scenario_columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(scenarios)")}
+                for column, definition in {
+                    "current_snapshot_hash": "TEXT NOT NULL DEFAULT ''",
+                    "latest_revision_number": "INTEGER NOT NULL DEFAULT -1",
+                    "latest_revision_hash": "TEXT NOT NULL DEFAULT ''",
+                    "proof_origin": (
+                        "TEXT NOT NULL DEFAULT 'MIGRATION_BACKFILLED' "
+                        "CHECK(proof_origin IN ('NATIVE_ATTESTED', 'MIGRATION_BACKFILLED', 'LEGACY_UNATTESTED'))"
+                    ),
+                }.items():
+                    if column not in scenario_columns:
+                        con.execute(f"ALTER TABLE scenarios ADD COLUMN {column} {definition}")
+                revision_columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(scenario_revisions)")}
+                for column, definition in {
+                    "proof_origin": (
+                        "TEXT NOT NULL DEFAULT 'MIGRATION_BACKFILLED' "
+                        "CHECK(proof_origin IN ('NATIVE_ATTESTED', 'MIGRATION_BACKFILLED', 'LEGACY_UNATTESTED'))"
+                    ),
+                    "chain_status": (
+                        "TEXT NOT NULL DEFAULT 'VERIFIED' "
+                        "CHECK(chain_status IN ('VERIFIED', 'ROOT_INVALID', 'GAP_DETECTED', 'ANCESTOR_INVALID'))"
+                    ),
+                }.items():
+                    if column not in revision_columns:
+                        con.execute(f"ALTER TABLE scenario_revisions ADD COLUMN {column} {definition}")
+                applicability_columns = {
+                    str(row["name"]) for row in con.execute("PRAGMA table_info(plan_applicability)")
+                }
+                for column, definition in {
+                    "evaluated_scenario_revision": "INTEGER",
+                    "evaluated_scenario_snapshot_hash": "TEXT NOT NULL DEFAULT ''",
+                    "reducer_policy_version": ("TEXT NOT NULL DEFAULT 'FIELD_SERVICE_PLAN_APPLICABILITY_V2'"),
+                    "projection_hash": "TEXT NOT NULL DEFAULT ''",
+                }.items():
+                    if column not in applicability_columns:
+                        con.execute(f"ALTER TABLE plan_applicability ADD COLUMN {column} {definition}")
+                con.execute("UPDATE scenario_revisions SET proof_origin='MIGRATION_BACKFILLED'")
+                for scenario_row in con.execute("SELECT id, payload FROM scenarios ORDER BY id").fetchall():
+                    scenario_id = str(scenario_row["id"])
+                    previous_hash: str | None = None
+                    expected_number = 0
+                    ancestor_invalid = False
+                    latest_verified: ScenarioRevision | None = None
+                    for revision_row in con.execute(
+                        "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number, created_at, id",
+                        (scenario_id,),
+                    ).fetchall():
+                        status = RevisionChainStatus.verified
+                        revision: ScenarioRevision | None = None
+                        try:
+                            revision = ScenarioRevision.model_validate_json(revision_row["payload"])
+                            relation_valid = (
+                                revision.id == revision_row["id"]
+                                and revision.scenario_id == revision_row["scenario_id"]
+                                and revision.number == revision_row["number"]
+                                and revision.reason == revision_row["reason"]
+                                and revision.created_at == revision_row["created_at"]
+                                and revision.scenario.id == revision.scenario_id
+                                and revision.scenario.revision == revision.number
+                                and revision.scenario_snapshot_hash == content_hash(revision.scenario)
+                                and revision.revision_hash == _scenario_revision_hash(revision)
+                                and revision.previous_revision_hash == previous_hash
+                            )
+                            if ancestor_invalid:
+                                status = RevisionChainStatus.ancestor_invalid
+                            elif revision.number != expected_number:
+                                status = (
+                                    RevisionChainStatus.root_invalid
+                                    if expected_number == 0
+                                    else RevisionChainStatus.gap_detected
+                                )
+                            elif not relation_valid:
+                                status = (
+                                    RevisionChainStatus.root_invalid
+                                    if expected_number == 0
+                                    else RevisionChainStatus.ancestor_invalid
+                                )
+                        except (TypeError, ValueError):
+                            status = (
+                                RevisionChainStatus.root_invalid
+                                if expected_number == 0
+                                else RevisionChainStatus.ancestor_invalid
+                            )
+                        if status is RevisionChainStatus.verified and revision is not None:
+                            revision.proof_origin = RevisionProofOrigin.migration_backfilled
+                            revision.chain_status = status
+                            con.execute(
+                                "UPDATE scenario_revisions SET payload=?, proof_origin=?, chain_status=? WHERE id=?",
+                                (
+                                    revision.model_dump_json(),
+                                    revision.proof_origin.value,
+                                    status.value,
+                                    revision.id,
+                                ),
+                            )
+                            latest_verified = revision
+                            previous_hash = revision.revision_hash
+                            expected_number += 1
+                        else:
+                            ancestor_invalid = True
+                            con.execute(
+                                "UPDATE scenario_revisions SET proof_origin='MIGRATION_BACKFILLED', chain_status=? WHERE id=?",
+                                (status.value, revision_row["id"]),
+                            )
+                            self._record_read_isolation(
+                                con,
+                                "scenario_revisions",
+                                str(revision_row["id"]),
+                                str(revision_row["payload"]),
+                                f"v23 migration: {status.value.lower()}",
+                            )
+                    if latest_verified is None:
+                        con.execute(
+                            "UPDATE scenarios SET current_snapshot_hash='', latest_revision_number=-1, "
+                            "latest_revision_hash='', proof_origin='MIGRATION_BACKFILLED' WHERE id=?",
+                            (scenario_id,),
+                        )
+                    else:
+                        con.execute(
+                            "UPDATE scenarios SET current_snapshot_hash=?, latest_revision_number=?, "
+                            "latest_revision_hash=?, proof_origin='MIGRATION_BACKFILLED' WHERE id=?",
+                            (
+                                latest_verified.scenario_snapshot_hash,
+                                latest_verified.number,
+                                latest_verified.revision_hash,
+                                scenario_id,
+                            ),
+                        )
+                for applicability_row in con.execute("SELECT * FROM plan_applicability").fetchall():
+                    head = con.execute(
+                        "SELECT latest_revision_number, current_snapshot_hash FROM scenarios WHERE id=?",
+                        (applicability_row["scenario_id"],),
+                    ).fetchone()
+                    applicability = PlanApplicability(
+                        route_executable=bool(applicability_row["route_executable"]),
+                        coverage_complete=bool(applicability_row["coverage_complete"]),
+                        planning_current=bool(applicability_row["planning_current"]),
+                        metrics_current=bool(applicability_row["metrics_current"]),
+                        commercial_current=bool(applicability_row["commercial_current"]),
+                        reoptimization_opportunity=bool(applicability_row["reoptimization_opportunity"]),
+                        invalid_assignment_ids=json.loads(applicability_row["invalid_assignment_ids"]),
+                        evaluated_scenario_revision=(int(head["latest_revision_number"]) if head else None),
+                        evaluated_scenario_snapshot_hash=(str(head["current_snapshot_hash"]) if head else ""),
+                    )
+                    applicability.projection_hash = _plan_applicability_hash(
+                        str(applicability_row["plan_version_id"]),
+                        str(applicability_row["scenario_id"]),
+                        applicability,
+                    )
+                    con.execute(
+                        "UPDATE plan_applicability SET evaluated_scenario_revision=?, "
+                        "evaluated_scenario_snapshot_hash=?, reducer_policy_version=?, projection_hash=? "
+                        "WHERE plan_version_id=?",
+                        (
+                            applicability.evaluated_scenario_revision,
+                            applicability.evaluated_scenario_snapshot_hash,
+                            applicability.reducer_policy_version,
+                            applicability.projection_hash,
+                            applicability_row["plan_version_id"],
+                        ),
+                    )
             command_columns = {row[1] for row in con.execute("PRAGMA table_info(command_keys)")}
             if "publication_key" not in command_columns:
                 con.execute("ALTER TABLE command_keys ADD COLUMN publication_key TEXT")
@@ -1122,6 +1395,16 @@ class Store:
                         "SELECT COALESCE(MAX(number), -1) FROM scenario_revisions WHERE scenario_id=?",
                         (scenario.id,),
                     ).fetchone()[0]
+                    if int(latest_revision) < 0:
+                        original = ScheduleScenario.model_validate_json(before)
+                        if original.revision != 0:
+                            raise DecisionAnalysisIntegrityError(
+                                "旧数据库缺少 D000，不能为已有非零修订伪造链根",
+                                record_id=scenario.id,
+                                record_type="SCENARIO_REVISION",
+                            )
+                        self._insert_revision(con, original, "v8 语义升级前快照")
+                        latest_revision = 0
                     scenario.revision = max(scenario.revision, int(latest_revision)) + 1
                     active_plan_id = scenario_row["active_plan_version_id"]
                     has_execution = bool(
@@ -1164,6 +1447,13 @@ class Store:
                                 f"UPDATE {table} SET payload=? WHERE rowid=?",
                                 (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), row["rowid"]),
                             )
+                # v22 proof backfill must happen after v10 has normalized every
+                # current and historical monetary snapshot. Otherwise its
+                # hashes describe the pre-normalization payload.
+                self._rehash_migrated_revision_chains(
+                    con,
+                    reason="v10 migration: invalid revision chain during post-normalization proof backfill",
+                )
             if version < 12:
                 applicability_columns = {
                     str(row["name"]) for row in con.execute("PRAGMA table_info(plan_applicability)").fetchall()
@@ -1319,6 +1609,170 @@ class Store:
                 violations = con.execute("PRAGMA foreign_key_check").fetchall()
                 if violations:
                     raise sqlite3.IntegrityError(f"foreign key check failed after v21 migration: {violations[:3]}")
+            # Databases older than v21 must first rebuild and sanitize the
+            # applicability table; only then is it safe to calculate proofs.
+            if version < 21:
+                scenario_columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(scenarios)")}
+                for column, definition in {
+                    "current_snapshot_hash": "TEXT NOT NULL DEFAULT ''",
+                    "latest_revision_number": "INTEGER NOT NULL DEFAULT -1",
+                    "latest_revision_hash": "TEXT NOT NULL DEFAULT ''",
+                    "proof_origin": (
+                        "TEXT NOT NULL DEFAULT 'MIGRATION_BACKFILLED' "
+                        "CHECK(proof_origin IN ('NATIVE_ATTESTED', 'MIGRATION_BACKFILLED', 'LEGACY_UNATTESTED'))"
+                    ),
+                }.items():
+                    if column not in scenario_columns:
+                        con.execute(f"ALTER TABLE scenarios ADD COLUMN {column} {definition}")
+                revision_columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(scenario_revisions)")}
+                for column, definition in {
+                    "proof_origin": (
+                        "TEXT NOT NULL DEFAULT 'MIGRATION_BACKFILLED' "
+                        "CHECK(proof_origin IN ('NATIVE_ATTESTED', 'MIGRATION_BACKFILLED', 'LEGACY_UNATTESTED'))"
+                    ),
+                    "chain_status": (
+                        "TEXT NOT NULL DEFAULT 'VERIFIED' "
+                        "CHECK(chain_status IN ('VERIFIED', 'ROOT_INVALID', 'GAP_DETECTED', 'ANCESTOR_INVALID'))"
+                    ),
+                }.items():
+                    if column not in revision_columns:
+                        con.execute(f"ALTER TABLE scenario_revisions ADD COLUMN {column} {definition}")
+                con.execute("UPDATE scenario_revisions SET proof_origin='MIGRATION_BACKFILLED'")
+                for scenario_row in con.execute("SELECT id, payload FROM scenarios ORDER BY id").fetchall():
+                    scenario_id = str(scenario_row["id"])
+                    previous_hash: str | None = None
+                    expected_number = 0
+                    ancestor_invalid = False
+                    latest_verified: ScenarioRevision | None = None
+                    for revision_row in con.execute(
+                        "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number, created_at, id",
+                        (scenario_id,),
+                    ).fetchall():
+                        status = RevisionChainStatus.verified
+                        revision: ScenarioRevision | None = None
+                        try:
+                            revision = ScenarioRevision.model_validate_json(revision_row["payload"])
+                            relation_valid = (
+                                revision.id == revision_row["id"]
+                                and revision.scenario_id == revision_row["scenario_id"]
+                                and revision.number == revision_row["number"]
+                                and revision.reason == revision_row["reason"]
+                                and revision.created_at == revision_row["created_at"]
+                                and revision.scenario.id == revision.scenario_id
+                                and revision.scenario.revision == revision.number
+                                and revision.scenario_snapshot_hash == content_hash(revision.scenario)
+                                and revision.revision_hash == _scenario_revision_hash(revision)
+                                and revision.previous_revision_hash == previous_hash
+                            )
+                            if ancestor_invalid:
+                                status = RevisionChainStatus.ancestor_invalid
+                            elif revision.number != expected_number:
+                                status = (
+                                    RevisionChainStatus.root_invalid
+                                    if expected_number == 0
+                                    else RevisionChainStatus.gap_detected
+                                )
+                            elif not relation_valid:
+                                status = (
+                                    RevisionChainStatus.root_invalid
+                                    if expected_number == 0
+                                    else RevisionChainStatus.ancestor_invalid
+                                )
+                        except (TypeError, ValueError):
+                            status = (
+                                RevisionChainStatus.root_invalid
+                                if expected_number == 0
+                                else RevisionChainStatus.ancestor_invalid
+                            )
+                        if status is RevisionChainStatus.verified and revision is not None:
+                            revision.proof_origin = RevisionProofOrigin.migration_backfilled
+                            revision.chain_status = status
+                            con.execute(
+                                "UPDATE scenario_revisions SET payload=?, proof_origin=?, chain_status=? WHERE id=?",
+                                (
+                                    revision.model_dump_json(),
+                                    revision.proof_origin.value,
+                                    status.value,
+                                    revision.id,
+                                ),
+                            )
+                            latest_verified = revision
+                            previous_hash = revision.revision_hash
+                            expected_number += 1
+                        else:
+                            ancestor_invalid = True
+                            con.execute(
+                                "UPDATE scenario_revisions SET proof_origin='MIGRATION_BACKFILLED', chain_status=? WHERE id=?",
+                                (status.value, revision_row["id"]),
+                            )
+                            self._record_read_isolation(
+                                con,
+                                "scenario_revisions",
+                                str(revision_row["id"]),
+                                str(revision_row["payload"]),
+                                f"v23 migration: {status.value.lower()}",
+                            )
+                    if latest_verified is None:
+                        con.execute(
+                            "UPDATE scenarios SET current_snapshot_hash='', latest_revision_number=-1, "
+                            "latest_revision_hash='', proof_origin='MIGRATION_BACKFILLED' WHERE id=?",
+                            (scenario_id,),
+                        )
+                    else:
+                        con.execute(
+                            "UPDATE scenarios SET current_snapshot_hash=?, latest_revision_number=?, "
+                            "latest_revision_hash=?, proof_origin='MIGRATION_BACKFILLED' WHERE id=?",
+                            (
+                                latest_verified.scenario_snapshot_hash,
+                                latest_verified.number,
+                                latest_verified.revision_hash,
+                                scenario_id,
+                            ),
+                        )
+                applicability_columns = {
+                    str(row["name"]) for row in con.execute("PRAGMA table_info(plan_applicability)")
+                }
+                for column, definition in {
+                    "evaluated_scenario_revision": "INTEGER",
+                    "evaluated_scenario_snapshot_hash": "TEXT NOT NULL DEFAULT ''",
+                    "reducer_policy_version": ("TEXT NOT NULL DEFAULT 'FIELD_SERVICE_PLAN_APPLICABILITY_V2'"),
+                    "projection_hash": "TEXT NOT NULL DEFAULT ''",
+                }.items():
+                    if column not in applicability_columns:
+                        con.execute(f"ALTER TABLE plan_applicability ADD COLUMN {column} {definition}")
+                for applicability_row in con.execute("SELECT * FROM plan_applicability").fetchall():
+                    head = con.execute(
+                        "SELECT latest_revision_number, current_snapshot_hash FROM scenarios WHERE id=?",
+                        (applicability_row["scenario_id"],),
+                    ).fetchone()
+                    applicability = PlanApplicability(
+                        route_executable=bool(applicability_row["route_executable"]),
+                        coverage_complete=bool(applicability_row["coverage_complete"]),
+                        planning_current=bool(applicability_row["planning_current"]),
+                        metrics_current=bool(applicability_row["metrics_current"]),
+                        commercial_current=bool(applicability_row["commercial_current"]),
+                        reoptimization_opportunity=bool(applicability_row["reoptimization_opportunity"]),
+                        invalid_assignment_ids=json.loads(applicability_row["invalid_assignment_ids"]),
+                        evaluated_scenario_revision=(int(head["latest_revision_number"]) if head else None),
+                        evaluated_scenario_snapshot_hash=(str(head["current_snapshot_hash"]) if head else ""),
+                    )
+                    applicability.projection_hash = _plan_applicability_hash(
+                        str(applicability_row["plan_version_id"]),
+                        str(applicability_row["scenario_id"]),
+                        applicability,
+                    )
+                    con.execute(
+                        "UPDATE plan_applicability SET evaluated_scenario_revision=?, "
+                        "evaluated_scenario_snapshot_hash=?, reducer_policy_version=?, projection_hash=? "
+                        "WHERE plan_version_id=?",
+                        (
+                            applicability.evaluated_scenario_revision,
+                            applicability.evaluated_scenario_snapshot_hash,
+                            applicability.reducer_policy_version,
+                            applicability.projection_hash,
+                            applicability_row["plan_version_id"],
+                        ),
+                    )
             con.execute(
                 """
                 INSERT OR IGNORE INTO plan_metadata(plan_version_id, label, note, tags, updated_at)
@@ -1374,6 +1828,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_candidates_run ON schedule_candidates(run_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_run_unique ON schedule_candidates(run_id);
+                CREATE INDEX IF NOT EXISTS idx_planning_reservations_scenario ON planning_reservations(scenario_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_execution_events_sequence ON work_order_execution_events(scenario_id, sequence);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_sequence_unique ON work_order_execution_events(scenario_id, sequence);
@@ -1563,7 +2018,8 @@ class Store:
                     "INSERT OR IGNORE INTO scenarios(id, payload) VALUES (?, ?)",
                     (scenario.id, scenario.model_dump_json()),
                 )
-                self._insert_revision(con, scenario, "内置场景初始化", ignore=True)
+                if int(con.execute("SELECT changes()").fetchone()[0]) == 1:
+                    self._insert_revision(con, scenario, "内置场景初始化")
 
     def seed_profiles(self) -> None:
         with self._lock, self._connect() as con:
@@ -1576,10 +2032,10 @@ class Store:
     def _scan_execution_status_integrity(self) -> None:
         """Record legacy WorkOrder states that cannot be derived from immutable events."""
         with self._lock, self._connect() as con:
-            for scenario_row in con.execute("SELECT id, payload FROM scenarios").fetchall():
+            for scenario_row in con.execute("SELECT * FROM scenarios").fetchall():
                 try:
-                    scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
-                except (TypeError, ValueError):
+                    scenario = self._load_scenario_head_row(con, scenario_row)
+                except DecisionAnalysisIntegrityError:
                     continue
                 event_actions: set[tuple[str, str]] = set()
                 for event_row in con.execute(
@@ -1628,21 +2084,44 @@ class Store:
     def _scan_revision_integrity(self) -> None:
         """Record broken revision proofs without preventing unrelated scenarios from opening."""
         with self._lock, self._connect() as con:
-            scenario_ids = [
-                str(row["scenario_id"])
-                for row in con.execute(
-                    "SELECT DISTINCT scenario_id FROM scenario_revisions ORDER BY scenario_id"
-                ).fetchall()
-            ]
-            for scenario_id in scenario_ids:
+            for scenario_row in con.execute("SELECT * FROM scenarios ORDER BY id").fetchall():
+                scenario_id = str(scenario_row["id"])
                 previous_hash: str | None = None
+                expected_number = 0
+                ancestor_invalid = False
                 for row in con.execute(
                     "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
                     (scenario_id,),
                 ).fetchall():
+                    status = RevisionChainStatus.verified
                     try:
-                        revision = self._load_revision_row(con, row, previous_hash)
-                    except DecisionAnalysisIntegrityError:
+                        if ancestor_invalid:
+                            status = RevisionChainStatus.ancestor_invalid
+                            raise ValueError("ancestor invalid")
+                        if int(row["number"]) != expected_number:
+                            status = (
+                                RevisionChainStatus.root_invalid
+                                if expected_number == 0
+                                else RevisionChainStatus.gap_detected
+                            )
+                            raise ValueError("revision number discontinuity")
+                        revision = self._load_revision_row(
+                            con,
+                            row,
+                            previous_hash,
+                            verify_chain_status=False,
+                        )
+                    except (DecisionAnalysisIntegrityError, ValueError):
+                        if status is RevisionChainStatus.verified:
+                            status = (
+                                RevisionChainStatus.root_invalid
+                                if expected_number == 0
+                                else RevisionChainStatus.ancestor_invalid
+                            )
+                        con.execute(
+                            "UPDATE scenario_revisions SET chain_status=? WHERE id=?",
+                            (status.value, row["id"]),
+                        )
                         self._record_read_isolation(
                             con,
                             "scenario_revisions",
@@ -1650,28 +2129,157 @@ class Store:
                             str(row["payload"]),
                             "startup integrity scan: invalid revision proof",
                         )
-                        previous_hash = None
+                        ancestor_invalid = True
                         continue
+                    con.execute(
+                        "UPDATE scenario_revisions SET chain_status='VERIFIED' WHERE id=?",
+                        (row["id"],),
+                    )
                     previous_hash = revision.revision_hash
+                    expected_number += 1
+                try:
+                    self._load_scenario_head_row(con, scenario_row)
+                except DecisionAnalysisIntegrityError:
+                    self._record_read_isolation(
+                        con,
+                        "scenarios",
+                        scenario_id,
+                        str(scenario_row["payload"]),
+                        "startup integrity scan: scenario head mismatch",
+                    )
 
     @classmethod
     def _insert_revision(
         cls, con: sqlite3.Connection, scenario: ScheduleScenario, reason: str, ignore: bool = False
     ) -> ScenarioRevision:
+        scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario.id,)).fetchone()
+        if not scenario_row:
+            raise DecisionAnalysisIntegrityError(
+                "业务数据聚合不存在，不能写入修订",
+                record_id=scenario.id,
+                record_type="SCENARIO",
+            )
+        # During a pre-v4 relational rebuild the v23 head/proof columns do not
+        # exist yet. Preserve the same D000/continuous-chain invariant using
+        # the revision rows; the v23 migration then materializes the O(1) head.
+        if "latest_revision_number" not in scenario_row.keys():
+            previous_hash: str | None = None
+            head_number = -1
+            existing_at_number: ScenarioRevision | None = None
+            for row in con.execute(
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number, created_at, id",
+                (scenario.id,),
+            ).fetchall():
+                revision = ScenarioRevision.model_validate_json(row["payload"])
+                if (
+                    revision.id != row["id"]
+                    or revision.scenario_id != row["scenario_id"]
+                    or revision.number != row["number"]
+                    or revision.reason != row["reason"]
+                    or revision.created_at != row["created_at"]
+                    or revision.scenario.id != scenario.id
+                    or revision.scenario.revision != revision.number
+                    or revision.number != head_number + 1
+                    or revision.scenario_snapshot_hash != content_hash(revision.scenario)
+                    or revision.previous_revision_hash != previous_hash
+                    or revision.revision_hash != _scenario_revision_hash(revision)
+                ):
+                    raise DecisionAnalysisIntegrityError(
+                        "旧数据库业务修订链不连续或证明不一致",
+                        record_id=str(row["id"]),
+                        record_type="SCENARIO_REVISION",
+                    )
+                head_number = revision.number
+                previous_hash = revision.revision_hash
+                if revision.number == scenario.revision:
+                    existing_at_number = revision
+            if ignore and existing_at_number:
+                if existing_at_number.scenario_snapshot_hash != content_hash(scenario):
+                    raise DecisionAnalysisIntegrityError(
+                        "业务数据聚合与已有修订不一致",
+                        record_id=scenario.id,
+                        record_type="SCENARIO_REVISION",
+                    )
+                return existing_at_number
+            if scenario.revision != head_number + 1:
+                raise DecisionAnalysisIntegrityError(
+                    "业务数据修订号必须从 D000 开始并连续递增",
+                    record_id=scenario.id,
+                    record_type="SCENARIO_REVISION",
+                )
+            revision = ScenarioRevision(
+                id=f"REV-{scenario.id}-{scenario.revision}-{uuid.uuid4().hex[:6]}",
+                scenario_id=scenario.id,
+                number=scenario.revision,
+                reason=reason,
+                scenario=scenario.model_copy(deep=True),
+                created_at=_now(),
+                scenario_snapshot_hash=content_hash(scenario),
+                previous_revision_hash=previous_hash,
+                proof_origin=RevisionProofOrigin.migration_backfilled,
+                chain_status=RevisionChainStatus.verified,
+            )
+            revision.revision_hash = _scenario_revision_hash(revision)
+            verb = "INSERT OR IGNORE" if ignore else "INSERT"
+            con.execute(
+                f"{verb} INTO scenario_revisions(id, scenario_id, number, reason, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    revision.id,
+                    revision.scenario_id,
+                    revision.number,
+                    reason,
+                    revision.model_dump_json(),
+                    revision.created_at,
+                ),
+            )
+            return revision
         if ignore:
             existing_row = con.execute(
-                "SELECT payload FROM scenario_revisions WHERE scenario_id=? AND number=?",
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? AND number=?",
                 (scenario.id, scenario.revision),
             ).fetchone()
             if existing_row:
-                return ScenarioRevision.model_validate_json(existing_row["payload"])
-        previous_rows = con.execute(
-            "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
-            (scenario.id,),
-        ).fetchall()
+                existing = cls._load_revision_row(con, existing_row, None, verify_predecessor=False)
+                if (
+                    int(scenario_row["latest_revision_number"]) != existing.number
+                    or str(scenario_row["latest_revision_hash"]) != existing.revision_hash
+                    or str(scenario_row["current_snapshot_hash"]) != existing.scenario_snapshot_hash
+                    or content_hash(scenario) != existing.scenario_snapshot_hash
+                ):
+                    raise DecisionAnalysisIntegrityError(
+                        "业务数据聚合与已有修订链头不一致",
+                        record_id=scenario.id,
+                        record_type="SCENARIO",
+                    )
+                return existing
+        head_number = int(scenario_row["latest_revision_number"])
+        head_hash = str(scenario_row["latest_revision_hash"])
+        if scenario.revision != head_number + 1:
+            raise DecisionAnalysisIntegrityError(
+                "业务数据修订号必须从 D000 开始并连续递增",
+                record_id=scenario.id,
+                record_type="SCENARIO_REVISION",
+            )
         previous_hash: str | None = None
-        for previous_row in previous_rows:
-            previous = cls._load_revision_row(con, previous_row, previous_hash)
+        if head_number >= 0:
+            previous_row = con.execute(
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? AND number=?",
+                (scenario.id, head_number),
+            ).fetchone()
+            if not previous_row:
+                raise DecisionAnalysisIntegrityError(
+                    "业务数据修订链头记录缺失",
+                    record_id=scenario.id,
+                    record_type="SCENARIO_REVISION",
+                )
+            previous = cls._load_revision_row(con, previous_row, None, verify_predecessor=False)
+            if previous.revision_hash != head_hash:
+                raise DecisionAnalysisIntegrityError(
+                    "业务数据修订链头哈希不一致",
+                    record_id=previous.id,
+                    record_type="SCENARIO_REVISION",
+                )
             previous_hash = previous.revision_hash
         revision = ScenarioRevision(
             id=f"REV-{scenario.id}-{scenario.revision}-{uuid.uuid4().hex[:6]}",
@@ -1682,18 +2290,33 @@ class Store:
             created_at=_now(),
             scenario_snapshot_hash=content_hash(scenario),
             previous_revision_hash=previous_hash,
+            proof_origin=RevisionProofOrigin.native_attested,
+            chain_status=RevisionChainStatus.verified,
         )
         revision.revision_hash = _scenario_revision_hash(revision)
         verb = "INSERT OR IGNORE" if ignore else "INSERT"
         con.execute(
-            f"{verb} INTO scenario_revisions(id, scenario_id, number, reason, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            f"{verb} INTO scenario_revisions(id, scenario_id, number, reason, payload, proof_origin, chain_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 revision.id,
                 revision.scenario_id,
                 revision.number,
                 reason,
                 revision.model_dump_json(),
+                revision.proof_origin.value,
+                revision.chain_status.value,
                 revision.created_at,
+            ),
+        )
+        con.execute(
+            "UPDATE scenarios SET current_snapshot_hash=?, latest_revision_number=?, latest_revision_hash=?, "
+            "proof_origin=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (
+                revision.scenario_snapshot_hash,
+                revision.number,
+                revision.revision_hash,
+                revision.proof_origin.value,
+                scenario.id,
             ),
         )
         return revision
@@ -1706,10 +2329,18 @@ class Store:
         expected_previous_hash: str | None,
         *,
         verify_predecessor: bool = True,
+        verify_chain_status: bool = True,
     ) -> ScenarioRevision:
         del cls, con
         try:
             revision = ScenarioRevision.model_validate_json(row["payload"])
+            row_keys = set(row.keys())
+            proof_origin = RevisionProofOrigin(
+                row["proof_origin"] if "proof_origin" in row_keys else RevisionProofOrigin.migration_backfilled
+            )
+            chain_status = RevisionChainStatus(
+                row["chain_status"] if "chain_status" in row_keys else RevisionChainStatus.verified
+            )
             relation_valid = (
                 revision.id == row["id"]
                 and revision.scenario_id == row["scenario_id"]
@@ -1721,12 +2352,15 @@ class Store:
             if (
                 not relation_valid
                 or not chain_valid
+                or (verify_chain_status and chain_status is not RevisionChainStatus.verified)
                 or revision.scenario.id != revision.scenario_id
                 or revision.scenario.revision != revision.number
                 or revision.scenario_snapshot_hash != content_hash(revision.scenario)
                 or revision.revision_hash != _scenario_revision_hash(revision)
             ):
                 raise ValueError("scenario revision proof mismatch")
+            revision.proof_origin = proof_origin
+            revision.chain_status = chain_status
             revision.self_integrity = AnalysisIntegrityStatus.verified
             revision.effective_integrity = AnalysisIntegrityStatus.verified
             return revision
@@ -1735,6 +2369,48 @@ class Store:
                 "业务数据修订记录完整性校验失败",
                 record_id=str(row["id"]),
                 record_type="SCENARIO_REVISION",
+            ) from error
+
+    @classmethod
+    def _load_scenario_head_row(cls, con: sqlite3.Connection, row: sqlite3.Row) -> ScheduleScenario:
+        try:
+            scenario = ScheduleScenario.model_validate_json(row["payload"])
+            if scenario.id != str(row["id"]):
+                raise ValueError("scenario relational identity mismatch")
+            head_number = int(row["latest_revision_number"])
+            head_hash = str(row["latest_revision_hash"])
+            snapshot_hash = str(row["current_snapshot_hash"])
+            if head_number < 0 or not head_hash or not snapshot_hash:
+                raise ValueError("scenario revision head missing")
+            latest_row = con.execute(
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number DESC LIMIT 1",
+                (scenario.id,),
+            ).fetchone()
+            if not latest_row or int(latest_row["number"]) != head_number:
+                raise ValueError("scenario latest revision mismatch")
+            latest = cls._load_revision_row(con, latest_row, None, verify_predecessor=False)
+            if (
+                scenario.revision != head_number
+                or content_hash(scenario) != snapshot_hash
+                or latest.revision_hash != head_hash
+                or latest.scenario_snapshot_hash != snapshot_hash
+                or content_hash(latest.scenario) != snapshot_hash
+            ):
+                raise ValueError("scenario head proof mismatch")
+            return scenario
+        except DecisionAnalysisIntegrityError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "当前业务数据与修订链头不一致",
+                record_id=str(row["id"]),
+                record_type="SCENARIO",
+                code="SCENARIO_HEAD_INTEGRITY_FAILED",
+                details={
+                    "current_revision": (
+                        int(row["latest_revision_number"]) if "latest_revision_number" in set(row.keys()) else None
+                    )
+                },
             ) from error
 
     @staticmethod
@@ -1746,6 +2422,7 @@ class Store:
         active: bool | None = None,
         coverage_status: PlanCoverageStatus | None = None,
         applicability: PlanApplicability | None = None,
+        evaluated_scenario: ScheduleScenario | None = None,
     ) -> None:
         existing = con.execute(
             "SELECT * FROM plan_applicability WHERE plan_version_id=?",
@@ -1762,6 +2439,10 @@ class Store:
                     commercial_current=bool(existing["commercial_current"]),
                     reoptimization_opportunity=bool(existing["reoptimization_opportunity"]),
                     invalid_assignment_ids=json.loads(existing["invalid_assignment_ids"]),
+                    evaluated_scenario_revision=existing["evaluated_scenario_revision"],
+                    evaluated_scenario_snapshot_hash=str(existing["evaluated_scenario_snapshot_hash"]),
+                    reducer_policy_version=str(existing["reducer_policy_version"]),
+                    projection_hash=str(existing["projection_hash"]),
                 )
             except (TypeError, ValueError, json.JSONDecodeError):
                 applicability = applicability_from_legacy_status(PlanCoverageStatus.stale_data_changed)
@@ -1778,15 +2459,30 @@ class Store:
                 applicability.metrics_current = False
                 if not existing:
                     applicability.route_executable = legacy_projection.route_executable
+        if evaluated_scenario is None:
+            scenario_row = con.execute("SELECT payload FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
+            if not scenario_row:
+                raise DecisionAnalysisIntegrityError(
+                    "方案适用性引用的当前业务数据不存在",
+                    record_id=plan_version_id,
+                    record_type="PLAN_APPLICABILITY",
+                )
+            evaluated_scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+        applicability.evaluated_scenario_revision = evaluated_scenario.revision
+        applicability.evaluated_scenario_snapshot_hash = content_hash(evaluated_scenario)
+        applicability.reducer_policy_version = "FIELD_SERVICE_PLAN_APPLICABILITY_V2"
+        applicability.projection_hash = _plan_applicability_hash(plan_version_id, scenario_id, applicability)
         resolved_coverage = coverage_status_from_applicability(applicability).value
         con.execute(
             """
             INSERT INTO plan_applicability(
                 plan_version_id, scenario_id, active, coverage_status,
                 route_executable, coverage_complete, planning_current, metrics_current,
-                commercial_current, reoptimization_opportunity, invalid_assignment_ids, updated_at
+                commercial_current, reoptimization_opportunity, invalid_assignment_ids,
+                evaluated_scenario_revision, evaluated_scenario_snapshot_hash,
+                reducer_policy_version, projection_hash, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(plan_version_id) DO UPDATE SET
                 active=excluded.active,
                 coverage_status=excluded.coverage_status,
@@ -1797,6 +2493,10 @@ class Store:
                 commercial_current=excluded.commercial_current,
                 reoptimization_opportunity=excluded.reoptimization_opportunity,
                 invalid_assignment_ids=excluded.invalid_assignment_ids,
+                evaluated_scenario_revision=excluded.evaluated_scenario_revision,
+                evaluated_scenario_snapshot_hash=excluded.evaluated_scenario_snapshot_hash,
+                reducer_policy_version=excluded.reducer_policy_version,
+                projection_hash=excluded.projection_hash,
                 updated_at=excluded.updated_at
             """,
             (
@@ -1811,6 +2511,10 @@ class Store:
                 int(applicability.commercial_current),
                 int(applicability.reoptimization_opportunity),
                 json.dumps(applicability.invalid_assignment_ids, ensure_ascii=False),
+                applicability.evaluated_scenario_revision,
+                applicability.evaluated_scenario_snapshot_hash,
+                applicability.reducer_policy_version,
+                applicability.projection_hash,
                 _now(),
             ),
         )
@@ -1834,7 +2538,27 @@ class Store:
                     commercial_current=bool(row["commercial_current"]),
                     reoptimization_opportunity=bool(row["reoptimization_opportunity"]),
                     invalid_assignment_ids=json.loads(row["invalid_assignment_ids"]),
+                    evaluated_scenario_revision=row["evaluated_scenario_revision"],
+                    evaluated_scenario_snapshot_hash=str(row["evaluated_scenario_snapshot_hash"]),
+                    reducer_policy_version=str(row["reducer_policy_version"]),
+                    projection_hash=str(row["projection_hash"]),
                 )
+                if plan.applicability.projection_hash != _plan_applicability_hash(
+                    plan.id, plan.scenario_id, plan.applicability
+                ):
+                    raise ValueError("applicability projection hash mismatch")
+                if plan.active:
+                    scenario_row = con.execute(
+                        "SELECT current_snapshot_hash, latest_revision_number FROM scenarios WHERE id=?",
+                        (plan.scenario_id,),
+                    ).fetchone()
+                    if (
+                        not scenario_row
+                        or plan.applicability.evaluated_scenario_revision != int(scenario_row["latest_revision_number"])
+                        or plan.applicability.evaluated_scenario_snapshot_hash
+                        != str(scenario_row["current_snapshot_hash"])
+                    ):
+                        raise ValueError("active applicability evaluated against stale scenario")
                 # coverage_status is a compatibility projection for older SQL
                 # readers. The multi-axis applicability record is authoritative.
                 plan.coverage_status = coverage_status_from_applicability(plan.applicability)
@@ -1987,11 +2711,11 @@ class Store:
         scenarios: list[ScheduleScenario] = []
         warnings: list[dict[str, str]] = []
         with self._lock, self._connect() as con:
-            rows = con.execute("SELECT id, payload FROM scenarios ORDER BY id").fetchall()
+            rows = con.execute("SELECT * FROM scenarios ORDER BY id").fetchall()
             for row in rows:
                 try:
-                    scenarios.append(ScheduleScenario.model_validate_json(row["payload"]))
-                except (TypeError, ValueError) as error:
+                    scenarios.append(self._load_scenario_head_row(con, row))
+                except DecisionAnalysisIntegrityError as error:
                     warning = {
                         "record_type": "SCENARIO",
                         "record_id": str(row["id"]),
@@ -2030,11 +2754,11 @@ class Store:
         malformed: DecisionAnalysisIntegrityError | None = None
         scenario: ScheduleScenario | None = None
         with self._lock, self._connect() as con:
-            row = con.execute("SELECT id, payload FROM scenarios WHERE id = ?", (scenario_id,)).fetchone()
+            row = con.execute("SELECT * FROM scenarios WHERE id = ?", (scenario_id,)).fetchone()
             if row:
                 try:
-                    scenario = ScheduleScenario.model_validate_json(row["payload"])
-                except (TypeError, ValueError):
+                    scenario = self._load_scenario_head_row(con, row)
+                except DecisionAnalysisIntegrityError as error:
                     self._record_read_isolation(
                         con,
                         "scenarios",
@@ -2042,11 +2766,7 @@ class Store:
                         str(row["payload"]),
                         "read isolation: malformed scenario payload",
                     )
-                    malformed = DecisionAnalysisIntegrityError(
-                        "场景记录无法解析，已隔离原始证据",
-                        record_id=str(row["id"]),
-                        record_type="SCENARIO",
-                    )
+                    malformed = error
         if malformed:
             raise malformed
         return scenario
@@ -2090,10 +2810,11 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
+                "SELECT * FROM scenarios WHERE id=?",
                 (scenario.id,),
             ).fetchone()
-            current_revision = ScheduleScenario.model_validate_json(row["payload"]).revision if row else -1
+            current_scenario = self._load_scenario_head_row(con, row) if row else None
+            current_revision = current_scenario.revision if current_scenario else -1
             if expected_revision is None:
                 if row:
                     raise ScenarioRevisionConflict(-1, current_revision)
@@ -2116,7 +2837,8 @@ class Store:
                     if not plan_row:
                         raise ActivePlanConflict(expected_active_plan_id, current_active_plan_id)
                     active_plan = self._load_plan_row(con, plan_row)
-                    previous_scenario = ScheduleScenario.model_validate_json(row["payload"])
+                    assert current_scenario is not None
+                    previous_scenario = current_scenario
                     plan_applicability = reduce_plan_applicability(
                         active_plan,
                         previous_scenario,
@@ -2133,18 +2855,18 @@ class Store:
                         "SELECT active_plan_version_id FROM scenarios WHERE id=?",
                         (scenario.id,),
                     ).fetchone()
-                    if (
-                        (mark_plan_stale or plan_coverage_status or plan_applicability)
-                        and active
-                        and active["active_plan_version_id"]
-                    ):
+                    if active and active["active_plan_version_id"]:
                         self._set_plan_applicability(
                             con,
                             active["active_plan_version_id"],
                             scenario.id,
                             active=True,
-                            coverage_status=plan_coverage_status or PlanCoverageStatus.stale_data_changed,
+                            coverage_status=(
+                                plan_coverage_status
+                                or (PlanCoverageStatus.stale_data_changed if mark_plan_stale else None)
+                            ),
                             applicability=plan_applicability,
+                            evaluated_scenario=scenario,
                         )
                     con.execute(
                         "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -2162,6 +2884,7 @@ class Store:
                             active=False,
                             coverage_status=PlanCoverageStatus.stale_data_changed,
                             applicability=plan_applicability,
+                            evaluated_scenario=scenario,
                         )
                     con.execute(
                         "UPDATE scenarios SET payload=?, active_plan_version_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -2215,12 +2938,12 @@ class Store:
             if command and command["request_fingerprint"] != request_fingerprint:
                 raise PublicationConflict("相同幂等键对应了不同请求")
             scenario_row = con.execute(
-                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
+                "SELECT * FROM scenarios WHERE id=?",
                 (scenario_id,),
             ).fetchone()
             if not scenario_row:
                 raise KeyError(f"scenario {scenario_id} not found")
-            scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+            scenario = self._load_scenario_head_row(con, scenario_row)
             if command:
                 return scenario, False
             existing = next((item for item in scenario.work_orders if item.id == order.id), None)
@@ -2229,6 +2952,20 @@ class Store:
             created = existing is None
             if created:
                 previous_scenario = scenario.model_copy(deep=True)
+                active_plan_id = scenario_row["active_plan_version_id"]
+                active_plan: PlanVersion | None = None
+                if active_plan_id:
+                    plan_row = con.execute(
+                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                        "FROM plan_versions WHERE id=? AND scenario_id=?",
+                        (active_plan_id, scenario.id),
+                    ).fetchone()
+                    if not plan_row:
+                        raise ActivePlanConflict(active_plan_id, active_plan_id)
+                    # The persisted applicability still proves the old head at
+                    # this point. Load it before advancing D, then rebind the
+                    # projection to the new head below.
+                    active_plan = self._load_plan_row(con, plan_row)
                 expected_revision = scenario.revision
                 scenario.work_orders.append(order.model_copy(deep=True))
                 scenario.revision += 1
@@ -2243,16 +2980,7 @@ class Store:
                     ).fetchone()
                     raise ScenarioRevisionConflict(expected_revision, int(current[0]) if current else -1)
                 self._insert_revision(con, scenario, f"接收突发工单 {order.id}")
-                active_plan_id = scenario_row["active_plan_version_id"]
-                if active_plan_id:
-                    plan_row = con.execute(
-                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
-                        "FROM plan_versions WHERE id=? AND scenario_id=?",
-                        (active_plan_id, scenario.id),
-                    ).fetchone()
-                    if not plan_row:
-                        raise ActivePlanConflict(active_plan_id, active_plan_id)
-                    active_plan = self._load_plan_row(con, plan_row)
+                if active_plan_id and active_plan:
                     applicability = reduce_plan_applicability(
                         active_plan,
                         previous_scenario,
@@ -2266,6 +2994,7 @@ class Store:
                         scenario.id,
                         active=True,
                         applicability=applicability,
+                        evaluated_scenario=scenario,
                     )
             now = _now()
             payload = json.dumps(
@@ -2430,24 +3159,24 @@ class Store:
                         code="EXECUTION_REPLAY_IDENTITY_MISMATCH",
                     )
                 scenario_row = con.execute(
-                    "SELECT payload FROM scenarios WHERE id=?",
+                    "SELECT * FROM scenarios WHERE id=?",
                     (scenario_id,),
                 ).fetchone()
                 if not scenario_row:
                     raise KeyError(f"场景 {scenario_id} 不存在")
-                current_scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+                current_scenario = self._load_scenario_head_row(con, scenario_row)
                 return WorkOrderExecutionResult(
                     scenario=current_scenario,
                     event=stored_event,
                 )
 
             scenario_row = con.execute(
-                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
+                "SELECT * FROM scenarios WHERE id=?",
                 (scenario_id,),
             ).fetchone()
             if not scenario_row:
                 raise KeyError(f"场景 {scenario_id} 不存在")
-            scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+            scenario = self._load_scenario_head_row(con, scenario_row)
             if scenario.revision != request.expected_revision:
                 raise ScenarioRevisionConflict(request.expected_revision, scenario.revision)
             order = next((item for item in scenario.work_orders if item.id == work_order_id), None)
@@ -2665,6 +3394,14 @@ class Store:
             con.execute(
                 "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (scenario.model_dump_json(), scenario_id),
+            )
+            self._set_plan_applicability(
+                con,
+                plan.id,
+                scenario_id,
+                active=True,
+                applicability=plan.applicability,
+                evaluated_scenario=scenario,
             )
             self._insert_revision(
                 con, scenario, f"工单 {work_order_id} {'开始服务' if action == 'start' else '完成服务'}"
@@ -2902,12 +3639,12 @@ class Store:
     def execution_source_context(self, scenario_id: str) -> ExecutionSourceContext:
         with self._connect() as con:
             row = con.execute(
-                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
+                "SELECT * FROM scenarios WHERE id=?",
                 (scenario_id,),
             ).fetchone()
             if not row:
                 raise KeyError(f"scenario {scenario_id} not found")
-            scenario = ScheduleScenario.model_validate_json(row["payload"])
+            scenario = self._load_scenario_head_row(con, row)
             return self._execution_source_context(con, scenario, row["active_plan_version_id"])
 
     def list_execution_events(self, scenario_id: str) -> list[WorkOrderExecutionEvent]:
@@ -3001,6 +3738,9 @@ class Store:
                 source_assignment.source_assignment_hash or assignment_source_fingerprint(source_assignment)
             ):
                 raise ValueError("execution event source assignment mismatch")
+            event.self_integrity = AnalysisIntegrityStatus.verified
+            event.source_plan_integrity = AnalysisIntegrityStatus.verified
+            event.effective_integrity = AnalysisIntegrityStatus.verified
             return event
         except DecisionAnalysisIntegrityError:
             raise
@@ -3029,10 +3769,10 @@ class Store:
             if existing:
                 if existing["request_fingerprint"] != request_fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同请求")
-                row = con.execute("SELECT payload FROM scenarios WHERE id=?", (existing["resource_id"],)).fetchone()
+                row = con.execute("SELECT * FROM scenarios WHERE id=?", (existing["resource_id"],)).fetchone()
                 if not row:
                     raise PublicationConflict("幂等克隆记录引用的场景不存在")
-                return ScheduleScenario.model_validate_json(row["payload"])
+                return self._load_scenario_head_row(con, row)
             if con.execute("SELECT 1 FROM scenarios WHERE id=?", (scenario.id,)).fetchone():
                 raise PublicationConflict("克隆场景标识已存在")
             con.execute(
@@ -3070,13 +3810,20 @@ class Store:
                 "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario_id,)
             ).fetchall()
             previous_hash: str | None = None
-            expected_number: int | None = None
+            expected_number = 0
+            ancestor_invalid = False
             for row in rows:
                 try:
-                    revision = self._load_revision_row(con, row, previous_hash)
-                    if expected_number is not None and revision.number != expected_number:
+                    if ancestor_invalid:
                         raise DecisionAnalysisIntegrityError(
-                            "业务数据修订号存在断裂",
+                            "业务数据修订依赖无效祖先",
+                            record_id=str(row["id"]),
+                            record_type="SCENARIO_REVISION",
+                        )
+                    revision = self._load_revision_row(con, row, previous_hash)
+                    if revision.number != expected_number:
+                        raise DecisionAnalysisIntegrityError(
+                            "业务数据修订必须从 D000 开始并连续递增",
                             record_id=revision.id,
                             record_type="SCENARIO_REVISION",
                         )
@@ -3084,6 +3831,7 @@ class Store:
                     previous_hash = revision.revision_hash
                     expected_number = revision.number + 1
                 except DecisionAnalysisIntegrityError as error:
+                    ancestor_invalid = True
                     self._record_read_isolation(
                         con,
                         "scenario_revisions",
@@ -3280,12 +4028,10 @@ class Store:
                             (experiment.model_dump_json(), experiment.id),
                         )
                     return self._overlay_plan_applicability(con, plan)
-            current_row = con.execute(
-                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?", (scenario.id,)
-            ).fetchone()
+            current_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario.id,)).fetchone()
             if not current_row:
                 raise KeyError(f"scenario {scenario.id} not found")
-            current_scenario = ScheduleScenario.model_validate_json(current_row["payload"])
+            current_scenario = self._load_scenario_head_row(con, current_row)
             current_revision = current_scenario.revision
             required_revision = (
                 expected_revision
@@ -3334,15 +4080,102 @@ class Store:
                 raise PublicationConflict("求解记录与候选方案的来源版本不一致")
             if candidate_run.expected_active_plan_version_id != candidate.expected_active_plan_version_id:
                 raise PublicationConflict("求解记录与候选方案的活动版本前置条件不一致")
+            if (
+                not candidate.reservation_id
+                or not candidate.reservation_hash
+                or candidate_run.reservation_id != candidate.reservation_id
+                or candidate_run.reservation_hash != candidate.reservation_hash
+            ):
+                raise PublicationConflict(
+                    "求解记录或候选缺少一致的规划预留",
+                    code="PLANNING_RESERVATION_REQUIRED",
+                )
+            reservation_row = con.execute(
+                "SELECT payload, reservation_hash FROM planning_reservations WHERE id=?",
+                (candidate.reservation_id,),
+            ).fetchone()
+            if not reservation_row:
+                raise PublicationConflict(
+                    "候选引用的规划预留不存在",
+                    code="PLANNING_RESERVATION_MISSING",
+                    details={"reservation_id": candidate.reservation_id},
+                )
+            reservation = PlanningReservation.model_validate_json(reservation_row["payload"])
+            if (
+                reservation.reservation_hash != reservation_row["reservation_hash"]
+                or reservation.reservation_hash != _planning_reservation_hash(reservation)
+                or reservation.reservation_hash != candidate.reservation_hash
+                or reservation.scenario_id != scenario.id
+                or reservation.active_plan_version_id != candidate.expected_active_plan_version_id
+                or reservation.source_plan_version_id != candidate.source_plan_version_id
+            ):
+                raise PublicationConflict(
+                    "候选规划预留证明失败",
+                    code="PLANNING_RESERVATION_INTEGRITY_FAILED",
+                    details={"reservation_id": candidate.reservation_id},
+                )
+            expected_reservation_revision = scenario.revision - 1 if replace_scenario else scenario.revision
+            if (
+                reservation.scenario_revision != expected_reservation_revision
+                or reservation.scenario_snapshot_hash != content_hash(current_scenario)
+                or reservation.scenario_snapshot_hash != str(current_row["current_snapshot_hash"])
+            ):
+                raise PublicationConflict(
+                    "规划预留的数据快照与发布事务不一致",
+                    code="PLANNING_RESERVATION_SCENARIO_CONFLICT",
+                    details={"reservation_id": reservation.id},
+                )
             current_active_plan_id = current_row["active_plan_version_id"]
             if candidate.expected_active_plan_version_id != current_active_plan_id:
                 raise PublicationConflict(
                     "求解期间活动方案已变化，结果未发布，请重新运行",
-                    code="ACTIVE_PLAN_VERSION_CONFLICT",
+                    code="ACTIVE_PLAN_CHANGED_DURING_COMMAND",
                     details={
-                        "expected_active_plan_version_id": candidate.expected_active_plan_version_id,
-                        "current_active_plan_version_id": current_active_plan_id,
+                        "expected_active_plan_id": candidate.expected_active_plan_version_id,
+                        "current_active_plan_id": current_active_plan_id,
+                        "reservation_id": reservation.id,
                     },
+                )
+            if current_active_plan_id:
+                active_row = con.execute(
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                    "FROM plan_versions WHERE id=? AND scenario_id=?",
+                    (current_active_plan_id, scenario.id),
+                ).fetchone()
+                if not active_row:
+                    raise PublicationConflict("活动方案记录不存在", code="ACTIVE_PLAN_INTEGRITY_FAILED")
+                active_plan = self._load_plan_row(con, active_row)
+                active_use_case = (
+                    PlanUseCase.audit_view
+                    if action == "reattest" and active_plan.id == source_version_id
+                    else PlanUseCase.replay
+                )
+                self._require_loaded_plan_for_use(active_plan, active_use_case)
+                if active_plan.publication_manifest_hash != reservation.active_plan_manifest_hash:
+                    raise PublicationConflict(
+                        "活动方案证明与规划预留不一致",
+                        code="ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+                        details={"reservation_id": reservation.id, "current_active_plan_id": current_active_plan_id},
+                    )
+            elif reservation.active_plan_manifest_hash is not None:
+                raise PublicationConflict(
+                    "规划预留的活动方案已不存在",
+                    code="ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+                    details={"reservation_id": reservation.id},
+                )
+            current_execution_context = self._execution_source_context(
+                con,
+                current_scenario,
+                current_active_plan_id,
+            )
+            if (
+                reservation.execution_watermark != current_execution_context.execution_event_sequence
+                or reservation.execution_context_hash != content_hash(current_execution_context)
+            ):
+                raise PublicationConflict(
+                    "规划期间执行事实已变化，结果未发布",
+                    code="EXECUTION_CONTEXT_CHANGED_DURING_COMMAND",
+                    details={"reservation_id": reservation.id},
                 )
             if candidate_run.solver_config_hash != candidate.solver_config_hash:
                 raise PublicationConflict("求解记录与候选方案的求解配置指纹不一致")
@@ -3380,8 +4213,19 @@ class Store:
                     raise PublicationConflict("来源方案不属于当前场景")
                 if candidate.source_plan_version_id and candidate.source_plan_version_id != publication_source.id:
                     raise PublicationConflict("候选方案引用了另一个来源版本")
+                if (
+                    reservation.source_plan_version_id != publication_source.id
+                    or reservation.source_plan_manifest_hash != publication_source.publication_manifest_hash
+                ):
+                    raise PublicationConflict(
+                        "来源方案与规划预留不一致",
+                        code="SOURCE_PLAN_CHANGED_DURING_COMMAND",
+                        details={"reservation_id": reservation.id, "resource_id": publication_source.id},
+                    )
             elif candidate.source_plan_version_id:
                 raise PublicationConflict("候选方案声明了来源版本，但发布请求未携带来源")
+            elif reservation.source_plan_version_id is not None:
+                raise PublicationConflict("规划预留声明了来源方案，但发布请求未携带来源")
             verification_source = publication_source
             if selected.kind == "replan" and action in {"activate", "restore", "reattest"} and publication_source:
                 stability_baseline_id = (
@@ -3562,6 +4406,7 @@ class Store:
                 scenario.id,
                 active=True,
                 coverage_status=PlanCoverageStatus.current_and_complete,
+                evaluated_scenario=scenario,
             )
             con.execute(
                 "INSERT INTO schedules(id, scenario_id, kind, version, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -3615,6 +4460,252 @@ class Store:
                     (experiment.model_dump_json(), experiment.id),
                 )
             return plan
+
+    def reserve_plan_command(
+        self,
+        scenario_id: str,
+        action: Literal["baseline", "optimize", "replan", "activate", "restore", "reattest", "experiment"],
+        *,
+        expected_revision: int,
+        expected_active_plan_version_id: str | None,
+        check_active_plan: bool,
+        source_mode: Literal["NONE", "ACTIVE_OR_LATEST", "EXPLICIT"],
+        source_plan_version_id: str | None,
+        source_use_case: PlanUseCase = PlanUseCase.replay,
+        command_fingerprint: str,
+        requested_time_limit_seconds: float = 0,
+        solver_name: str = "ortools-routing",
+        solver_config_hash: str,
+        run_id: str | None = None,
+        started_at: str | None = None,
+    ) -> tuple[PlanningReservation, ScheduleRun]:
+        """Freeze every planning input and create its run in one SQLite write snapshot."""
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
+            if not scenario_row:
+                raise KeyError(f"scenario {scenario_id} not found")
+            scenario = self._load_scenario_head_row(con, scenario_row)
+            if scenario.revision != expected_revision:
+                raise ScenarioRevisionConflict(expected_revision, scenario.revision)
+            active_plan_id = scenario_row["active_plan_version_id"]
+            if check_active_plan and active_plan_id != expected_active_plan_version_id:
+                raise PublicationConflict(
+                    "命令开始前活动方案已变化，请刷新后重试",
+                    code="ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+                    details={
+                        "expected_active_plan_id": expected_active_plan_version_id,
+                        "current_active_plan_id": active_plan_id,
+                    },
+                )
+            active_plan: PlanVersion | None = None
+            if active_plan_id:
+                active_row = con.execute(
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                    "FROM plan_versions WHERE id=? AND scenario_id=?",
+                    (active_plan_id, scenario_id),
+                ).fetchone()
+                if not active_row:
+                    raise PublicationConflict(
+                        "活动方案记录不存在",
+                        code="ACTIVE_PLAN_INTEGRITY_FAILED",
+                        details={"current_active_plan_id": active_plan_id},
+                    )
+                active_plan = self._load_plan_row(con, active_row)
+                active_use_case = (
+                    PlanUseCase.audit_view
+                    if action == "reattest" and active_plan.id == source_plan_version_id
+                    else PlanUseCase.replay
+                )
+                self._require_loaded_plan_for_use(active_plan, active_use_case)
+
+            resolved_source_id = source_plan_version_id
+            if source_mode == "NONE":
+                resolved_source_id = None
+            elif source_mode == "ACTIVE_OR_LATEST":
+                resolved_source_id = active_plan_id
+                if resolved_source_id is None:
+                    latest = con.execute(
+                        "SELECT id FROM plan_versions WHERE scenario_id=? ORDER BY number DESC LIMIT 1",
+                        (scenario_id,),
+                    ).fetchone()
+                    resolved_source_id = str(latest["id"]) if latest else None
+            elif source_mode == "EXPLICIT" and not resolved_source_id:
+                raise PublicationConflict(
+                    "命令缺少明确来源方案",
+                    code="SOURCE_PLAN_REQUIRED",
+                )
+
+            source_plan: PlanVersion | None = None
+            if resolved_source_id:
+                if active_plan and resolved_source_id == active_plan.id:
+                    source_plan = active_plan.model_copy(deep=True)
+                else:
+                    source_row = con.execute(
+                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                        "FROM plan_versions WHERE id=? AND scenario_id=?",
+                        (resolved_source_id, scenario_id),
+                    ).fetchone()
+                    if not source_row:
+                        raise PublicationConflict(
+                            "来源方案不存在",
+                            code="SOURCE_PLAN_NOT_FOUND",
+                            details={"resource_id": resolved_source_id},
+                        )
+                    source_plan = self._load_plan_row(con, source_row)
+                self._require_loaded_plan_for_use(source_plan, source_use_case)
+
+            execution_context = self._execution_source_context(con, scenario, active_plan_id)
+            resolved_run_id = run_id or f"RUN-{uuid.uuid4().hex[:12]}"
+            reservation_id = f"RES-{resolved_run_id}"
+            existing_reservation_row = con.execute(
+                "SELECT payload, reservation_hash FROM planning_reservations WHERE id=?",
+                (reservation_id,),
+            ).fetchone()
+            if existing_reservation_row:
+                reservation = PlanningReservation.model_validate_json(existing_reservation_row["payload"])
+                if (
+                    reservation.reservation_hash != existing_reservation_row["reservation_hash"]
+                    or reservation.reservation_hash != _planning_reservation_hash(reservation)
+                    or reservation.command_fingerprint != command_fingerprint
+                    or reservation.scenario_id != scenario_id
+                    or reservation.action != action
+                ):
+                    raise PublicationConflict(
+                        "规划预留与恢复请求不一致",
+                        code="PLANNING_RESERVATION_CONFLICT",
+                        details={"reservation_id": reservation_id},
+                    )
+                run_row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (resolved_run_id,)).fetchone()
+                if not run_row:
+                    raise PublicationConflict(
+                        "规划预留引用的求解记录不存在",
+                        code="PLANNING_RESERVATION_RUN_MISSING",
+                        details={"reservation_id": reservation_id},
+                    )
+                run = ScheduleRun.model_validate_json(run_row["payload"])
+                if run.status is ScheduleRunStatus.failed and run.termination_reason == "APPLICATION_RESTARTED":
+                    run.status = ScheduleRunStatus.running
+                    run.termination_reason = None
+                    run.finished_at = None
+                    con.execute(
+                        "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
+                        (run.status.value, run.model_dump_json(), run.id),
+                    )
+                return reservation, run
+
+            now = started_at or _now()
+            reservation = PlanningReservation(
+                id=reservation_id,
+                scenario_id=scenario_id,
+                action=action,
+                scenario_revision=scenario.revision,
+                scenario_snapshot_hash=content_hash(scenario),
+                scenario_snapshot=scenario.model_copy(deep=True),
+                active_plan_version_id=active_plan.id if active_plan else None,
+                active_plan_manifest_hash=active_plan.publication_manifest_hash if active_plan else None,
+                source_plan_version_id=source_plan.id if source_plan else None,
+                source_plan_manifest_hash=source_plan.publication_manifest_hash if source_plan else None,
+                source_plan=source_plan.model_copy(deep=True) if source_plan else None,
+                execution_watermark=execution_context.execution_event_sequence,
+                execution_context_hash=content_hash(execution_context),
+                execution_context=execution_context,
+                command_fingerprint=command_fingerprint,
+                created_at=now,
+            )
+            reservation.reservation_hash = _planning_reservation_hash(reservation)
+            requested_ms = int(round(requested_time_limit_seconds * 1000))
+            run = ScheduleRun(
+                id=resolved_run_id,
+                scenario_id=scenario_id,
+                action=action,
+                scenario_revision=scenario.revision,
+                scenario_snapshot_hash=reservation.scenario_snapshot_hash,
+                source_plan_version_id=reservation.source_plan_version_id,
+                source_plan_snapshot_hash=(source_plan.scenario_snapshot_hash if source_plan else None),
+                expected_active_plan_version_id=reservation.active_plan_version_id,
+                reservation_id=reservation.id,
+                reservation_hash=reservation.reservation_hash,
+                solver_name=solver_name,
+                solver_version="pending",
+                solver_config_hash=solver_config_hash,
+                requested_time_limit_ms=requested_ms,
+                effective_time_limit_ms=requested_ms,
+                status=ScheduleRunStatus.running,
+                started_at=now,
+            )
+            con.execute(
+                "INSERT INTO planning_reservations(id, scenario_id, reservation_hash, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (reservation.id, scenario_id, reservation.reservation_hash, reservation.model_dump_json(), now),
+            )
+            con.execute(
+                "INSERT INTO schedule_runs(id, scenario_id, status, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (run.id, run.scenario_id, run.status.value, run.model_dump_json(), run.started_at),
+            )
+            return reservation, run
+
+    def bind_schedule_run_context(
+        self,
+        run: ScheduleRun,
+        reservation: PlanningReservation,
+        planning_context: PlanningContext | None,
+    ) -> ScheduleRun:
+        context_hash = content_hash(planning_context) if planning_context is not None else None
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            reservation_row = con.execute(
+                "SELECT payload, reservation_hash FROM planning_reservations WHERE id=?",
+                (reservation.id,),
+            ).fetchone()
+            if not reservation_row:
+                raise PublicationConflict("规划预留不存在", code="PLANNING_RESERVATION_MISSING")
+            stored_reservation = PlanningReservation.model_validate_json(reservation_row["payload"])
+            if (
+                stored_reservation.reservation_hash != reservation_row["reservation_hash"]
+                or stored_reservation.reservation_hash != _planning_reservation_hash(stored_reservation)
+                or stored_reservation.reservation_hash != reservation.reservation_hash
+            ):
+                raise PublicationConflict("规划预留证明失败", code="PLANNING_RESERVATION_INTEGRITY_FAILED")
+            run_row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
+            if not run_row:
+                raise PublicationConflict("求解记录不存在")
+            stored_run = ScheduleRun.model_validate_json(run_row["payload"])
+            if (
+                stored_run.reservation_id != reservation.id
+                or stored_run.reservation_hash != reservation.reservation_hash
+            ):
+                raise PublicationConflict("求解记录引用了其他规划预留")
+            if stored_run.planning_context_hash is not None:
+                if stored_run.planning_context_hash != context_hash:
+                    raise PublicationConflict("求解记录的计划上下文不可修改")
+                return stored_run
+            stored_run.planning_context = planning_context
+            stored_run.planning_context_hash = context_hash
+            con.execute(
+                "UPDATE schedule_runs SET payload=? WHERE id=?",
+                (stored_run.model_dump_json(), stored_run.id),
+            )
+            return stored_run
+
+    def get_planning_reservation(self, reservation_id: str) -> PlanningReservation | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT payload, reservation_hash FROM planning_reservations WHERE id=?",
+                (reservation_id,),
+            ).fetchone()
+            if not row:
+                return None
+            reservation = PlanningReservation.model_validate_json(row["payload"])
+            if reservation.reservation_hash != row[
+                "reservation_hash"
+            ] or reservation.reservation_hash != _planning_reservation_hash(reservation):
+                raise DecisionAnalysisIntegrityError(
+                    "规划预留完整性校验失败",
+                    record_id=reservation_id,
+                    record_type="PLANNING_RESERVATION",
+                )
+            return reservation
 
     def save_schedule_run(self, run: ScheduleRun) -> ScheduleRun:
         with self._lock, self._connect() as con:
@@ -3676,6 +4767,13 @@ class Store:
     ) -> tuple[ScheduleRun, ScheduleCandidate]:
         if candidate.run_id != run.id or candidate.scenario_id != run.scenario_id:
             raise PublicationConflict("候选方案与求解记录不匹配")
+        if (
+            not run.reservation_id
+            or not run.reservation_hash
+            or candidate.reservation_id != run.reservation_id
+            or candidate.reservation_hash != run.reservation_hash
+        ):
+            raise PublicationConflict("候选方案与求解记录的规划预留不匹配")
         if run.status in {ScheduleRunStatus.queued, ScheduleRunStatus.running} or run.candidate_id != candidate.id:
             raise PublicationConflict("完成求解记录前必须设置终态和对应候选")
         with self._lock, self._connect() as con:
@@ -3684,6 +4782,19 @@ class Store:
             if not run_row:
                 raise PublicationConflict("求解记录不存在")
             stored = ScheduleRun.model_validate_json(run_row["payload"])
+            reservation_row = con.execute(
+                "SELECT payload, reservation_hash FROM planning_reservations WHERE id=?",
+                (run.reservation_id,),
+            ).fetchone()
+            if not reservation_row:
+                raise PublicationConflict("求解记录引用的规划预留不存在")
+            reservation = PlanningReservation.model_validate_json(reservation_row["payload"])
+            if (
+                reservation.reservation_hash != reservation_row["reservation_hash"]
+                or reservation.reservation_hash != _planning_reservation_hash(reservation)
+                or reservation.reservation_hash != run.reservation_hash
+            ):
+                raise PublicationConflict("求解记录引用的规划预留证明失败")
             if stored.status not in {ScheduleRunStatus.queued, ScheduleRunStatus.running}:
                 if stored.candidate_id == candidate.id:
                     existing = con.execute(
@@ -4673,6 +5784,95 @@ class Store:
             if row and row["active_plan_version_id"]
             else None
         )
+
+    def operational_view(self, scenario_id: str) -> ScenarioOperationalView:
+        with self._lock, self._connect() as con:
+            scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
+            if not scenario_row:
+                raise KeyError(f"scenario {scenario_id} not found")
+            scenario = self._load_scenario_head_row(con, scenario_row)
+            plan: PlanVersion | None = None
+            active_plan_id = scenario_row["active_plan_version_id"]
+            if active_plan_id:
+                plan_row = con.execute(
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                    "FROM plan_versions WHERE id=? AND scenario_id=?",
+                    (active_plan_id, scenario_id),
+                ).fetchone()
+                if not plan_row:
+                    raise DecisionAnalysisIntegrityError(
+                        "活动方案记录不存在",
+                        record_id=str(active_plan_id),
+                        record_type="PLAN_VERSION",
+                    )
+                plan = self._load_plan_row(con, plan_row)
+                self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
+            assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
+            unassigned = {item.work_order_id: item for item in plan.selected.unassigned} if plan else {}
+            invalid = set(plan.applicability.invalid_assignment_ids) if plan else set()
+            work_order_views: list[OperationalWorkOrderView] = []
+            for order in scenario.work_orders:
+                assignment = assignments.get(order.id)
+                blocking_reason: str | None = None
+                if order.status is WorkOrderStatus.completed:
+                    disposition = CurrentWorkOrderDisposition.completed
+                    blocking_reason = "WORK_ORDER_ALREADY_COMPLETED"
+                elif order.status is WorkOrderStatus.started:
+                    disposition = CurrentWorkOrderDisposition.started
+                    blocking_reason = "WORK_ORDER_ALREADY_STARTED"
+                elif order.id in invalid:
+                    disposition = CurrentWorkOrderDisposition.assigned_invalid
+                    blocking_reason = "INVALID_ASSIGNMENT_CANNOT_START"
+                elif assignment is not None:
+                    disposition = CurrentWorkOrderDisposition.assigned_valid
+                elif order.id in unassigned:
+                    disposition = CurrentWorkOrderDisposition.plan_unassigned
+                    blocking_reason = unassigned[order.id].reason.value
+                else:
+                    disposition = CurrentWorkOrderDisposition.new_uncovered
+                    blocking_reason = "NEW_DEMAND_NOT_IN_ACTIVE_PLAN" if plan else "NO_ACTIVE_PLAN"
+                work_order_views.append(
+                    OperationalWorkOrderView(
+                        work_order_id=order.id,
+                        disposition=disposition,
+                        assignment=assignment,
+                        start_allowed=disposition is CurrentWorkOrderDisposition.assigned_valid,
+                        blocking_reason_code=blocking_reason,
+                    )
+                )
+            active_views = [
+                item for item in work_order_views if item.disposition is not CurrentWorkOrderDisposition.completed
+            ]
+            valid_assigned_count = sum(
+                item.disposition in {CurrentWorkOrderDisposition.assigned_valid, CurrentWorkOrderDisposition.started}
+                for item in active_views
+            )
+            active_demand_count = len(active_views)
+            metrics = OperationalMetrics(
+                active_demand_count=active_demand_count,
+                valid_assigned_count=valid_assigned_count,
+                invalid_assignment_count=sum(
+                    item.disposition is CurrentWorkOrderDisposition.assigned_invalid for item in active_views
+                ),
+                plan_unassigned_count=sum(
+                    item.disposition is CurrentWorkOrderDisposition.plan_unassigned for item in active_views
+                ),
+                new_uncovered_count=sum(
+                    item.disposition is CurrentWorkOrderDisposition.new_uncovered for item in active_views
+                ),
+                current_actionable_coverage_rate=(
+                    valid_assigned_count / active_demand_count if active_demand_count else 1.0
+                ),
+            )
+            return ScenarioOperationalView(
+                scenario_id=scenario.id,
+                scenario_revision=scenario.revision,
+                scenario_snapshot_hash=content_hash(scenario),
+                active_plan_version_id=plan.id if plan else None,
+                plan_applicability=plan.applicability if plan else None,
+                work_orders=work_order_views,
+                current_metrics=metrics,
+            )
 
     def latest_plan_version(self, scenario_id: str) -> PlanVersion | None:
         with self._connect() as con:

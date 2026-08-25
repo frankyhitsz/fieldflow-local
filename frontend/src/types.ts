@@ -7,15 +7,23 @@ export type Technician = Required<ApiSchemas['Technician']>
 export type WorkOrder = Required<ApiSchemas['WorkOrder']>
 export type ExecutionEvent = Required<ApiSchemas['WorkOrderExecutionEvent']>
 export type ExecutionResult = { scenario: Scenario; event: ExecutionEvent }
-export type ManualReassignmentResult = {
-  lock_persisted: boolean; replan_status: 'COMPLETED' | 'FAILED'; active_plan_preserved: boolean
-  scenario: Scenario; schedule: Schedule | null; error: Record<string, unknown> | null
+type ApiManualReassignmentResult = ApiSchemas['ManualReassignmentResult']
+export type ManualReassignmentResult = Omit<Required<ApiManualReassignmentResult>, 'scenario' | 'schedule'> & {
+  scenario: Scenario
+  schedule: Schedule | null
 }
 export type Scenario = {
   id: string; name: string; description: string; planning_date: string; seed: number
   technicians: Technician[]; work_orders: WorkOrder[]
   locked_assignments: { work_order_id: string; technician_id: string }[]
   revision: number
+}
+export type CurrentWorkOrderDisposition = ApiSchemas['CurrentWorkOrderDisposition']
+type ApiOperationalWorkOrder = ApiSchemas['OperationalWorkOrderView']
+type ApiOperationalView = ApiSchemas['ScenarioOperationalView']
+export type OperationalView = Omit<Required<ApiOperationalView>, 'plan_applicability' | 'work_orders'> & {
+  plan_applicability: PlanVersion['applicability'] | null
+  work_orders: Array<Omit<Required<ApiOperationalWorkOrder>, 'assignment'> & { assignment: Assignment | null }>
 }
 export type Assignment = {
   work_order_id: string; technician_id: string; sequence: number; arrival_time: number
@@ -83,7 +91,8 @@ export type PlanVersion = {
   applicability: {
     route_executable: boolean; coverage_complete: boolean; planning_current: boolean
     metrics_current: boolean; commercial_current: boolean; reoptimization_opportunity: boolean
-    invalid_assignment_ids: string[]
+    invalid_assignment_ids: string[]; evaluated_scenario_revision: number | null
+    evaluated_scenario_snapshot_hash: string; reducer_policy_version: string; projection_hash: string
   }
   selected: Schedule
   artifacts: { id: string; role: 'baseline' | 'selected' | 'candidate'; strategy: string; schedule: Schedule }[]
@@ -206,6 +215,9 @@ export type RiskSimulation = AnalysisContextFields & {
   execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE' | 'EARLIEST_FEASIBLE_EXECUTION'; execution_policy_version: string
   emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'
   emergency_responder_selection_policy: 'MYOPIC_EARLIEST_EMERGENCY_FINISH'
+  emergency_location_policy: 'ACTIVE_DEMAND_LOCATIONS' | 'ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY' | 'UNIFORM_SERVICE_AREA' | 'EXTERNAL_EMPIRICAL_DISTRIBUTION'
+  emergency_location_work_order_ids: string[]
+  artifact_detail_policy: 'SUMMARY_ONLY' | 'FULL_TRIAL_DETAIL'
   simulation_policy_version: string; analysis_code_version: string; simulation_input_hash: string; seed: number; trials: number
   simulation_scenario_set_hash: string
   expected_sla_on_time_rate: number; sla_rate_ci_low: number; sla_rate_ci_high: number
@@ -214,9 +226,15 @@ export type RiskSimulation = AnalysisContextFields & {
   emergency_completion_rate: number | null; emergency_on_time_rate: number | null; emergency_unserved_probability: number | null
   emergency_incremental_late_minutes: number | null; emergency_incremental_overtime_minutes: number | null
   emergency_incremental_unserved_orders: number | null; emergency_affected_work_order_count: number | null
+  emergency_disposition_changed_count: number | null; emergency_newly_unserved_count: number | null
+  emergency_newly_late_count: number | null; emergency_lateness_increased_count: number | null
+  emergency_metric_sample_count: number; emergency_completed_sample_count: number
   monte_carlo_mean_ci_low: number; monte_carlo_mean_ci_high: number
   full_day_total_late_minutes_p50: number; full_day_total_late_minutes_p90: number; full_day_total_late_minutes_p95: number
   scope_total_late_minutes_p50: number; scope_total_late_minutes_p90: number; scope_total_late_minutes_p95: number
+  published_work_total_late_minutes_p50: number; published_work_total_late_minutes_p90: number; published_work_total_late_minutes_p95: number
+  all_demand_total_late_minutes_p50: number; all_demand_total_late_minutes_p90: number; all_demand_total_late_minutes_p95: number
+  emergency_late_minutes_mean: number | null; emergency_late_minutes_p50: number | null; emergency_late_minutes_p90: number | null
   late_minutes_p50: number; late_minutes_p90: number; late_minutes_p95: number
   expected_overtime_minutes: number; additional_disruption_probability: number
   technician_absence_event_probability: number; absence_caused_failure_probability: number
@@ -276,7 +294,7 @@ export type CapacityCounterfactualArtifact = {
 
 export type SimulationScenarioSetArtifact = {
   artifact_type: 'SIMULATION_SCENARIO_SET'; id: string; scenario_id: string; analysis_run_id: string
-  policy_version: string; keyed_random_version: string; emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'; emergency_responder_selection_policy: 'MYOPIC_EARLIEST_EMERGENCY_FINISH'; scenario_snapshot_hash: string; seed: number; trials: number
+  policy_version: string; keyed_random_version: string; emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'; emergency_responder_selection_policy: 'MYOPIC_EARLIEST_EMERGENCY_FINISH'; emergency_location_policy: RiskSimulation['emergency_location_policy']; emergency_location_work_order_ids: string[]; scenario_snapshot_hash: string; seed: number; trials: number
   technician_ids: string[]; work_order_ids: string[]; exogenous_parameters: Record<string, number>
   emergency_events: { trial: number; event_id: string; technician_id: string | null; event_time: number; location: Point; duration_minutes: number; required_skill: string; sla_deadline: number }[]
   scenario_set_hash: string; artifact_hash: string; integrity_status: IntegrityStatus; self_integrity: IntegrityStatus; parent_analysis_integrity: IntegrityStatus; effective_integrity: IntegrityStatus; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string
@@ -284,7 +302,7 @@ export type SimulationScenarioSetArtifact = {
 
 export type RiskTrialOutcomeArtifact = {
   artifact_type: 'RISK_TRIAL_OUTCOMES'; id: string; scenario_id: string; analysis_run_id: string
-  scenario_set_hash: string; metrics: { trial: number; sla_on_time_rate: number; total_overtime_minutes: number; total_unserved_orders: number; disrupted: boolean }[]
+  scenario_set_hash: string; detail_policy: 'SUMMARY_ONLY' | 'FULL_TRIAL_DETAIL'; metrics: { trial: number; sla_on_time_rate: number; total_overtime_minutes: number; total_unserved_orders: number; disrupted: boolean }[]
   artifact_hash: string; integrity_status: IntegrityStatus; self_integrity: IntegrityStatus; parent_analysis_integrity: IntegrityStatus; effective_integrity: IntegrityStatus; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string
 }
 

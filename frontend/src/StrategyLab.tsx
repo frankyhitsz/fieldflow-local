@@ -50,7 +50,7 @@ function ProfileEditor({ initial, onClose, onSaved }: { initial?: StrategyProfil
   </section></div>
 }
 
-export function StrategyLab({ scenario, profiles, loadingDataset, onSelectDataset, onReloadProfiles, onPublished, onToast }: { scenario: Scenario; profiles: StrategyProfile[]; loadingDataset: boolean; onSelectDataset: (id: string) => void; onReloadProfiles: () => Promise<void>; onPublished: (plan: PlanVersion) => void; onToast: (message: string) => void }) {
+export function StrategyLab({ scenario, profiles, loadingDataset, expectedActivePlanId, onSelectDataset, onReloadProfiles, onPublished, onToast }: { scenario: Scenario; profiles: StrategyProfile[]; loadingDataset: boolean; expectedActivePlanId?: string | null; onSelectDataset: (id: string) => void; onReloadProfiles: () => Promise<void>; onPublished: (plan: PlanVersion) => void; onToast: (message: string) => void }) {
   const selectable = profiles.filter(profile => profile.id !== 'stable')
   const [selected, setSelected] = useState<string[]>(() => selectable.map(profile => profile.id))
   const [experiment, setExperiment] = useState<StrategyExperiment>()
@@ -86,7 +86,7 @@ export function StrategyLab({ scenario, profiles, loadingDataset, onSelectDatase
     if (!experiment) return
     setWorking('正在发布候选方案')
     try {
-      const plan = await api.publishExperiment(scenario.id, experiment.id, candidateId, scenario.revision)
+      const plan = await api.publishExperiment(scenario.id, experiment.id, candidateId, scenario.revision, expectedActivePlanId)
       onPublished(plan); onToast(`已发布为 V${String(plan.number).padStart(3, '0')}`)
     } catch (cause) { onToast(cause instanceof Error ? cause.message : '候选发布失败') }
     finally { setWorking('') }

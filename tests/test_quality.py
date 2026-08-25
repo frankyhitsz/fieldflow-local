@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 from pathlib import Path
@@ -64,3 +65,59 @@ def test_user_facing_copy_stays_direct_and_version_numbers_stay_consistent():
 def test_application_version_has_one_checked_release_value():
     package = json.loads(Path("frontend/package.json").read_text())
     assert app.version == package["version"] == __version__
+
+
+def test_publication_conflicts_are_never_returned_as_plain_strings():
+    tree = ast.parse(Path("backend/main.py").read_text())
+    violations: list[int] = []
+    for handler in (node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)):
+        if not isinstance(handler.type, ast.Name) or handler.type.id != "PublicationConflict":
+            continue
+        for raised in (node for node in ast.walk(handler) if isinstance(node, ast.Raise) and node.exc):
+            call = raised.exc
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                continue
+            if call.func.id != "HTTPException":
+                continue
+            detail = (
+                call.args[1]
+                if len(call.args) > 1
+                else next(
+                    (keyword.value for keyword in call.keywords if keyword.arg == "detail"),
+                    None,
+                )
+            )
+            if not isinstance(detail, ast.Dict):
+                violations.append(raised.lineno)
+    assert violations == []
+
+
+def test_all_literal_http_409_responses_have_structured_details():
+    tree = ast.parse(Path("backend/main.py").read_text())
+    violations: list[int] = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != "HTTPException":
+            continue
+        status = (
+            call.args[0]
+            if call.args
+            else next((keyword.value for keyword in call.keywords if keyword.arg == "status_code"), None)
+        )
+        if not isinstance(status, ast.Constant) or status.value != 409:
+            continue
+        detail = (
+            call.args[1]
+            if len(call.args) > 1
+            else next((keyword.value for keyword in call.keywords if keyword.arg == "detail"), None)
+        )
+        if (
+            detail is None
+            or isinstance(detail, ast.JoinedStr)
+            or (isinstance(detail, ast.Constant) and isinstance(detail.value, str))
+        ):
+            violations.append(call.lineno)
+        if isinstance(detail, ast.Dict):
+            keys = {key.value for key in detail.keys if isinstance(key, ast.Constant)}
+            if "code" not in keys or "message" not in keys:
+                violations.append(call.lineno)
+    assert violations == []

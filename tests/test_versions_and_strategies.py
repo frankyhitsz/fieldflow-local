@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from backend.fixtures import get_fixture
 from backend.hashing import content_hash
-from backend.models import ScheduleCandidate, ScheduleRun, ScheduleRunStatus
+from backend.models import ScheduleCandidate, ScheduleRunStatus
 from backend.scheduler import baseline_schedule
 from backend.storage import PublicationConflict, ScenarioRevisionConflict, Store
 from backend.verification import verify_schedule
@@ -21,25 +21,22 @@ from backend.verification import verify_schedule
 def _verified_candidate(store: Store, scenario, result) -> str:
     now = datetime.now(UTC).isoformat()
     suffix = uuid.uuid4().hex[:10]
-    active = store.active_plan_version(scenario.id)
-    run = ScheduleRun(
-        id=f"RUN-{suffix}",
-        scenario_id=scenario.id,
-        action="baseline",
-        scenario_revision=scenario.revision,
-        scenario_snapshot_hash=content_hash(scenario),
-        expected_active_plan_version_id=active.id if active else None,
+    reservation, run = store.reserve_plan_command(
+        scenario.id,
+        "baseline",
+        expected_revision=scenario.revision,
+        expected_active_plan_version_id=None,
+        check_active_plan=False,
+        source_mode="NONE",
+        source_plan_version_id=None,
+        command_fingerprint=f"test-{suffix}",
         solver_name=result.solver_name,
-        solver_version=result.solver_version,
         solver_config_hash=result.solver_config_hash,
-        solver_policy_fingerprint=result.solver_policy.fingerprint,
-        requested_time_limit_ms=0,
-        effective_time_limit_ms=0,
-        status=ScheduleRunStatus.running,
-        solution_found=False,
+        run_id=f"RUN-{suffix}",
         started_at=now,
     )
-    store.save_schedule_run(run)
+    run.solver_version = result.solver_version
+    run.solver_policy_fingerprint = result.solver_policy.fingerprint
     report = verify_schedule(scenario, result)
     candidate = ScheduleCandidate(
         id=f"CAND-{suffix}",
@@ -48,6 +45,8 @@ def _verified_candidate(store: Store, scenario, result) -> str:
         scenario_revision=scenario.revision,
         scenario_snapshot_hash=content_hash(scenario),
         expected_active_plan_version_id=run.expected_active_plan_version_id,
+        reservation_id=reservation.id,
+        reservation_hash=reservation.reservation_hash,
         solver_config_hash=result.solver_config_hash,
         solver_policy_fingerprint=result.solver_policy.fingerprint,
         schedule=result,
@@ -222,6 +221,95 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
                 json={"candidate_id": another["id"], "expected_revision": 2},
             )
             assert rejected_second_choice.status_code == 409
+
+
+def test_activate_and_restore_reject_changed_active_plan_with_structured_errors(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "active-plan-preconditions.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        first = client.get("/api/scenarios/main/plan-versions").json()[0]
+        assert (
+            client.post(
+                "/api/scenarios/main/optimize",
+                json={"strategy": "balanced", "time_limit_seconds": 1},
+            ).status_code
+            == 200
+        )
+        second = client.get("/api/scenarios/main/plan-versions").json()[1]
+
+        stale_activate = client.post(
+            f"/api/scenarios/main/plan-versions/{first['id']}/activate",
+            json={
+                "expected_revision": 0,
+                "expected_active_plan_version_id": first["id"],
+                "idempotency_key": "stale-activate-001",
+            },
+        )
+        assert stale_activate.status_code == 409, stale_activate.text
+        assert stale_activate.json()["detail"]["code"] == "ACTIVE_PLAN_CHANGED_DURING_COMMAND"
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
+
+        preview = client.get(f"/api/scenarios/main/plan-versions/{first['id']}/rollback-preview").json()
+        assert preview["current_plan_version_id"] == second["id"]
+        assert (
+            client.post(
+                "/api/scenarios/main/optimize",
+                json={"strategy": "low_travel", "time_limit_seconds": 1},
+            ).status_code
+            == 200
+        )
+        stale_restore = client.post(
+            f"/api/scenarios/main/plan-versions/{first['id']}/restore",
+            json={
+                "expected_revision": 0,
+                "expected_active_plan_version_id": second["id"],
+                "confirmation_token": preview["confirmation_token"],
+                "reason": "测试过期确认",
+                "idempotency_key": "stale-restore-001",
+            },
+        )
+        assert stale_restore.status_code == 409, stale_restore.text
+        assert stale_restore.json()["detail"]["code"] == "ROLLBACK_CONFIRMATION_EXPIRED"
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2, 3]
+
+
+def test_experiment_candidate_cannot_publish_over_newer_active_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "stale-experiment-active-plan.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        experiment_response = client.post(
+            "/api/scenarios/main/strategy-experiments",
+            json={"profile_ids": ["balanced"], "time_limit_seconds": 1},
+        )
+        assert experiment_response.status_code == 202, experiment_response.text
+        experiment = _wait_for_experiment(client, "main", experiment_response.json()["id"])
+        candidate = experiment["candidates"][0]
+        assert candidate["publishable"] is True
+        assert (
+            client.post(
+                "/api/scenarios/main/optimize",
+                json={"strategy": "low_travel", "time_limit_seconds": 1},
+            ).status_code
+            == 200
+        )
+        current = client.get("/api/scenarios/main/plan-versions").json()[-1]
+        stale = client.post(
+            f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish",
+            json={
+                "candidate_id": candidate["id"],
+                "expected_revision": 0,
+                "expected_active_plan_version_id": current["id"],
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["detail"]["code"] == "EXPERIMENT_ACTIVE_PLAN_CHANGED"
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
 
 
 def test_experiment_can_be_cancelled_cooperatively(monkeypatch, tmp_path):
@@ -725,7 +813,7 @@ def test_atomic_public_version_allocation(tmp_path):
         try:
             return store.publish_plan(scenario, pair[0], "baseline", candidate_id=pair[1])
         except PublicationConflict as error:
-            assert error.code == "ACTIVE_PLAN_VERSION_CONFLICT"
+            assert error.code == "ACTIVE_PLAN_CHANGED_DURING_COMMAND"
             return None
 
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -742,22 +830,22 @@ def test_run_and_candidate_completion_rolls_back_as_one_transaction(tmp_path):
     assert scenario is not None
     result = baseline_schedule(scenario, 0)
     now = datetime.now(UTC).isoformat()
-    run = ScheduleRun(
-        id="RUN-ATOMIC",
-        scenario_id=scenario.id,
-        action="baseline",
-        scenario_revision=scenario.revision,
-        scenario_snapshot_hash=content_hash(scenario),
+    reservation, run = store.reserve_plan_command(
+        scenario.id,
+        "baseline",
+        expected_revision=scenario.revision,
+        expected_active_plan_version_id=None,
+        check_active_plan=False,
+        source_mode="NONE",
+        source_plan_version_id=None,
+        command_fingerprint="atomic-run-completion",
         solver_name=result.solver_name,
-        solver_version=result.solver_version,
         solver_config_hash=result.solver_config_hash,
-        solver_policy_fingerprint=result.solver_policy.fingerprint,
-        requested_time_limit_ms=0,
-        effective_time_limit_ms=0,
-        status=ScheduleRunStatus.running,
+        run_id="RUN-ATOMIC",
         started_at=now,
     )
-    store.save_schedule_run(run)
+    run.solver_version = result.solver_version
+    run.solver_policy_fingerprint = result.solver_policy.fingerprint
     report = verify_schedule(scenario, result)
     candidate = ScheduleCandidate(
         id="CAND-ATOMIC",
@@ -765,6 +853,8 @@ def test_run_and_candidate_completion_rolls_back_as_one_transaction(tmp_path):
         scenario_id=scenario.id,
         scenario_revision=scenario.revision,
         scenario_snapshot_hash=content_hash(scenario),
+        reservation_id=reservation.id,
+        reservation_hash=reservation.reservation_hash,
         solver_config_hash=result.solver_config_hash,
         solver_policy_fingerprint=result.solver_policy.fingerprint,
         schedule=result,
@@ -882,7 +972,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 23
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -897,7 +987,7 @@ def test_schema_versions_1_through_15_converge_to_current_schema(tmp_path, legac
     migrated = Store(database)
     assert migrated.get_scenario("main") is not None
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert "publication_key" in {row[1] for row in connection.execute("PRAGMA table_info(command_keys)").fetchall()}
@@ -952,7 +1042,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"

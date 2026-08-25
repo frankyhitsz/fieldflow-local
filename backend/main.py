@@ -62,6 +62,7 @@ from .models import (
     OptimizeRequest,
     PairedMetricSummary,
     PlanningContext,
+    PlanningReservation,
     PlanUseCase,
     PlanVersion,
     PlanVersionPatch,
@@ -77,6 +78,7 @@ from .models import (
     RiskTrialOutcomeArtifact,
     RollbackPreview,
     ScenarioCreate,
+    ScenarioOperationalView,
     ScheduleArtifact,
     ScheduleCandidate,
     ScheduleResult,
@@ -162,6 +164,39 @@ def require_store() -> Store:
     if store is None:
         raise RuntimeError("FieldFlow Store 尚未启动；请通过 FastAPI lifespan 运行应用")
     return store
+
+
+def publication_conflict_detail(error: PublicationConflict) -> dict[str, object]:
+    details: dict[str, object] = {str(key): value for key, value in error.details.items()}
+    if "expected_active_plan_version_id" in details and "expected_active_plan_id" not in details:
+        details["expected_active_plan_id"] = details.pop("expected_active_plan_version_id")
+    if "current_active_plan_version_id" in details and "current_active_plan_id" not in details:
+        details["current_active_plan_id"] = details.pop("current_active_plan_version_id")
+    refresh_codes = {
+        "ACTIVE_PLAN_CHANGED",
+        "ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+        "ACTIVE_PLAN_VERSION_CONFLICT",
+        "SCENARIO_CHANGED_DURING_COMMAND",
+        "SCENARIO_REVISION_CONFLICT",
+        "PLANNING_RESERVATION_SCENARIO_CONFLICT",
+    }
+    retryable_codes = {
+        "ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+        "SCENARIO_CHANGED_DURING_COMMAND",
+        "EXECUTION_CONTEXT_CHANGED_DURING_COMMAND",
+        "IDEMPOTENT_REQUEST_IN_PROGRESS",
+    }
+    return {
+        "code": error.code,
+        "message": str(error),
+        "retryable": error.code in retryable_codes,
+        "refresh_required": error.code in refresh_codes,
+        **details,
+    }
+
+
+def publication_conflict_to_http(error: PublicationConflict, status_code: int = 409) -> HTTPException:
+    return HTTPException(status_code=status_code, detail=publication_conflict_detail(error))
 
 
 def safe_filename_component(value: str) -> str:
@@ -263,6 +298,7 @@ def save_scenario_change(
         raise HTTPException(
             409,
             detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
                 "message": "业务数据已被其他操作更新，请刷新后重试",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
@@ -454,7 +490,7 @@ def reserve_solve_command(publication_key: str | None, fingerprint: str | None) 
             return
         command = require_store().get_command_record("schedule-solve", publication_key, fingerprint)
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
     if command and command["status"] == "FAILED":
         payload = command["payload"]
         raise HTTPException(
@@ -534,12 +570,14 @@ def artifact(
 
 def prepare_replan_run(
     scenario: ScheduleScenario,
-    source: PlanVersion | None,
     request: ReplanRequest,
     *,
     run_id: str | None = None,
     run_started_at: str | None = None,
+    command_fingerprint: str | None = None,
 ) -> tuple[
+    PlanningReservation,
+    PlanVersion | None,
     ScheduleResult,
     list[ScheduleArtifact],
     ScheduleScenario,
@@ -549,11 +587,33 @@ def prepare_replan_run(
     PlanningContext,
     ScheduleRun,
 ]:
+    profile = profile_for_request(request.strategy, request.profile_id, request.time_limit_seconds)
+    preliminary_effective = scenario_for_profile(scenario, profile)
+    reservation, run = start_schedule_run(
+        scenario,
+        "replan",
+        source_mode="ACTIVE_OR_LATEST",
+        requested_time_limit_seconds=profile.time_limit_seconds,
+        solver_config_hash=content_hash(preliminary_effective.solver_config),
+        run_id=run_id,
+        started_at=run_started_at,
+        expected_active_plan_version_id=request.expected_active_plan_version_id,
+        check_active_plan="expected_active_plan_version_id" in request.model_fields_set,
+        command_fingerprint=command_fingerprint,
+    )
+    scenario = reservation.scenario_snapshot
+    source = reservation.source_plan
     previous = source.selected if source else None
     internal: list[ScheduleArtifact] = []
     if not previous:
         if any(order.status == WorkOrderStatus.started for order in scenario.work_orders):
-            raise HTTPException(409, "执行中的工单缺少可追溯的原方案，不能安全重排")
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "REPLAN_SOURCE_PLAN_REQUIRED",
+                    "message": "执行中的工单缺少可追溯的原方案，不能安全重排",
+                },
+            )
         balanced = require_profile("balanced")
         base_effective = scenario_for_profile(scenario, balanced)
         previous = optimized_schedule(
@@ -565,29 +625,20 @@ def prepare_replan_run(
         )
         previous = bind_solver_policy(previous, base_effective, balanced, "balanced", scenario)
         internal.append(artifact("candidate", previous, "balanced"))
-    profile = profile_for_request(request.strategy, request.profile_id, request.time_limit_seconds)
     effective = scenario_for_profile(scenario, profile)
     strategy_key = profile.id if profile.builtin else "custom"
     planning_time = request.planning_time
     assert planning_time is not None
-    execution_source_context = require_store().execution_source_context(scenario.id)
     planning_context = build_planning_context(
         scenario,
         source,
         planning_time,
-        execution_source_context,
+        reservation.execution_context,
     )
-    run = start_schedule_run(
-        scenario,
-        "replan",
-        source=source,
-        requested_time_limit_seconds=profile.time_limit_seconds,
-        planning_context=planning_context,
-        solver_config_hash=content_hash(effective.solver_config),
-        run_id=run_id,
-        started_at=run_started_at,
-    )
+    run = require_store().bind_schedule_run_context(run, reservation, planning_context)
     return (
+        reservation,
+        source,
         previous,
         internal,
         effective,
@@ -610,36 +661,47 @@ def start_schedule_run(
     solver_config_hash: str | None = None,
     run_id: str | None = None,
     started_at: str | None = None,
-) -> ScheduleRun:
-    requested_ms = int(round(requested_time_limit_seconds * 1000))
-    active_plan = require_store().active_plan_version(scenario.id)
-    run = ScheduleRun(
-        id=run_id or f"RUN-{uuid.uuid4().hex[:12]}",
-        scenario_id=scenario.id,
-        action=action,
-        scenario_revision=scenario.revision,
-        scenario_snapshot_hash=content_hash(scenario),
+    source_mode: Literal["NONE", "ACTIVE_OR_LATEST", "EXPLICIT"] | None = None,
+    expected_active_plan_version_id: str | None = None,
+    check_active_plan: bool = False,
+    command_fingerprint: str | None = None,
+) -> tuple[PlanningReservation, ScheduleRun]:
+    resolved_source_mode = source_mode or ("EXPLICIT" if source else "NONE")
+    reservation, run = require_store().reserve_plan_command(
+        scenario.id,
+        action,
+        expected_revision=scenario.revision,
+        expected_active_plan_version_id=expected_active_plan_version_id,
+        check_active_plan=check_active_plan,
+        source_mode=resolved_source_mode,
         source_plan_version_id=source.id if source else None,
-        source_plan_snapshot_hash=source.scenario_snapshot_hash if source else None,
-        expected_active_plan_version_id=active_plan.id if active_plan else None,
+        source_use_case=(PlanUseCase.audit_view if action == "reattest" else PlanUseCase.replay),
+        command_fingerprint=command_fingerprint
+        or content_hash(
+            {
+                "scenario_id": scenario.id,
+                "action": action,
+                "scenario_revision": scenario.revision,
+                "source_plan_version_id": source.id if source else None,
+                "solver_config_hash": solver_config_hash or content_hash(scenario.solver_config),
+                "requested_time_limit_seconds": requested_time_limit_seconds,
+            }
+        ),
+        requested_time_limit_seconds=requested_time_limit_seconds,
         solver_name=solver_name,
-        solver_version="pending",
         solver_config_hash=solver_config_hash or content_hash(scenario.solver_config),
-        requested_time_limit_ms=requested_ms,
-        effective_time_limit_ms=requested_ms,
-        status=ScheduleRunStatus.running,
-        started_at=started_at or _now(),
-        planning_context=planning_context,
-        planning_context_hash=content_hash(planning_context) if planning_context else None,
+        run_id=run_id,
+        started_at=started_at,
     )
-    existing = require_store().get_schedule_run(run.id)
-    if not existing:
-        return require_store().save_schedule_run(run)
-    if existing.model_dump(mode="json") == run.model_dump(mode="json"):
-        return existing
-    if existing.status is ScheduleRunStatus.failed and existing.termination_reason == "APPLICATION_RESTARTED":
-        return require_store().resume_interrupted_schedule_run(run)
-    raise PublicationConflict("相同求解标识已经对应其他输入或终态")
+    if reservation.scenario_snapshot_hash != content_hash(scenario):
+        raise PublicationConflict(
+            "命令读取的业务快照已变化",
+            code="SCENARIO_CHANGED_DURING_COMMAND",
+            details={"reservation_id": reservation.id},
+        )
+    if planning_context is not None:
+        run = require_store().bind_schedule_run_context(run, reservation, planning_context)
+    return reservation, run
 
 
 def fail_schedule_run(run: ScheduleRun, reason: str) -> None:
@@ -789,6 +851,8 @@ def publish_selected(
         scenario_snapshot_hash=content_hash(scenario),
         source_plan_version_id=source.id if source else None,
         expected_active_plan_version_id=run.expected_active_plan_version_id,
+        reservation_id=run.reservation_id,
+        reservation_hash=run.reservation_hash,
         solver_config_hash=result.solver_config_hash,
         solver_policy_fingerprint=result.solver_policy.fingerprint if result.solver_policy else "",
         schedule=result,
@@ -854,13 +918,14 @@ def publish_selected(
         raise HTTPException(
             409,
             detail={
+                "code": "SCENARIO_CHANGED_DURING_COMMAND",
                 "message": "求解期间业务数据已变化，结果未发布，请重新运行",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
             },
         ) from error
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
     return plan.selected
 
 
@@ -890,6 +955,16 @@ def get_scenario(scenario_id: str, response: Response) -> ScheduleScenario:
     return scenario
 
 
+@router.get(
+    "/api/scenarios/{scenario_id}/operational-view",
+    response_model=ScenarioOperationalView,
+)
+def get_operational_view(scenario_id: str, response: Response) -> ScenarioOperationalView:
+    view = require_store().operational_view(scenario_id)
+    response.headers["ETag"] = f'"D{view.scenario_revision}"'
+    return view
+
+
 @router.post("/api/scenarios", response_model=ScheduleScenario)
 def create_scenario(request: ScenarioCreate) -> ScheduleScenario:
     try:
@@ -904,7 +979,12 @@ def create_scenario(request: ScenarioCreate) -> ScheduleScenario:
         require_store().save_scenario(scenario, "创建业务场景")
     except ScenarioRevisionConflict as error:
         raise HTTPException(
-            409, detail={"message": "场景标识发生冲突，请重新创建", "current_revision": error.current}
+            409,
+            detail={
+                "code": "SCENARIO_ID_CONFLICT",
+                "message": "场景标识发生冲突，请重新创建",
+                "current_revision": error.current,
+            },
         ) from error
     return scenario
 
@@ -930,7 +1010,10 @@ def reset_scenario(
         )
     revisions = require_store().list_revisions(scenario_id)
     if not revisions:
-        raise HTTPException(409, "该场景没有可恢复的初始业务数据")
+        raise HTTPException(
+            409,
+            detail={"code": "SCENARIO_INITIAL_REVISION_MISSING", "message": "该场景没有可恢复的初始业务数据"},
+        )
     fresh = revisions[0].scenario.model_copy(deep=True)
     fresh.id = current.id
     fresh.name = current.name
@@ -942,6 +1025,7 @@ def reset_scenario(
         raise HTTPException(
             409,
             detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
                 "message": "业务数据已被其他操作更新，请刷新后重试",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
@@ -972,7 +1056,14 @@ def create_work_order(
     validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     work_order = request.to_work_order()
     if any(item.id == work_order.id for item in scenario.work_orders):
-        raise HTTPException(409, f"工单 {work_order.id} 已存在")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "WORK_ORDER_ALREADY_EXISTS",
+                "message": f"工单 {work_order.id} 已存在",
+                "resource_id": work_order.id,
+            },
+        )
     scenario.work_orders.append(normalize_order(work_order))
     return save_scenario_change(scenario, f"新增工单 {work_order.id}", impact=FieldImpact.new_demand)
 
@@ -1016,7 +1107,14 @@ def update_work_order(
             "reported_at",
         }
         if any(key in updates and updates[key] != original.model_dump().get(key) for key in immutable_fields):
-            raise HTTPException(409, "已开始或已完成的工单只能修改备注")
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "EXECUTION_STATUS_EVENT_REQUIRED",
+                    "message": "已开始或已完成的工单只能修改备注",
+                    "resource_id": work_order_id,
+                },
+            )
     payload = original.model_dump()
     payload.update(updates)
     if updates.get("is_emergency") is False:
@@ -1082,6 +1180,7 @@ def execute_work_order_transition(
         raise HTTPException(
             409,
             detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
                 "message": "业务数据已变化，请刷新后重试",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
@@ -1134,7 +1233,14 @@ def delete_work_order(
     if not order:
         raise HTTPException(404, f"工单 {work_order_id} 不存在")
     if order.status.value in {"started", "completed"}:
-        raise HTTPException(409, "已开始或已完成的工单不能删除")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXECUTED_WORK_ORDER_DELETE_FORBIDDEN",
+                "message": "已开始或已完成的工单不能删除",
+                "resource_id": work_order_id,
+            },
+        )
     active_plan = require_store().active_plan_version(scenario_id)
     is_unassigned_in_active_plan = bool(
         active_plan and any(item.work_order_id == work_order_id for item in active_plan.selected.unassigned)
@@ -1164,7 +1270,14 @@ def create_technician(
     scenario = require_scenario(scenario_id)
     validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     if any(item.id == technician.id for item in scenario.technicians):
-        raise HTTPException(409, f"技师 {technician.id} 已存在")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "TECHNICIAN_ALREADY_EXISTS",
+                "message": f"技师 {technician.id} 已存在",
+                "resource_id": technician.id,
+            },
+        )
     scenario.technicians.append(Technician.model_validate(technician.model_dump(mode="python")))
     return save_scenario_change(scenario, f"新增技师 {technician.id}", impact=FieldImpact.capacity_added)
 
@@ -1244,7 +1357,14 @@ def _lock_assignment(
     if not set(order.required_skills).issubset(set(tech.skills)):
         raise HTTPException(422, f"{tech.name} 不具备该工单要求的全部技能")
     if order.status is not WorkOrderStatus.pending:
-        raise HTTPException(409, "已开始或已完成工单不能更改锁定关系")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXECUTED_WORK_ORDER_LOCK_FORBIDDEN",
+                "message": "已开始或已完成工单不能更改锁定关系",
+                "resource_id": order.id,
+            },
+        )
     active_assignment = next(
         (
             item
@@ -1285,6 +1405,54 @@ def lock_assignment(
     return _lock_assignment(scenario_id, request, expected_revision=scenario.revision)
 
 
+def replay_manual_reassignment_terminal(
+    scenario_id: str,
+    command: dict,
+) -> ManualReassignmentResult:
+    """Rebuild a terminal saga response from verified resources, never its cached response body."""
+    current = require_scenario(scenario_id)
+    active = require_store().active_plan_version(scenario_id)
+    if command["status"] == "COMPLETED":
+        publication_key = command.get("publication_key")
+        published = require_store().plan_for_publication_key(publication_key) if publication_key else None
+        if not published and command.get("resource_type") == "plan_version" and command.get("resource_id"):
+            published = require_store().get_plan_version(scenario_id, command["resource_id"])
+        if not published:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "MANUAL_REASSIGNMENT_RESOURCE_MISSING",
+                    "message": "人工改派记录对应的方案不存在，不能安全重放结果",
+                },
+            )
+        verified = require_plan_for_use(scenario_id, published.id, PlanUseCase.replay)
+        return ManualReassignmentResult(
+            lock_persisted=any(
+                item.work_order_id == command.get("payload", {}).get("work_order_id")
+                and item.technician_id == command.get("payload", {}).get("target_technician_id")
+                for item in current.locked_assignments
+            ),
+            replan_status="COMPLETED",
+            active_plan_preserved=active is not None,
+            scenario=current,
+            schedule=verified.selected,
+        )
+    return ManualReassignmentResult(
+        lock_persisted=any(
+            item.work_order_id == command.get("payload", {}).get("work_order_id")
+            and item.technician_id == command.get("payload", {}).get("target_technician_id")
+            for item in current.locked_assignments
+        ),
+        replan_status="FAILED",
+        active_plan_preserved=active is not None,
+        scenario=current,
+        error={
+            "code": "REPLAN_FAILED_AFTER_LOCK",
+            "message": "人工锁定已保存，但局部重排运行失败",
+        },
+    )
+
+
 def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -> ManualReassignmentResult:
     """Recoverable saga: persist the lock once, then idempotently publish replan."""
     scenario = require_scenario(scenario_id)
@@ -1294,12 +1462,31 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
     try:
         existing = require_store().get_command_record(namespace, request.idempotency_key, fingerprint)
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
     if existing and existing["status"] in {"COMPLETED", "FAILED_AFTER_LOCK"}:
-        return ManualReassignmentResult.model_validate(existing["payload"]["result"])
+        return replay_manual_reassignment_terminal(scenario_id, existing)
     if existing and existing["status"] in {"FAILED", "FAILED_CONTEXT_CHANGED"}:
-        payload = existing["payload"]
-        raise HTTPException(int(payload.get("http_status", 409)), detail=payload.get("detail", payload))
+        current = require_scenario(scenario_id)
+        code = (
+            "MANUAL_REASSIGNMENT_CONTEXT_CHANGED"
+            if existing["status"] == "FAILED_CONTEXT_CHANGED"
+            else "MANUAL_REASSIGNMENT_FAILED"
+        )
+        stored_detail = existing.get("payload", {}).get("detail")
+        if isinstance(stored_detail, dict) and stored_detail.get("code") == code:
+            raise HTTPException(409, detail=stored_detail)
+        raise HTTPException(
+            409,
+            detail={
+                "code": code,
+                "message": (
+                    "锁定提交后的业务数据又发生变化，不能静默恢复原重排"
+                    if existing["status"] == "FAILED_CONTEXT_CHANGED"
+                    else "人工改派未提交，请刷新当前数据后重试"
+                ),
+                "current_revision": current.revision,
+            },
+        )
     if not existing:
         if scenario.revision != request.expected_revision:
             raise HTTPException(
@@ -1337,7 +1524,7 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
                     },
                 )
         except PublicationConflict as error:
-            raise HTTPException(409, str(error)) from error
+            raise publication_conflict_to_http(error) from error
         existing = require_store().get_command_record(namespace, request.idempotency_key, fingerprint)
         assert existing
 
@@ -1364,7 +1551,6 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
                 **payload,
                 "phase": "COMPLETED",
                 "plan_version_id": published.id,
-                "result": result.model_dump(mode="json"),
             },
         )
         return result
@@ -1495,13 +1681,16 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
         )
 
     try:
+        replan_payload: dict[str, object] = {
+            "planning_time": request.planning_time,
+            "strategy": "stable",
+            "idempotency_key": request.idempotency_key,
+        }
+        if "expected_active_plan_version_id" in request.model_fields_set:
+            replan_payload["expected_active_plan_version_id"] = request.expected_active_plan_version_id
         schedule = _run_replan(
             scenario_id,
-            ReplanRequest(
-                planning_time=request.planning_time,
-                strategy="stable",
-                idempotency_key=request.idempotency_key,
-            ),
+            ReplanRequest.model_validate(replan_payload),
             run_identity=(run_id, run_started_at),
             on_run_created=record_replan_created,
         )
@@ -1531,15 +1720,17 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
         if isinstance(error.detail, dict) and error.detail.get("code") == "IDEMPOTENT_REQUEST_IN_PROGRESS":
             raise
         current = require_scenario(scenario_id)
-        detail = error.detail if isinstance(error.detail, dict) else {"message": str(error.detail)}
         result = ManualReassignmentResult(
             lock_persisted=True,
             replan_status="FAILED",
             active_plan_preserved=require_store().active_plan_version(scenario_id) is not None,
             scenario=current,
-            error={"http_status": error.status_code, **detail},
+            error={
+                "code": "REPLAN_FAILED_AFTER_LOCK",
+                "message": "人工锁定已保存，但局部重排运行失败",
+            },
         )
-    except Exception as error:
+    except Exception:
         current = require_scenario(scenario_id)
         result = ManualReassignmentResult(
             lock_persisted=True,
@@ -1547,9 +1738,8 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
             active_plan_preserved=require_store().active_plan_version(scenario_id) is not None,
             scenario=current,
             error={
-                "http_status": 500,
+                "code": "REPLAN_FAILED_AFTER_LOCK",
                 "message": "人工锁定已保存，但局部重排运行失败",
-                "error_type": type(error).__name__,
             },
         )
     result_plan = require_store().plan_for_publication_key(publication_key) if result.schedule else None
@@ -1565,7 +1755,6 @@ def _manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) -
             **payload,
             "phase": "COMPLETED" if result.schedule else "FAILED_AFTER_LOCK",
             "plan_version_id": result_plan.id if result_plan else None,
-            "result": result.model_dump(mode="json"),
         },
     )
     return result
@@ -1628,14 +1817,25 @@ def run_baseline(
 ) -> ScheduleResult:
     scenario = require_scenario(scenario_id)
     if any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders):
-        raise HTTPException(409, "场景已有执行记录，请使用局部重排延续当前执行位置和容量")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "BASELINE_EXECUTION_CONTEXT_CONFLICT",
+                "message": "场景已有执行记录，请使用局部重排延续当前执行位置和容量",
+            },
+        )
     publication_key, fingerprint, existing = publication_retry("baseline", scenario, idempotency_key, {})
     if existing:
         return existing.selected
     reserve_solve_command(publication_key, fingerprint)
     run: ScheduleRun | None = None
     try:
-        run = start_schedule_run(scenario, "baseline", solver_name="fieldflow-greedy")
+        _reservation, run = start_schedule_run(
+            scenario,
+            "baseline",
+            solver_name="fieldflow-greedy",
+            command_fingerprint=fingerprint,
+        )
         update_solve_command(
             publication_key,
             fingerprint,
@@ -1683,7 +1883,13 @@ def run_optimize(
 ) -> ScheduleResult:
     scenario = require_scenario(scenario_id)
     if any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders):
-        raise HTTPException(409, "场景已有执行记录，请使用局部重排延续当前执行位置和容量")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "OPTIMIZE_EXECUTION_CONTEXT_CONFLICT",
+                "message": "场景已有执行记录，请使用局部重排延续当前执行位置和容量",
+            },
+        )
     request = request or OptimizeRequest()
     profile = profile_for_request(request.strategy, request.profile_id, request.time_limit_seconds)
     publication_key, fingerprint, existing = publication_retry(
@@ -1697,18 +1903,20 @@ def run_optimize(
     reserve_solve_command(publication_key, fingerprint)
     effective = scenario_for_profile(scenario, profile)
     strategy_key = profile.id if profile.builtin else "custom"
-    source = require_store().active_plan_version(scenario_id) or require_store().latest_plan_version(scenario_id)
-    if source is not None:
-        source = require_plan_for_use(scenario_id, source.id, PlanUseCase.replay)
     run: ScheduleRun | None = None
     try:
-        run = start_schedule_run(
+        reservation, run = start_schedule_run(
             scenario,
             "optimize",
-            source=source,
+            source_mode="ACTIVE_OR_LATEST",
             requested_time_limit_seconds=profile.time_limit_seconds,
             solver_config_hash=content_hash(effective.solver_config),
+            expected_active_plan_version_id=request.expected_active_plan_version_id,
+            check_active_plan="expected_active_plan_version_id" in request.model_fields_set,
+            command_fingerprint=fingerprint,
         )
+        scenario = reservation.scenario_snapshot
+        source = reservation.source_plan
         update_solve_command(
             publication_key,
             fingerprint,
@@ -1823,7 +2031,7 @@ def _run_replan(
                 request_fingerprint,
             )
         except PublicationConflict as error:
-            raise HTTPException(409, str(error)) from error
+            raise publication_conflict_to_http(error) from error
         if existing_publication:
             return existing_publication.selected
     if incoming and idempotency_key and request_fingerprint:
@@ -1832,7 +2040,7 @@ def _run_replan(
                 command_namespace, idempotency_key, request_fingerprint
             )
         except PublicationConflict as error:
-            raise HTTPException(409, str(error)) from error
+            raise publication_conflict_to_http(error) from error
         if existing_command and existing_command["status"] == "COMPLETED":
             plan = require_plan_for_use(
                 scenario_id,
@@ -1893,16 +2101,15 @@ def _run_replan(
                     },
                 )
         except PublicationConflict as error:
-            raise HTTPException(409, str(error)) from error
+            raise publication_conflict_to_http(error) from error
         except ValueError as error:
             raise HTTPException(422, detail={"message": "突发工单数据不完整", "error": str(error)}) from error
     elif solve_publication_key and request_fingerprint:
         reserve_solve_command(solve_publication_key, request_fingerprint)
-    source = require_store().active_plan_version(scenario_id) or require_store().latest_plan_version(scenario_id)
-    if source is not None:
-        source = require_plan_for_use(scenario_id, source.id, PlanUseCase.replay)
     try:
         (
+            reservation,
+            source,
             previous,
             internal,
             effective,
@@ -1913,11 +2120,12 @@ def _run_replan(
             run,
         ) = prepare_replan_run(
             scenario,
-            source,
             request,
             run_id=run_identity[0] if run_identity else None,
             run_started_at=run_identity[1] if run_identity else None,
+            command_fingerprint=request_fingerprint,
         )
+        scenario = reservation.scenario_snapshot
         if on_run_created:
             on_run_created(run)
     except HTTPException as error:
@@ -2331,7 +2539,7 @@ def execute_decision_analysis_run(
         risk_request = RiskSimulationRequest.model_validate(
             {**risk_parameters.model_dump(mode="json"), "analysis_scope": context.analysis_scope}
         )
-        policy_version = "FIELD_SERVICE_SIMULATION_V5"
+        policy_version = "FIELD_SERVICE_SIMULATION_V6"
         policy_snapshot = risk_request.model_dump(mode="json")
     request_snapshot = request.model_dump(mode="json")
     runtime_manifest = decision_runtime_manifest()
@@ -2511,6 +2719,7 @@ def execute_decision_analysis_run(
                 risk_request,
                 result.seed,
                 context.analysis_as_of_time or 0,
+                active_work_order_ids=result.emergency_location_work_order_ids,
             )
             if content_hash(scenario_set_manifest) != result.simulation_scenario_set_hash:
                 raise DecisionAnalysisError(
@@ -2529,6 +2738,8 @@ def execute_decision_analysis_run(
                 analysis_run_id=reserved.id,
                 emergency_dispatch_policy=risk_request.emergency_dispatch_policy,
                 emergency_responder_selection_policy=risk_request.emergency_responder_selection_policy,
+                emergency_location_policy=risk_request.emergency_location_policy,
+                emergency_location_work_order_ids=result.emergency_location_work_order_ids,
                 scenario_snapshot_hash=plan.scenario_snapshot_hash,
                 seed=result.seed,
                 trials=result.trials,
@@ -2567,6 +2778,7 @@ def execute_decision_analysis_run(
                 scenario_id=scenario_id,
                 analysis_run_id=reserved.id,
                 scenario_set_hash=result.simulation_scenario_set_hash,
+                detail_policy=risk_request.artifact_detail_policy,
                 metrics=result.trial_metrics,
                 created_at=_now(),
             )
@@ -3488,6 +3700,7 @@ def activate_plan_version(
         raise HTTPException(
             409,
             detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
                 "message": "业务数据已变化，请刷新后重试",
                 "expected_revision": request.expected_revision,
                 "current_revision": current.revision,
@@ -3506,6 +3719,7 @@ def activate_plan_version(
         raise HTTPException(
             409,
             detail={
+                "code": "PLAN_SCENARIO_MISMATCH",
                 "message": "历史计划使用的业务数据与当前场景不同，不能直接激活",
                 "added_work_orders": preview.added_work_orders,
                 "removed_work_orders": preview.removed_work_orders,
@@ -3534,13 +3748,17 @@ def activate_plan_version(
             stability_baseline.selected if stability_baseline else None,
             provider=require_store().travel_provider,
         )
-    run = start_schedule_run(
+    reservation, run = start_schedule_run(
         current,
         "activate",
         source=source,
         solver_name="plan-activation",
         solver_config_hash=selected.solver_config_hash,
+        expected_active_plan_version_id=request.expected_active_plan_version_id,
+        check_active_plan="expected_active_plan_version_id" in request.model_fields_set,
+        command_fingerprint=fingerprint,
     )
+    source = reservation.source_plan or source
     published = publish_selected(
         current,
         selected,
@@ -3653,13 +3871,17 @@ def reattest_plan_version(
     selected.solver_note += f" 重新认证模式：{request.mode.value}。"
     if selected.kind != "replan":
         selected = normalize_schedule(current, selected, provider=require_store().travel_provider)
-    run = start_schedule_run(
+    reservation, run = start_schedule_run(
         current,
         "reattest",
         source=source,
         solver_name="plan-reattestation",
         solver_config_hash=selected.solver_config_hash,
+        expected_active_plan_version_id=request.expected_active_plan_version_id,
+        check_active_plan="expected_active_plan_version_id" in request.model_fields_set,
+        command_fingerprint=fingerprint,
     )
+    source = reservation.source_plan or source
     published = publish_selected(
         current,
         selected,
@@ -3712,7 +3934,7 @@ def clone_plan_scenario(
             source_version_id=source.id,
         )
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
 
 
 @router.get("/api/scenarios/{scenario_id}/plan-versions/{version_id}/rollback-preview", response_model=RollbackPreview)
@@ -3757,13 +3979,14 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
     try:
         existing = require_store().published_for_key(publication_key, fingerprint)
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
     if existing:
         return existing
     if current.revision != request.expected_revision:
         raise HTTPException(
             409,
             detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
                 "message": "业务数据已变化，请刷新后重新确认恢复",
                 "expected_revision": request.expected_revision,
                 "current_revision": current.revision,
@@ -3778,11 +4001,20 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         store.list_execution_events(scenario_id),
     )
     if request.confirmation_token != preview.confirmation_token:
-        raise HTTPException(409, "回滚确认已过期，请重新查看差异")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "ROLLBACK_CONFIRMATION_EXPIRED",
+                "message": "回滚确认已过期，请重新查看差异",
+                "expected_active_plan_id": request.expected_active_plan_version_id,
+                "current_active_plan_id": preview.current_plan_version_id,
+            },
+        )
     if preview.completed_work_orders_reopened:
         raise HTTPException(
             409,
             detail={
+                "code": "ROLLBACK_REOPENS_COMPLETED_WORK",
                 "message": "回滚会重新打开已有执行事件的已完成工单，禁止执行",
                 "completed_work_orders_reopened": preview.completed_work_orders_reopened,
             },
@@ -3791,6 +4023,7 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         raise HTTPException(
             409,
             detail={
+                "code": "ROLLBACK_REOPENS_STARTED_WORK",
                 "message": "回滚会重新打开服务中的工单，禁止执行",
                 "started_work_orders_reopened": preview.started_work_orders_reopened,
             },
@@ -3799,6 +4032,7 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         raise HTTPException(
             409,
             detail={
+                "code": "ROLLBACK_DELETES_EXECUTED_WORK",
                 "message": "回滚会删除已有执行记录的工单，禁止执行",
                 "executed_work_orders_deleted": preview.executed_work_orders_deleted,
                 "affected_execution_event_ids": preview.affected_execution_event_ids,
@@ -3808,10 +4042,30 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         raise HTTPException(
             409,
             detail={
+                "code": "ROLLBACK_DELETES_NEW_WORK",
                 "message": "回滚会删除历史版本之后新增的工单，默认禁止",
                 "removed_work_orders": preview.removed_work_orders,
             },
         )
+    expected_active_plan_id = (
+        request.expected_active_plan_version_id
+        if "expected_active_plan_version_id" in request.model_fields_set
+        else preview.current_plan_version_id
+    )
+    reservation, run = start_schedule_run(
+        current,
+        "restore",
+        source=source,
+        solver_name="plan-restore",
+        solver_config_hash=source.selected.solver_config_hash,
+        expected_active_plan_version_id=expected_active_plan_id,
+        check_active_plan=True,
+        command_fingerprint=fingerprint,
+    )
+    current = reservation.scenario_snapshot
+    source = reservation.source_plan or source
+    if not source.scenario_snapshot:
+        raise HTTPException(409, detail={"code": "SOURCE_PLAN_SNAPSHOT_MISSING", "message": "来源方案快照缺失"})
     restored = source.scenario_snapshot.model_copy(deep=True)
     restored.id = scenario_id
     restored.revision = current.revision + 1
@@ -3836,13 +4090,10 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         )
     else:
         selected = normalize_schedule(restored, selected, provider=require_store().travel_provider)
-    run = start_schedule_run(
-        restored,
-        "restore",
-        source=source,
-        solver_name="plan-restore",
-        solver_config_hash=selected.solver_config_hash,
-    )
+    run.scenario_revision = restored.revision
+    run.scenario_snapshot_hash = content_hash(restored)
+    run.solver_config_hash = selected.solver_config_hash
+    run = require_store().save_schedule_run(run)
     verification = validate_result(
         restored,
         selected,
@@ -3856,6 +4107,8 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         scenario_snapshot_hash=content_hash(restored),
         source_plan_version_id=source.id,
         expected_active_plan_version_id=run.expected_active_plan_version_id,
+        reservation_id=run.reservation_id,
+        reservation_hash=run.reservation_hash,
         solver_config_hash=selected.solver_config_hash,
         solver_policy_fingerprint=selected.solver_policy.fingerprint if selected.solver_policy else "",
         schedule=selected,
@@ -3910,13 +4163,14 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         raise HTTPException(
             409,
             detail={
+                "code": "ROLLBACK_SCENARIO_CHANGED",
                 "message": "业务数据已变化，请刷新后重新确认恢复",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
             },
         ) from error
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
 
 
 def build_comparison(
@@ -4027,7 +4281,10 @@ def comparison(scenario_id: str, before: str | None = None, after: str | None = 
         )
         before_result = internal_baseline or (baseline_plan.selected if baseline_plan else None)
         if not before_result:
-            raise HTTPException(409, "指定方案没有可比较的基线")
+            raise HTTPException(
+                409,
+                detail={"code": "COMPARISON_BASELINE_MISSING", "message": "指定方案没有可比较的基线"},
+            )
         return build_comparison(
             scenario_id,
             before_result,
@@ -4041,7 +4298,7 @@ def comparison(scenario_id: str, before: str | None = None, after: str | None = 
         if item.effective_integrity is AnalysisIntegrityStatus.verified
     ]
     if not plans:
-        raise HTTPException(409, "请先生成至少一个方案")
+        raise HTTPException(409, detail={"code": "PLAN_REQUIRED", "message": "请先生成至少一个方案"})
     after_plan = store.active_plan_version(scenario_id) or next(
         (item for item in reversed(plans) if item.action != "baseline"),
         plans[-1],
@@ -4053,7 +4310,10 @@ def comparison(scenario_id: str, before: str | None = None, after: str | None = 
         None,
     )
     if not before_result:
-        raise HTTPException(409, "当前方案没有可比较的基线")
+        raise HTTPException(
+            409,
+            detail={"code": "COMPARISON_BASELINE_MISSING", "message": "当前方案没有可比较的基线"},
+        )
     return build_comparison(
         scenario_id,
         before_result,
@@ -4080,7 +4340,7 @@ def update_strategy_profile(profile_id: str, request: StrategyProfileCreate) -> 
     try:
         return require_store().save_profile(request, profile_id)
     except ValueError as error:
-        raise HTTPException(409, str(error)) from error
+        raise HTTPException(409, detail={"code": "STRATEGY_PROFILE_CONFLICT", "message": str(error)}) from error
 
 
 @router.delete("/api/strategy-profiles/{profile_id}", status_code=204)
@@ -4088,7 +4348,7 @@ def delete_strategy_profile(profile_id: str) -> Response:
     try:
         deleted = require_store().delete_profile(profile_id)
     except ValueError as error:
-        raise HTTPException(409, str(error)) from error
+        raise HTTPException(409, detail={"code": "STRATEGY_PROFILE_CONFLICT", "message": str(error)}) from error
     if not deleted:
         raise HTTPException(404, "策略不存在")
     return Response(status_code=204)
@@ -4192,12 +4452,24 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                 profile.time_limit_seconds = override_limit
             effective = scenario_for_profile(scenario, profile)
             strategy_key = profile.id if profile.builtin else "custom"
-            run = start_schedule_run(
+            reservation, run = start_schedule_run(
                 scenario,
                 "experiment",
+                source_mode="ACTIVE_OR_LATEST",
                 requested_time_limit_seconds=profile.time_limit_seconds,
                 solver_config_hash=content_hash(effective.solver_config),
+                expected_active_plan_version_id=experiment.expected_active_plan_version_id,
+                check_active_plan=True,
+                command_fingerprint=content_hash(
+                    {
+                        "experiment_id": experiment.id,
+                        "profile_id": profile.id,
+                        "experiment_fingerprint": experiment.fingerprint,
+                    }
+                ),
             )
+            scenario = reservation.scenario_snapshot
+            effective = scenario_for_profile(scenario, profile)
             try:
                 baseline = baseline_schedule(
                     effective,
@@ -4227,7 +4499,10 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                     scenario_id=scenario.id,
                     scenario_revision=scenario.revision,
                     scenario_snapshot_hash=content_hash(scenario),
+                    source_plan_version_id=reservation.source_plan_version_id,
                     expected_active_plan_version_id=run.expected_active_plan_version_id,
+                    reservation_id=run.reservation_id,
+                    reservation_hash=run.reservation_hash,
                     solver_config_hash=result.solver_config_hash,
                     schedule=result,
                     solver_policy_fingerprint=result.solver_policy.fingerprint if result.solver_policy else "",
@@ -4350,6 +4625,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
         raise HTTPException(422, "一次实验最多选择 8 个策略")
     profiles = [require_profile(profile_id).model_copy(deep=True) for profile_id in profile_ids]
     scenario_snapshot_hash = content_hash(scenario)
+    active_plan = require_store().active_plan_version(target_id)
     experiment_fingerprint = content_hash(
         {
             "scenario_snapshot_hash": scenario_snapshot_hash,
@@ -4361,6 +4637,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
             "score_policy_version": "FIELD_SERVICE_SCORE_V2",
             "score_policy_snapshot": COMMON_EVALUATION_POLICY,
             "seed": scenario.seed,
+            "expected_active_plan_version_id": active_plan.id if active_plan else None,
         }
     )
     experiment = StrategyExperiment(
@@ -4377,6 +4654,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
         profile_snapshots=profiles,
         fingerprint=experiment_fingerprint,
         scenario_snapshot_hash=scenario_snapshot_hash,
+        expected_active_plan_version_id=active_plan.id if active_plan else None,
         score_policy_version="FIELD_SERVICE_SCORE_V2",
         score_policy_snapshot=COMMON_EVALUATION_POLICY,
         travel_model_version=require_store().travel_provider.version,
@@ -4450,13 +4728,24 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
     if not experiment or experiment.scenario_id != scenario_id:
         raise HTTPException(404, "策略实验不存在")
     if experiment.status not in {"COMPLETED", "COMPLETED_WITH_ERRORS"}:
-        raise HTTPException(409, "策略实验尚未完成")
+        raise HTTPException(
+            409,
+            detail={"code": "EXPERIMENT_NOT_COMPLETED", "message": "策略实验尚未完成", "resource_id": experiment.id},
+        )
     if experiment.winner_candidate_id and experiment.winner_candidate_id != request.candidate_id:
-        raise HTTPException(409, "该实验已发布其他候选，一次实验只能选定一个方案")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXPERIMENT_ALREADY_PUBLISHED",
+                "message": "该实验已发布其他候选，一次实验只能选定一个方案",
+                "resource_id": experiment.winner_candidate_id,
+            },
+        )
     if scenario.revision != request.expected_revision or experiment.data_revision != scenario.revision:
         raise HTTPException(
             409,
             detail={
+                "code": "EXPERIMENT_SCENARIO_CHANGED",
                 "message": "实验完成后业务数据已变化，请重新运行",
                 "experiment_revision": experiment.data_revision,
                 "current_revision": scenario.revision,
@@ -4465,13 +4754,27 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
     candidate = next((item for item in experiment.candidates if item.id == request.candidate_id), None)
     if not candidate:
         raise HTTPException(404, "候选方案不存在")
+    if experiment.winner_candidate_id == candidate.id and experiment.winner_plan_version_id:
+        return require_plan_for_use(
+            scenario_id,
+            experiment.winner_plan_version_id,
+            PlanUseCase.replay,
+        )
     if not candidate.publishable:
-        raise HTTPException(409, "该候选没有可发布的可行方案")
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXPERIMENT_CANDIDATE_NOT_PUBLISHABLE",
+                "message": "该候选没有可发布的可行方案",
+                "resource_id": candidate.id,
+            },
+        )
     verification = validate_result(scenario, candidate.schedule)
     if not verification.publishable:
         raise HTTPException(
             409,
             detail={
+                "code": "EXPERIMENT_CANDIDATE_VALIDATION_FAILED",
                 "message": "候选方案未通过当前发布验证",
                 "errors": [item.model_dump() for item in verification.errors],
             },
@@ -4482,10 +4785,57 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
         else None
     )
     if not schedule_candidate:
-        raise HTTPException(409, "候选方案缺少可追溯的求解记录，请重新运行实验")
-    source = require_store().active_plan_version(scenario_id)
-    if source is not None:
-        source = require_plan_for_use(scenario_id, source.id, PlanUseCase.replay)
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXPERIMENT_CANDIDATE_PROVENANCE_MISSING",
+                "message": "候选方案缺少可追溯的求解记录，请重新运行实验",
+                "resource_id": candidate.id,
+            },
+        )
+    current_active = require_store().active_plan_version(scenario_id)
+    current_active_id = current_active.id if current_active else None
+    expected_active_id = schedule_candidate.expected_active_plan_version_id
+    if expected_active_id != experiment.expected_active_plan_version_id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXPERIMENT_PROVENANCE_MISMATCH",
+                "message": "实验候选与实验冻结的活动方案不一致，请重新运行实验",
+                "experiment_active_plan_version_id": experiment.expected_active_plan_version_id,
+                "candidate_active_plan_version_id": expected_active_id,
+            },
+        )
+    if (
+        "expected_active_plan_version_id" in request.model_fields_set
+        and request.expected_active_plan_version_id != current_active_id
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "ACTIVE_PLAN_PRECONDITION_FAILED",
+                "message": "活动方案已变化，请刷新后重新确认发布",
+                "expected_active_plan_version_id": request.expected_active_plan_version_id,
+                "current_active_plan_version_id": current_active_id,
+            },
+        )
+    if current_active_id != expected_active_id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXPERIMENT_ACTIVE_PLAN_CHANGED",
+                "message": "实验运行后活动方案已变化，请重新运行实验",
+                "experiment_active_plan_version_id": expected_active_id,
+                "current_active_plan_version_id": current_active_id,
+            },
+        )
+    source = None
+    if schedule_candidate.source_plan_version_id:
+        source = require_plan_for_use(
+            scenario_id,
+            schedule_candidate.source_plan_version_id,
+            PlanUseCase.replay,
+        )
     try:
         published = require_store().publish_plan(
             scenario,
@@ -4507,13 +4857,14 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
         raise HTTPException(
             409,
             detail={
+                "code": "EXPERIMENT_SCENARIO_CHANGED",
                 "message": "业务数据已变化，请重新运行策略实验",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
             },
         ) from error
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise publication_conflict_to_http(error) from error
 
 
 @router.get("/api/scenarios/{scenario_id}/plan-versions/{version_id}/report", response_class=HTMLResponse)
@@ -4628,11 +4979,48 @@ def create_app(
             status_code=409,
             content={
                 "detail": {
-                    "code": "RECORD_INTEGRITY_FAILED",
+                    "code": error.code,
                     "legacy_code": "MALFORMED_ATTESTED_RECORD",
                     "message": str(error),
                     "record_id": error.record_id,
                     "record_type": error.record_type,
+                    **error.details,
+                }
+            },
+        )
+
+    @application.exception_handler(PublicationConflict)
+    async def publication_conflict_handler(_request: Request, error: PublicationConflict):
+        return JSONResponse(status_code=409, content={"detail": publication_conflict_detail(error)})
+
+    @application.exception_handler(ScenarioRevisionConflict)
+    async def scenario_revision_conflict_handler(_request: Request, error: ScenarioRevisionConflict):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": "SCENARIO_REVISION_CONFLICT",
+                    "message": "业务数据已变化，请刷新后重试",
+                    "retryable": True,
+                    "refresh_required": True,
+                    "expected_revision": error.expected,
+                    "current_revision": error.current,
+                }
+            },
+        )
+
+    @application.exception_handler(ActivePlanConflict)
+    async def active_plan_conflict_handler(_request: Request, error: ActivePlanConflict):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": "ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+                    "message": "活动方案已变化，请刷新后重试",
+                    "retryable": True,
+                    "refresh_required": True,
+                    "expected_active_plan_id": error.expected,
+                    "current_active_plan_id": error.current,
                 }
             },
         )

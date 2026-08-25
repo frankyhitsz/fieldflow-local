@@ -8,7 +8,7 @@ import {
 import { api } from './api'
 import { ReviewView, TechnicianEditor, TechniciansView, VersionsView, WorkOrderEditor } from './Management'
 import { StrategyLab } from './StrategyLab'
-import type { Assignment, Comparison, PlanVersion, Scenario, Schedule, Strategy, StrategyProfile, Technician, Unassigned, WorkOrder } from './types'
+import type { Assignment, Comparison, OperationalView, PlanVersion, Scenario, Schedule, Strategy, StrategyProfile, Technician, Unassigned, WorkOrder } from './types'
 
 const hhmm = (minutes: number) => {
   const day = Math.floor(minutes / 1440)
@@ -65,21 +65,18 @@ function SolverBadge({ schedule }: { schedule?: Schedule }) {
   return <span className={`solver-badge ${statusClass}`} title={schedule.solver_note}><span />{solverStatusLabel[schedule.solver_status]} · {schedule.runtime_ms} ms</span>
 }
 
-function KpiStrip({ scenario, schedule, baseline }: { scenario: Scenario; schedule?: Schedule; baseline?: Schedule }) {
+function KpiStrip({ scenario, schedule, baseline, operational }: { scenario: Scenario; schedule?: Schedule; baseline?: Schedule; operational?: OperationalView }) {
   const k = schedule?.kpis
-  const assignedIds = new Set(schedule?.assignments.map(item => item.work_order_id))
-  const publishedUnassignedIds = new Set(schedule?.unassigned.map(item => item.work_order_id))
-  const currentDemand = scenario.work_orders.filter(item => item.status !== 'completed')
-  const currentAssigned = currentDemand.filter(item => assignedIds.has(item.id)).length
-  const uncovered = currentDemand.filter(item => !assignedIds.has(item.id) && !publishedUnassignedIds.has(item.id))
-  const currentUnserved = currentDemand.length - currentAssigned
-  const currentHighPriorityMissed = currentDemand.filter(item => !assignedIds.has(item.id) && ['urgent', 'high'].includes(item.priority)).length
+  const currentMetrics = operational?.current_metrics
+  const disposition = new Map(operational?.work_orders.map(item => [item.work_order_id, item.disposition]))
+  const currentUnserved = currentMetrics ? currentMetrics.active_demand_count - currentMetrics.valid_assigned_count : 0
+  const currentHighPriorityMissed = scenario.work_orders.filter(item => item.status !== 'completed' && ['urgent', 'high'].includes(item.priority) && !['ASSIGNED_VALID', 'STARTED'].includes(disposition.get(item.id) || '')).length
   const metrics = [
-    { label: '当前需求已排率', value: k && currentDemand.length ? pct(currentAssigned / currentDemand.length) : k ? '100%' : '—', sub: k ? uncovered.length ? `${uncovered.length} 单新增需求尚未进入 V${String(schedule!.version).padStart(3, '0')}` : `${currentAssigned} / ${currentDemand.length} 单已排入当前路线` : '尚未排程', icon: Check, warn: currentUnserved > 0 },
+    { label: '当前可执行覆盖率', value: currentMetrics ? pct(currentMetrics.current_actionable_coverage_rate) : '—', sub: currentMetrics ? `${currentMetrics.valid_assigned_count} / ${currentMetrics.active_demand_count} 单可执行 · ${currentMetrics.invalid_assignment_count} 单分配失效` : '正在核对当前业务状态', icon: Check, warn: currentUnserved > 0 },
     { label: '冻结方案 SLA', value: k ? pct(k.committed_on_time_rate) : '—', sub: k ? `仅对应 V${String(schedule!.version).padStart(3, '0')} 发布时需求；已排工单 ${pct(k.assigned_on_time_rate)}` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count || currentUnserved > 0 },
     { label: '总行程', value: k ? `${k.total_travel_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_travel_minutes - baseline.kpis.total_travel_minutes : null, icon: Route },
     { label: '总加班', value: k ? `${k.total_overtime_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_overtime_minutes - baseline.kpis.total_overtime_minutes : null, icon: Clock3 },
-    { label: '当前待排', value: k ? `${currentUnserved}` : '—', unit: '工单', sub: k ? `${currentHighPriorityMissed} 单高优先级${uncovered.length ? ` · ${uncovered.length} 单未被当前 V 覆盖` : ''}` : '尚未计算', icon: AlertTriangle, warn: currentUnserved > 0 },
+    { label: '当前待处理', value: currentMetrics ? `${currentUnserved}` : '—', unit: '工单', sub: currentMetrics ? `${currentHighPriorityMissed} 单高优先级 · 新增 ${currentMetrics.new_uncovered_count} · 失效 ${currentMetrics.invalid_assignment_count}` : '尚未计算', icon: AlertTriangle, warn: currentUnserved > 0 },
     { label: schedule?.kind === 'replan' ? '重排稳定率' : '占用利用率', value: k ? (schedule?.kind === 'replan' && k.stability_rate != null ? pct(k.stability_rate) : pct(k.average_occupied_utilization)) : '—', sub: schedule?.kind === 'replan' ? `原技师 ${k?.same_technician_rate == null ? '—' : pct(k.same_technician_rate)}` : '行程 + 等待 + 服务 ÷ 可用时间', icon: TimerReset },
   ]
   return <section className="kpi-strip" aria-label="关键业务指标">
@@ -91,17 +88,18 @@ function KpiStrip({ scenario, schedule, baseline }: { scenario: Scenario; schedu
   </section>
 }
 
-function OrderQueue({ scenario, schedule, selectedId, onSelect, onAdd }: { scenario: Scenario; schedule?: Schedule; selectedId?: string; onSelect: (id: string) => void; onAdd: () => void }) {
+function OrderQueue({ scenario, schedule, operational, selectedId, onSelect, onAdd }: { scenario: Scenario; schedule?: Schedule; operational?: OperationalView; selectedId?: string; onSelect: (id: string) => void; onAdd: () => void }) {
   const [tab, setTab] = useState<'risk' | 'all'>('risk')
   const assignmentMap = new Map(schedule?.assignments.map(a => [a.work_order_id, a]))
   const unassignedMap = new Map(schedule?.unassigned.map(u => [u.work_order_id, u]))
-  const uncovered = new Set(schedule ? scenario.work_orders.filter(order => order.status !== 'completed' && !assignmentMap.has(order.id) && !unassignedMap.has(order.id)).map(order => order.id) : [])
+  const disposition = new Map(operational?.work_orders.map(item => [item.work_order_id, item.disposition]))
   const ranked = [...scenario.work_orders].sort((a, b) => {
-    const au = uncovered.has(a.id) ? 0 : unassignedMap.has(a.id) ? 1 : assignmentMap.get(a.id)?.sla_late_minutes ? 2 : 3
-    const bu = uncovered.has(b.id) ? 0 : unassignedMap.has(b.id) ? 1 : assignmentMap.get(b.id)?.sla_late_minutes ? 2 : 3
+    const rank = (order: WorkOrder) => disposition.get(order.id) === 'ASSIGNED_INVALID' ? 0 : disposition.get(order.id) === 'NEW_UNCOVERED' ? 1 : disposition.get(order.id) === 'PLAN_UNASSIGNED' ? 2 : assignmentMap.get(order.id)?.sla_late_minutes ? 3 : disposition.get(order.id) === 'COMPLETED' ? 5 : 4
+    const au = rank(a)
+    const bu = rank(b)
     return au - bu || a.sla_deadline - b.sla_deadline
   })
-  const visible = tab === 'all' || !schedule ? ranked : ranked.filter(order => uncovered.has(order.id) || unassignedMap.has(order.id) || !!assignmentMap.get(order.id)?.sla_late_minutes)
+  const visible = tab === 'all' || !schedule ? ranked : ranked.filter(order => disposition.get(order.id) !== 'COMPLETED' && (['ASSIGNED_INVALID', 'NEW_UNCOVERED', 'PLAN_UNASSIGNED'].includes(disposition.get(order.id) || '') || !!assignmentMap.get(order.id)?.sla_late_minutes))
   return <section className="queue panel">
     <div className="panel-heading"><div><span className="eyebrow">WORK ORDERS</span><h2>工单队列</h2></div><div className="heading-actions"><span className="count">{scenario.work_orders.length}</span><button className="mini-add" onClick={onAdd} aria-label="新增工单"><Plus size={13} /></button></div></div>
     <div className="queue-tabs"><button className={tab === 'risk' ? 'active' : ''} onClick={() => setTab('risk')}>风险优先</button><button className={tab === 'all' ? 'active' : ''} onClick={() => setTab('all')}>全部</button></div>
@@ -109,11 +107,13 @@ function OrderQueue({ scenario, schedule, selectedId, onSelect, onAdd }: { scena
       {visible.map(order => {
         const assignment = assignmentMap.get(order.id)
         const unassigned = unassignedMap.get(order.id)
-        const isUncovered = uncovered.has(order.id)
-        return <button className={`order-card ${selectedId === order.id ? 'selected' : ''} ${unassigned || isUncovered ? 'unassigned' : ''}`} key={order.id} onClick={() => onSelect(order.id)}>
+        const orderDisposition = disposition.get(order.id)
+        const isUncovered = orderDisposition === 'NEW_UNCOVERED'
+        const isInvalid = orderDisposition === 'ASSIGNED_INVALID'
+        return <button className={`order-card ${selectedId === order.id ? 'selected' : ''} ${unassigned || isUncovered || isInvalid ? 'unassigned' : ''} ${isInvalid ? 'invalid' : ''}`} key={order.id} onClick={() => onSelect(order.id)}>
           <span className={`priority ${order.priority}`}>{priorityLabel[order.priority]}</span>
           <div className="order-main"><div className="order-id">{order.id}{order.is_emergency && <span className="emergency-tag">突发</span>}{order.vip && <span className="vip">VIP</span>}</div><strong>{order.customer_name}</strong><small>{order.title}</small></div>
-          <div className="order-meta"><span><Clock3 size={12} />{hhmm(order.window_start)}–{hhmm(order.window_end)}</span><span className={unassigned || isUncovered ? 'danger' : assignment?.sla_late_minutes ? 'danger' : ''}>{isUncovered ? '新增未纳入当前方案' : unassigned ? '待处理' : assignment ? `${hhmm(assignment.start_time)} 开始` : '未排程'}</span></div>
+          <div className="order-meta"><span><Clock3 size={12} />{hhmm(order.window_start)}–{hhmm(order.window_end)}</span><span className={unassigned || isUncovered || isInvalid ? 'danger' : assignment?.sla_late_minutes ? 'danger' : ''}>{isInvalid ? '分配已失效，需重排' : isUncovered ? '新增未纳入当前方案' : unassigned ? '待处理' : orderDisposition === 'COMPLETED' ? '已完成' : assignment ? `${hhmm(assignment.start_time)} 开始` : '未排程'}</span></div>
         </button>
       })}
       {!visible.length && <div className="queue-empty"><Check size={18} /><strong>当前没有风险工单</strong><span>所有已分配工单均满足 SLA。</span></div>}
@@ -121,18 +121,18 @@ function OrderQueue({ scenario, schedule, selectedId, onSelect, onAdd }: { scena
   </section>
 }
 
-function RouteMap({ scenario, schedule, selectedId, onSelect }: { scenario: Scenario; schedule?: Schedule; selectedId?: string; onSelect: (id: string) => void }) {
+function RouteMap({ scenario, schedule, operational, selectedId, onSelect }: { scenario: Scenario; schedule?: Schedule; operational?: OperationalView; selectedId?: string; onSelect: (id: string) => void }) {
   const orderMap = new Map(scenario.work_orders.map(o => [o.id, o]))
   const assignedMap = new Map(schedule?.assignments.map(a => [a.work_order_id, a]))
-  const publishedUnassigned = new Set(schedule?.unassigned.map(u => u.work_order_id))
-  const unassigned = new Set(scenario.work_orders.filter(order => order.status !== 'completed' && (!assignedMap.has(order.id) || publishedUnassigned.has(order.id))).map(order => order.id))
+  const disposition = new Map(operational?.work_orders.map(item => [item.work_order_id, item.disposition]))
+  const unassigned = new Set(scenario.work_orders.filter(order => ['ASSIGNED_INVALID', 'PLAN_UNASSIGNED', 'NEW_UNCOVERED'].includes(disposition.get(order.id) || '')).map(order => order.id))
   const routes = scenario.technicians.map(tech => ({
     tech,
-    assignments: (schedule?.assignments.filter(a => a.technician_id === tech.id && orderMap.has(a.work_order_id)) || []).sort((a, b) => a.sequence - b.sequence),
+    assignments: (schedule?.assignments.filter(a => a.technician_id === tech.id && orderMap.has(a.work_order_id) && disposition.get(a.work_order_id) !== 'ASSIGNED_INVALID') || []).sort((a, b) => a.sequence - b.sequence),
   }))
   const depots = Array.from(new Map(scenario.technicians.map(tech => [`${tech.start_location.x}:${tech.start_location.y}`, tech.start_location])).values())
   return <section className="map-panel panel">
-    <div className="panel-heading map-heading"><div><span className="eyebrow">服务区域 / 位置与行程估算</span><h2>服务位置图</h2></div><div className="map-legend"><span><i className="legend depot" />技师出发点</span><span><i className="legend job" />已排</span><span><i className="legend risk" />待排</span></div></div>
+    <div className="panel-heading map-heading"><div><span className="eyebrow">服务区域 / 位置与行程估算</span><h2>服务位置图</h2></div><div className="map-legend"><span><i className="legend depot" />技师出发点</span><span><i className="legend job" />可执行</span><span><i className="legend risk" />需处理</span></div></div>
     <div className="map-canvas">
       <svg viewBox="0 0 100 100" role="img" aria-label="工单位置与技师路线图">
         <defs>
@@ -161,14 +161,15 @@ function RouteMap({ scenario, schedule, selectedId, onSelect }: { scenario: Scen
           </g>
         })}
       </svg>
-      <div className="map-stamp"><b>{schedule?.assignments.length || 0}</b><span>已落点</span></div>
+      <div className="map-stamp"><b>{operational?.current_metrics.valid_assigned_count ?? schedule?.assignments.length ?? 0}</b><span>可执行</span></div>
     </div>
   </section>
 }
 
-function Timeline({ scenario, schedule, onSelect, currentTime }: { scenario: Scenario; schedule?: Schedule; onSelect: (id: string) => void; currentTime: number }) {
+function Timeline({ scenario, schedule, operational, onSelect, currentTime }: { scenario: Scenario; schedule?: Schedule; operational?: OperationalView; onSelect: (id: string) => void; currentTime: number }) {
   const orders = new Map(scenario.work_orders.map(o => [o.id, o]))
   const assignments = schedule?.assignments || []
+  const invalidAssignments = new Set(operational?.work_orders.filter(item => item.disposition === 'ASSIGNED_INVALID').map(item => item.work_order_id))
   const start = Math.floor(Math.min(currentTime, ...scenario.technicians.map(item => item.shift_start), ...assignments.map(item => item.arrival_time)) / 60) * 60
   const end = Math.ceil(Math.max(currentTime + 60, ...scenario.technicians.map(item => item.shift_end + item.overtime_limit), ...assignments.map(item => item.finish_time)) / 60) * 60
   const tickCount = 6
@@ -189,7 +190,7 @@ function Timeline({ scenario, schedule, onSelect, currentTime }: { scenario: Sce
             {items.map(item => {
               const order = orders.get(item.work_order_id)
               if (!order) return null
-              return <button key={item.work_order_id} className={`run-block ${item.sla_late_minutes ? 'late' : ''} ${item.locked ? 'locked' : ''}`} style={{ left: `${pos(item.start_time)}%`, width: `${Math.max(5, pos(item.finish_time) - pos(item.start_time))}%`, '--tech': tech.color } as React.CSSProperties} onClick={() => onSelect(item.work_order_id)} title={`${item.work_order_id} · ${order.customer_name} · ${hhmm(item.start_time)}–${hhmm(item.finish_time)}`}><span>{item.sequence}</span>{item.locked && <Lock size={9} />}</button>
+              return <button key={item.work_order_id} className={`run-block ${item.sla_late_minutes ? 'late' : ''} ${item.locked ? 'locked' : ''} ${invalidAssignments.has(item.work_order_id) ? 'invalid' : ''}`} style={{ left: `${pos(item.start_time)}%`, width: `${Math.max(5, pos(item.finish_time) - pos(item.start_time))}%`, '--tech': tech.color } as React.CSSProperties} onClick={() => onSelect(item.work_order_id)} title={`${item.work_order_id} · ${order.customer_name} · ${hhmm(item.start_time)}–${hhmm(item.finish_time)}${invalidAssignments.has(item.work_order_id) ? ' · 分配已失效' : ''}`}><span>{item.sequence}</span>{item.locked && <Lock size={9} />}</button>
             })}
           </div>
         </div>
@@ -284,6 +285,7 @@ export default function App() {
   const [baseline, setBaseline] = useState<Schedule>()
   const [plans, setPlans] = useState<PlanVersion[]>([])
   const [profiles, setProfiles] = useState<StrategyProfile[]>([])
+  const [operational, setOperational] = useState<OperationalView>()
   const [historicalScenario, setHistoricalScenario] = useState<Scenario>()
   const [view, setView] = useState<View>('dispatch')
   const [strategy, setStrategy] = useState<Strategy>('balanced')
@@ -347,6 +349,21 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
+  useEffect(() => {
+    if (!scenario || historicalScenario) return
+    const scenarioId = scenario.id
+    const scenarioRevision = scenario.revision
+    let cancelled = false
+    api.operationalView(scenarioId).then(view => {
+      if (!cancelled && activeScenarioId.current === scenarioId && view.scenario_revision === scenarioRevision) {
+        setOperational(view)
+      }
+    }).catch(error => {
+      if (!cancelled) setToast(error instanceof Error ? error.message : '当前执行状态核对失败')
+    })
+    return () => { cancelled = true }
+  }, [scenario, schedule?.id, historicalScenario])
+
   const act = async (label: string, call: () => Promise<Schedule>, success: string) => {
     setWorking(label)
     try {
@@ -363,6 +380,11 @@ export default function App() {
   }
 
   const displayScenario = historicalScenario || scenario
+  const currentOperational = !historicalScenario && scenario
+    && operational?.scenario_id === scenario.id
+    && operational.scenario_revision === scenario.revision
+    ? operational
+    : undefined
   const selected = useMemo(() => displayScenario?.work_orders.find(o => o.id === selectedId), [displayScenario, selectedId])
   const dateText = scenario ? new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date(`${scenario.planning_date}T00:00:00`)) : ''
 
@@ -430,6 +452,7 @@ export default function App() {
           'stable',
           order,
           commandKey('emergency-replan'),
+          activePlan?.id ?? null,
         )
         if (activeScenarioId.current !== scenario.id) return
         const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
@@ -446,7 +469,7 @@ export default function App() {
       if (activeScenarioId.current !== next.id) return
       setWorkEditor(undefined)
       if (replan) {
-        const result = await api.replan(next.id, order.reported_at ?? 600, 'stable', undefined, commandKey('emergency-replan'))
+        const result = await api.replan(next.id, order.reported_at ?? 600, 'stable', undefined, commandKey('emergency-replan'), activePlan?.id ?? null)
         if (activeScenarioId.current !== next.id) return
         const [fresh, planItems] = await Promise.all([api.scenario(next.id), api.planVersions(next.id)])
         if (activeScenarioId.current !== next.id) return
@@ -491,7 +514,7 @@ export default function App() {
   const runOptimize = async () => {
     setWorking('正在生成推荐方案')
     try {
-      const result = await api.optimize(scenario.id, strategy, undefined, commandKey('optimize'))
+      const result = await api.optimize(scenario.id, strategy, undefined, commandKey('optimize'), activePlan?.id ?? null)
       if (activeScenarioId.current !== scenario.id) return
       const planItems = await api.planVersions(scenario.id)
       if (activeScenarioId.current !== scenario.id) return
@@ -508,7 +531,7 @@ export default function App() {
   const runReplan = async () => {
     setWorking('正在保持已执行安排并局部重排')
     try {
-      const result = await api.replan(scenario.id, replanTime, 'stable', undefined, commandKey('replan'))
+      const result = await api.replan(scenario.id, replanTime, 'stable', undefined, commandKey('replan'), activePlan?.id ?? null)
       if (activeScenarioId.current !== scenario.id) return
       const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
       if (activeScenarioId.current !== scenario.id) return
@@ -539,8 +562,8 @@ export default function App() {
     {metricsOutdated && !partialCoverage && !routeInvalidated && !reoptimizationAvailable && schedule && <div className="stale-banner partial"><CalendarDays size={16} /><div><strong>现有路线仍可执行，展示指标已过期</strong><span>业务目标、成本或未分配需求发生变化；请重新优化以更新指标。</span></div></div>}
     {executionProgress && <div className="stale-banner partial"><Clock3 size={16} /><div><strong>现场执行状态已更新</strong><span>V{String(schedule.version).padStart(3, '0')} 仍是当前执行依据；局部重排会保留服务中的安排，并排除已完成工单。</span></div></div>}
     {!displayingActivePlan && !executionProgress && schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
-        <KpiStrip scenario={shownScenario} schedule={schedule} baseline={baseline} />
-    <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
+        <KpiStrip scenario={shownScenario} schedule={schedule} baseline={baseline} operational={currentOperational} />
+    <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} operational={currentOperational} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} operational={currentOperational} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} operational={currentOperational} onSelect={setSelectedId} currentTime={replanTime} /></div>
     <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / {skillCount} 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
   </>
 
@@ -552,7 +575,7 @@ export default function App() {
       {view === 'versions' && <VersionsView scenario={scenario} plans={plans} onOpen={async item => { setWorking('正在读取版本快照'); try { const detail = await api.planVersion(scenario.id, item.id); setSchedule(detail.selected); setHistoricalScenario(detail.active && detail.data_revision === scenario.revision ? undefined : detail.scenario_snapshot || undefined); setBaseline(detail.artifacts.find(artifactItem => artifactItem.role === 'baseline')?.schedule); setView('dispatch'); setToast(`已打开历史方案 V${String(item.number).padStart(3, '0')}`) } catch (error) { setToast(error instanceof Error ? error.message : '版本读取失败') } finally { setWorking(undefined) } }} onActivate={async item => {
         setWorking('正在核对并激活历史计划')
         try {
-          const activated = await api.activatePlanVersion(scenario.id, item.id, scenario.revision, commandKey('activate'))
+          const activated = await api.activatePlanVersion(scenario.id, item.id, scenario.revision, commandKey('activate'), activePlan?.id ?? null)
           if (activeScenarioId.current !== scenario.id) return
           const planItems = await api.planVersions(scenario.id)
           if (activeScenarioId.current !== scenario.id) return
@@ -562,7 +585,7 @@ export default function App() {
       }} onReattest={async item => {
         setWorking('正在重新验证历史计划')
         try {
-          const attested = await api.reattestPlanVersion(scenario.id, item.id, scenario.revision, commandKey('reattest'), 'PLANNING_EQUIVALENT')
+          const attested = await api.reattestPlanVersion(scenario.id, item.id, scenario.revision, commandKey('reattest'), 'PLANNING_EQUIVALENT', activePlan?.id ?? null)
           if (activeScenarioId.current !== scenario.id) return
           const planItems = await api.planVersions(scenario.id)
           if (activeScenarioId.current !== scenario.id) return
@@ -592,7 +615,7 @@ export default function App() {
           const currentPlan = preview.current_plan_number == null ? '当前没有可执行方案' : `当前 V${String(preview.current_plan_number).padStart(3, '0')}`
           const message = `将业务数据回滚到 V${String(item.number).padStart(3, '0')} 的快照。\n\n工单：新增 ${preview.added_work_orders.length} 个、删除 ${preview.removed_work_orders.length} 个、修改 ${preview.modified_work_orders.length} 个；技师变化 ${preview.technician_changes.length} 项；锁定变化 ${preview.lock_changes.length} 项；受影响执行事件 ${preview.affected_execution_event_ids.length} 条。\n${currentPlan} 切换后将有 ${preview.changed_plan_work_orders.length} 个工单的安排发生变化。\n\n这不是普通的计划切换。操作会创建新的 D 和 V，现有历史不会删除。`
           if (!window.confirm(message)) return
-          const restored = await api.rollbackPlanVersion(scenario.id, item.id, scenario.revision, preview.confirmation_token, reason, commandKey('rollback'))
+          const restored = await api.rollbackPlanVersion(scenario.id, item.id, scenario.revision, preview.confirmation_token, reason, commandKey('rollback'), preview.current_plan_version_id)
           if (activeScenarioId.current !== scenario.id) return
           const [fresh, planItems] = await Promise.all([api.scenario(scenario.id), api.planVersions(scenario.id)])
           if (activeScenarioId.current !== scenario.id) return
@@ -607,13 +630,13 @@ export default function App() {
         finally { setWorking(undefined) }
       }} />}
       {view === 'technicians' && <TechniciansView scenario={scenario} schedule={schedule} onEdit={initial => setTechEditor({ initial })} onAdd={() => setTechEditor({})} />}
-      {view === 'lab' && <StrategyLab key={scenario.id} scenario={scenario} profiles={profiles} loadingDataset={!!loadingScenarioId} onSelectDataset={id => { void loadScenario(id); setView('lab') }} onReloadProfiles={async () => setProfiles(await api.strategyProfiles())} onPublished={async plan => { if (activeScenarioId.current !== plan.scenario_id) return; const [fresh, planItems] = await Promise.all([api.scenario(plan.scenario_id), api.planVersions(plan.scenario_id)]); if (activeScenarioId.current !== plan.scenario_id) return; setScenario(fresh); setPlans(planItems); setSchedule(plan.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch') }} onToast={setToast} />}
+      {view === 'lab' && <StrategyLab key={scenario.id} scenario={scenario} profiles={profiles} loadingDataset={!!loadingScenarioId} expectedActivePlanId={activePlan?.id ?? null} onSelectDataset={id => { void loadScenario(id); setView('lab') }} onReloadProfiles={async () => setProfiles(await api.strategyProfiles())} onPublished={async plan => { if (activeScenarioId.current !== plan.scenario_id) return; const [fresh, planItems] = await Promise.all([api.scenario(plan.scenario_id), api.planVersions(plan.scenario_id)]); if (activeScenarioId.current !== plan.scenario_id) return; setScenario(fresh); setPlans(planItems); setSchedule(plan.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch') }} onToast={setToast} />}
       {view === 'review' && <ReviewView key={(plans.find(item => item.selected.id === schedule?.id) || activePlan)?.id} scenarioId={scenario.id} planVersionId={(plans.find(item => item.selected.id === schedule?.id) || activePlan)?.id} schedule={schedule} baseline={baseline} />}
     </main>
-    {selected && <ExplanationPanel key={`${selected.id}:${schedule?.id || 'unscheduled'}`} scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} invalidAssignment={!!activePlan?.applicability.invalid_assignment_ids.includes(selected.id)} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
+    {selected && <ExplanationPanel key={`${selected.id}:${schedule?.id || 'unscheduled'}`} scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} invalidAssignment={currentOperational?.work_orders.find(item => item.work_order_id === selected.id)?.disposition === 'ASSIGNED_INVALID'} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
       setWorking('正在改派并局部重排')
       try {
-        const result = await api.manualReassignment(scenario.id, orderId, technicianId, replanTime, scenario.revision, commandKey('manual-reassignment'))
+        const result = await api.manualReassignment(scenario.id, orderId, technicianId, replanTime, scenario.revision, commandKey('manual-reassignment'), activePlan?.id ?? null)
         if (activeScenarioId.current !== scenario.id) return
         const planItems = await api.planVersions(scenario.id)
         if (activeScenarioId.current !== scenario.id) return

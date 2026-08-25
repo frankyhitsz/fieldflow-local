@@ -3,6 +3,17 @@
     "schemas": {
       "ActivatePlanRequest": {
         "properties": {
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
+          },
           "expected_revision": {
             "minimum": 0.0,
             "title": "Expected Revision",
@@ -1731,6 +1742,18 @@
         "title": "CoverageSummary",
         "type": "object"
       },
+      "CurrentWorkOrderDisposition": {
+        "enum": [
+          "ASSIGNED_VALID",
+          "ASSIGNED_INVALID",
+          "PLAN_UNASSIGNED",
+          "NEW_UNCOVERED",
+          "STARTED",
+          "COMPLETED"
+        ],
+        "title": "CurrentWorkOrderDisposition",
+        "type": "string"
+      },
       "DecisionAnalysisRun": {
         "properties": {
           "active_booking_ids": {
@@ -2278,7 +2301,7 @@
             "type": "string"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V1",
+            "default": "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V2",
             "title": "Policy Version",
             "type": "string"
           },
@@ -2289,6 +2312,13 @@
           "python_version": {
             "title": "Python Version",
             "type": "string"
+          },
+          "runtime_distributions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Runtime Distributions",
+            "type": "object"
           },
           "sqlite_version": {
             "title": "Sqlite Version",
@@ -2420,6 +2450,16 @@
           "BETWEEN_VISITS_ONLY"
         ],
         "title": "EmergencyDispatchPolicy",
+        "type": "string"
+      },
+      "EmergencyLocationPolicy": {
+        "enum": [
+          "ACTIVE_DEMAND_LOCATIONS",
+          "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY",
+          "UNIFORM_SERVICE_AREA",
+          "EXTERNAL_EMPIRICAL_DISTRIBUTION"
+        ],
+        "title": "EmergencyLocationPolicy",
         "type": "string"
       },
       "EmergencyResponderSelectionPolicy": {
@@ -2723,6 +2763,17 @@
             "title": "Candidate Id",
             "type": "string"
           },
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
+          },
           "expected_revision": {
             "minimum": 0.0,
             "title": "Expected Revision",
@@ -3016,6 +3067,17 @@
       },
       "ManualReassignmentRequest": {
         "properties": {
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
+          },
           "expected_revision": {
             "minimum": 0.0,
             "title": "Expected Revision",
@@ -3109,8 +3171,109 @@
         "title": "ManualReassignmentResult",
         "type": "object"
       },
+      "OperationalMetrics": {
+        "properties": {
+          "active_demand_count": {
+            "minimum": 0.0,
+            "title": "Active Demand Count",
+            "type": "integer"
+          },
+          "current_actionable_coverage_rate": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Current Actionable Coverage Rate",
+            "type": "number"
+          },
+          "invalid_assignment_count": {
+            "minimum": 0.0,
+            "title": "Invalid Assignment Count",
+            "type": "integer"
+          },
+          "new_uncovered_count": {
+            "minimum": 0.0,
+            "title": "New Uncovered Count",
+            "type": "integer"
+          },
+          "plan_unassigned_count": {
+            "minimum": 0.0,
+            "title": "Plan Unassigned Count",
+            "type": "integer"
+          },
+          "valid_assigned_count": {
+            "minimum": 0.0,
+            "title": "Valid Assigned Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "active_demand_count",
+          "valid_assigned_count",
+          "invalid_assignment_count",
+          "plan_unassigned_count",
+          "new_uncovered_count",
+          "current_actionable_coverage_rate"
+        ],
+        "title": "OperationalMetrics",
+        "type": "object"
+      },
+      "OperationalWorkOrderView": {
+        "properties": {
+          "assignment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleAssignment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "blocking_reason_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocking Reason Code"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/CurrentWorkOrderDisposition"
+          },
+          "start_allowed": {
+            "default": false,
+            "title": "Start Allowed",
+            "type": "boolean"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "disposition"
+        ],
+        "title": "OperationalWorkOrderView",
+        "type": "object"
+      },
       "OptimizeRequest": {
         "properties": {
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
+          },
           "profile_id": {
             "anyOf": [
               {
@@ -3257,6 +3420,23 @@
             "title": "Coverage Complete",
             "type": "boolean"
           },
+          "evaluated_scenario_revision": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluated Scenario Revision"
+          },
+          "evaluated_scenario_snapshot_hash": {
+            "default": "",
+            "title": "Evaluated Scenario Snapshot Hash",
+            "type": "string"
+          },
           "invalid_assignment_ids": {
             "items": {
               "type": "string"
@@ -3273,6 +3453,16 @@
             "default": true,
             "title": "Planning Current",
             "type": "boolean"
+          },
+          "projection_hash": {
+            "default": "",
+            "title": "Projection Hash",
+            "type": "string"
+          },
+          "reducer_policy_version": {
+            "default": "FIELD_SERVICE_PLAN_APPLICABILITY_V2",
+            "title": "Reducer Policy Version",
+            "type": "string"
           },
           "reoptimization_opportunity": {
             "default": false,
@@ -3936,6 +4126,17 @@
       },
       "ReattestPlanRequest": {
         "properties": {
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
+          },
           "expected_revision": {
             "minimum": 0.0,
             "title": "Expected Revision",
@@ -4014,6 +4215,17 @@
                 "type": "null"
               }
             ]
+          },
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
           },
           "idempotency_key": {
             "anyOf": [
@@ -4115,6 +4327,17 @@
             "title": "Confirmation Token",
             "type": "string"
           },
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
+          },
           "expected_revision": {
             "minimum": 0.0,
             "title": "Expected Revision",
@@ -4141,6 +4364,14 @@
         ],
         "title": "RestoreRequest",
         "type": "object"
+      },
+      "RiskArtifactDetailPolicy": {
+        "enum": [
+          "SUMMARY_ONLY",
+          "FULL_TRIAL_DETAIL"
+        ],
+        "title": "RiskArtifactDetailPolicy",
+        "type": "string"
       },
       "RiskComparisonResult": {
         "properties": {
@@ -4470,6 +4701,10 @@
       "RiskSimulationParameters": {
         "additionalProperties": false,
         "properties": {
+          "artifact_detail_policy": {
+            "$ref": "#/components/schemas/RiskArtifactDetailPolicy",
+            "default": "SUMMARY_ONLY"
+          },
           "customer_no_show_basis_points": {
             "default": 400,
             "maximum": 10000.0,
@@ -4480,6 +4715,10 @@
           "emergency_dispatch_policy": {
             "$ref": "#/components/schemas/EmergencyDispatchPolicy",
             "default": "BETWEEN_VISITS_ONLY"
+          },
+          "emergency_location_policy": {
+            "$ref": "#/components/schemas/EmergencyLocationPolicy",
+            "default": "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY"
           },
           "emergency_order_basis_points": {
             "default": 1200,
@@ -4552,6 +4791,10 @@
               }
             ]
           },
+          "artifact_detail_policy": {
+            "$ref": "#/components/schemas/RiskArtifactDetailPolicy",
+            "default": "SUMMARY_ONLY"
+          },
           "customer_no_show_basis_points": {
             "default": 400,
             "maximum": 10000.0,
@@ -4562,6 +4805,10 @@
           "emergency_dispatch_policy": {
             "$ref": "#/components/schemas/EmergencyDispatchPolicy",
             "default": "BETWEEN_VISITS_ONLY"
+          },
+          "emergency_location_policy": {
+            "$ref": "#/components/schemas/EmergencyLocationPolicy",
+            "default": "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY"
           },
           "emergency_order_basis_points": {
             "default": 1200,
@@ -4681,6 +4928,24 @@
             "title": "All Demand Sla Rate",
             "type": "number"
           },
+          "all_demand_total_late_minutes_p50": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "All Demand Total Late Minutes P50",
+            "type": "integer"
+          },
+          "all_demand_total_late_minutes_p90": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "All Demand Total Late Minutes P90",
+            "type": "integer"
+          },
+          "all_demand_total_late_minutes_p95": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "All Demand Total Late Minutes P95",
+            "type": "integer"
+          },
           "analysis_as_of_time": {
             "anyOf": [
               {
@@ -4701,6 +4966,10 @@
           "analysis_scope": {
             "$ref": "#/components/schemas/DecisionAnalysisScope",
             "default": "EX_ANTE_FROZEN_PLAN"
+          },
+          "artifact_detail_policy": {
+            "$ref": "#/components/schemas/RiskArtifactDetailPolicy",
+            "default": "SUMMARY_ONLY"
           },
           "assumptions": {
             "items": {
@@ -4779,6 +5048,12 @@
             "title": "Emergency Caused Window Failure Probability",
             "type": "number"
           },
+          "emergency_completed_sample_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Completed Sample Count",
+            "type": "integer"
+          },
           "emergency_completion_rate": {
             "anyOf": [
               {
@@ -4795,6 +5070,18 @@
           "emergency_dispatch_policy": {
             "$ref": "#/components/schemas/EmergencyDispatchPolicy",
             "default": "BETWEEN_VISITS_ONLY"
+          },
+          "emergency_disposition_changed_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Disposition Changed Count"
           },
           "emergency_event_count": {
             "default": 0,
@@ -4857,6 +5144,97 @@
               }
             ],
             "title": "Emergency Incremental Unserved Orders"
+          },
+          "emergency_late_minutes_mean": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Late Minutes Mean"
+          },
+          "emergency_late_minutes_p50": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Late Minutes P50"
+          },
+          "emergency_late_minutes_p90": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Late Minutes P90"
+          },
+          "emergency_lateness_increased_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Lateness Increased Count"
+          },
+          "emergency_location_policy": {
+            "$ref": "#/components/schemas/EmergencyLocationPolicy",
+            "default": "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY"
+          },
+          "emergency_location_work_order_ids": {
+            "items": {
+              "maxLength": 80,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Emergency Location Work Order Ids",
+            "type": "array"
+          },
+          "emergency_metric_sample_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Metric Sample Count",
+            "type": "integer"
+          },
+          "emergency_newly_late_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Newly Late Count"
+          },
+          "emergency_newly_unserved_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Newly Unserved Count"
           },
           "emergency_on_time_rate": {
             "anyOf": [
@@ -5016,6 +5394,24 @@
             "title": "Published Commitment Sla Rate",
             "type": "number"
           },
+          "published_work_total_late_minutes_p50": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Published Work Total Late Minutes P50",
+            "type": "integer"
+          },
+          "published_work_total_late_minutes_p90": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Published Work Total Late Minutes P90",
+            "type": "integer"
+          },
+          "published_work_total_late_minutes_p95": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Published Work Total Late Minutes P95",
+            "type": "integer"
+          },
           "scenario_id": {
             "title": "Scenario Id",
             "type": "string"
@@ -5066,7 +5462,7 @@
             "type": "string"
           },
           "simulation_policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_V5",
+            "default": "FIELD_SERVICE_SIMULATION_V6",
             "title": "Simulation Policy Version",
             "type": "string"
           },
@@ -5158,6 +5554,12 @@
             "title": "All Demand Sla Rate",
             "type": "number"
           },
+          "all_demand_total_late_minutes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "All Demand Total Late Minutes",
+            "type": "integer"
+          },
           "disrupted": {
             "title": "Disrupted",
             "type": "boolean"
@@ -5206,6 +5608,12 @@
             ],
             "title": "Emergency Dispatch Time"
           },
+          "emergency_disposition_changed_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Disposition Changed Count",
+            "type": "integer"
+          },
           "emergency_event": {
             "default": false,
             "title": "Emergency Event",
@@ -5240,6 +5648,36 @@
             "default": 0,
             "minimum": 0.0,
             "title": "Emergency Incremental Unserved Orders",
+            "type": "integer"
+          },
+          "emergency_late_minutes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Late Minutes"
+          },
+          "emergency_lateness_increased_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Lateness Increased Count",
+            "type": "integer"
+          },
+          "emergency_newly_late_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Newly Late Count",
+            "type": "integer"
+          },
+          "emergency_newly_unserved_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Newly Unserved Count",
             "type": "integer"
           },
           "emergency_on_time": {
@@ -5280,6 +5718,12 @@
             "title": "Published Commitment Sla Rate",
             "type": "number"
           },
+          "published_work_total_late_minutes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Published Work Total Late Minutes",
+            "type": "integer"
+          },
           "sla_on_time_rate": {
             "maximum": 1.0,
             "minimum": 0.0,
@@ -5300,6 +5744,13 @@
             "minimum": 0.0,
             "title": "Trial",
             "type": "integer"
+          },
+          "work_order_outcomes": {
+            "items": {
+              "$ref": "#/components/schemas/SimulatedWorkOrderOutcome"
+            },
+            "title": "Work Order Outcomes",
+            "type": "array"
           }
         },
         "required": [
@@ -5336,6 +5787,10 @@
           "created_at": {
             "title": "Created At",
             "type": "string"
+          },
+          "detail_policy": {
+            "$ref": "#/components/schemas/RiskArtifactDetailPolicy",
+            "default": "SUMMARY_ONLY"
           },
           "effective_integrity": {
             "$ref": "#/components/schemas/AnalysisIntegrityStatus",
@@ -5606,6 +6061,65 @@
         "title": "ScenarioCreate",
         "type": "object"
       },
+      "ScenarioOperationalView": {
+        "properties": {
+          "active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Plan Version Id"
+          },
+          "current_metrics": {
+            "$ref": "#/components/schemas/OperationalMetrics"
+          },
+          "plan_applicability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanApplicability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scenario_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "minimum": 0.0,
+            "title": "Scenario Revision",
+            "type": "integer"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "work_orders": {
+            "items": {
+              "$ref": "#/components/schemas/OperationalWorkOrderView"
+            },
+            "title": "Work Orders",
+            "type": "array"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "scenario_revision",
+          "scenario_snapshot_hash",
+          "work_orders",
+          "current_metrics"
+        ],
+        "title": "ScenarioOperationalView",
+        "type": "object"
+      },
       "ScheduleArtifact": {
         "properties": {
           "id": {
@@ -5788,6 +6302,28 @@
           "publishable": {
             "title": "Publishable",
             "type": "boolean"
+          },
+          "reservation_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Hash"
+          },
+          "reservation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Id"
           },
           "run_id": {
             "title": "Run Id",
@@ -6358,6 +6894,28 @@
             "title": "Requested Time Limit Ms",
             "type": "integer"
           },
+          "reservation_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Hash"
+          },
+          "reservation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Id"
+          },
           "scenario_id": {
             "title": "Scenario Id",
             "type": "string"
@@ -6599,6 +7157,58 @@
         "title": "ScheduleVerificationReport",
         "type": "object"
       },
+      "SimulatedWorkOrderOutcome": {
+        "properties": {
+          "disposition": {
+            "enum": [
+              "ON_TIME",
+              "LATE",
+              "NO_SHOW_UNSERVED",
+              "ABSENCE_UNSERVED",
+              "PLAN_UNSERVED"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "late_minutes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Late Minutes"
+          },
+          "technician_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Technician Id"
+          },
+          "work_order_id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_order_id",
+          "disposition"
+        ],
+        "title": "SimulatedWorkOrderOutcome",
+        "type": "object"
+      },
       "SimulationEmergencyEvent": {
         "properties": {
           "duration_minutes": {
@@ -6702,6 +7312,19 @@
             "title": "Emergency Events",
             "type": "array"
           },
+          "emergency_location_policy": {
+            "$ref": "#/components/schemas/EmergencyLocationPolicy",
+            "default": "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY"
+          },
+          "emergency_location_work_order_ids": {
+            "items": {
+              "maxLength": 80,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Emergency Location Work Order Ids",
+            "type": "array"
+          },
           "emergency_responder_selection_policy": {
             "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
             "default": "MYOPIC_EARLIEST_EMERGENCY_FINISH"
@@ -6731,7 +7354,7 @@
             "default": "LEGACY_UNATTESTED"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V5",
+            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V6",
             "title": "Policy Version",
             "type": "string"
           },
@@ -7163,6 +7786,17 @@
               }
             ],
             "title": "Error"
+          },
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
           },
           "fingerprint": {
             "default": "",
@@ -8792,7 +9426,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.9"
+    "version": "0.5.10"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -9516,6 +10150,45 @@
           }
         },
         "summary": "Manual Reassignment"
+      }
+    },
+    "/api/scenarios/{scenario_id}/operational-view": {
+      "get": {
+        "operationId": "get_operational_view_api_scenarios__scenario_id__operational_view_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScenarioOperationalView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Operational View"
       }
     },
     "/api/scenarios/{scenario_id}/optimize": {

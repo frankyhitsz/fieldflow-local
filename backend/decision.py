@@ -32,12 +32,14 @@ from .models import (
     DecisionCostPolicy,
     EmergencyDecisionInformationSet,
     EmergencyDispatchPolicy,
+    EmergencyLocationPolicy,
     EmergencyResponderSelectionPolicy,
     ExternalAssignment,
     LaborCostMode,
     PlanCostBreakdown,
     PlanVersion,
     Point,
+    RiskArtifactDetailPolicy,
     RiskExecutionPolicy,
     RiskSimulationRequest,
     RiskSimulationResult,
@@ -46,6 +48,7 @@ from .models import (
     ScheduleAssignment,
     ScheduleResult,
     ScheduleScenario,
+    SimulatedWorkOrderOutcome,
     SimulationEmergencyEvent,
     Skill,
     Technician,
@@ -89,6 +92,7 @@ class _RiskRouteState:
     returned: bool = False
     on_time: int = 0
     total_late: int = 0
+    emergency_late: int = 0
     total_overtime: int = 0
     unserved: int = 0
     no_show_failure: bool = False
@@ -100,11 +104,14 @@ class _RiskRouteState:
     emergency_finish_time: int | None = None
     emergency_dispatch_location: Point | None = None
     work_order_late_minutes: dict[str, int | None] = field(default_factory=dict)
+    work_order_outcomes: dict[str, SimulatedWorkOrderOutcome] = field(default_factory=dict)
 
 
 class _RiskTrialOutcome(TypedDict):
     on_time: int
     total_late: int
+    published_total_late: int
+    emergency_late: int
     total_overtime: int
     unserved: int
     no_show_failure: bool
@@ -120,6 +127,7 @@ class _RiskTrialOutcome(TypedDict):
     emergency_decision_information_set: EmergencyDecisionInformationSet | None
     emergency_sla_failure: bool
     work_order_late_minutes: dict[str, int | None]
+    work_order_outcomes: dict[str, SimulatedWorkOrderOutcome]
 
 
 class DecisionAnalysisError(ValueError):
@@ -1725,9 +1733,27 @@ def build_simulation_scenario_set(
     request: RiskSimulationRequest,
     seed: int,
     analysis_as_of_time: int = 0,
+    active_work_order_ids: list[str] | None = None,
 ) -> dict[str, object]:
     technicians = {item.id: item for item in scenario.technicians}
     orders = sorted(scenario.work_orders, key=lambda item: item.id)
+    if request.emergency_location_policy is EmergencyLocationPolicy.external_empirical_distribution:
+        raise DecisionAnalysisError(
+            "EXTERNAL_EMERGENCY_LOCATION_DISTRIBUTION_REQUIRED",
+            "外部经验位置分布尚未配置，请选择当前需求、冻结位置代理或均匀服务区",
+        )
+    active_ids = set(active_work_order_ids or [])
+    if request.emergency_location_policy is EmergencyLocationPolicy.active_demand_locations:
+        location_orders = [item for item in orders if item.id in active_ids]
+    elif request.emergency_location_policy is EmergencyLocationPolicy.all_frozen_locations_as_spatial_proxy:
+        location_orders = orders
+    else:
+        location_orders = []
+    service_area_points = [item.location for item in orders] + [item.start_location for item in technicians.values()]
+    min_x = min((item.x for item in service_area_points), default=0)
+    max_x = max((item.x for item in service_area_points), default=100)
+    min_y = min((item.y for item in service_area_points), default=0)
+    max_y = max((item.y for item in service_area_points), default=100)
     technician_ids = sorted(technicians)
     skills = sorted(
         {skill for technician in technicians.values() for skill in technician.skills}, key=lambda x: x.value
@@ -1753,9 +1779,16 @@ def build_simulation_scenario_set(
             "emergency_time",
             modulo=event_span,
         )
-        if orders:
-            target_order = orders[_keyed_draw(seed, trial, "emergency_location", modulo=len(orders))]
+        if location_orders:
+            target_order = location_orders[_keyed_draw(seed, trial, "emergency_location", modulo=len(location_orders))]
             location = target_order.location
+        elif request.emergency_location_policy is EmergencyLocationPolicy.uniform_service_area:
+            x_span = max(1, int(round((max_x - min_x) * 1000)) + 1)
+            y_span = max(1, int(round((max_y - min_y) * 1000)) + 1)
+            location = Point(
+                x=min_x + _keyed_draw(seed, trial, "emergency_location_x", modulo=x_span) / 1000,
+                y=min_y + _keyed_draw(seed, trial, "emergency_location_y", modulo=y_span) / 1000,
+            )
         else:
             technician = technicians[
                 technician_ids[_keyed_draw(seed, trial, "emergency_location", modulo=len(technician_ids))]
@@ -1775,10 +1808,12 @@ def build_simulation_scenario_set(
             )
         )
     return {
-        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V5",
+        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V6",
         "keyed_random_version": "FIELD_SERVICE_KEYED_RANDOM_V1",
         "emergency_dispatch_policy": request.emergency_dispatch_policy.value,
         "emergency_responder_selection_policy": request.emergency_responder_selection_policy.value,
+        "emergency_location_policy": request.emergency_location_policy.value,
+        "emergency_location_work_order_ids": [item.id for item in location_orders],
         "scenario_snapshot_hash": content_hash(scenario),
         "seed": seed,
         "trials": request.trials,
@@ -1820,6 +1855,7 @@ def simulate_plan_risk(
         request,
         seed,
         context.analysis_as_of_time or 0,
+        active_work_order_ids=sorted(orders),
     )
     event_payload = scenario_set_manifest["emergency_events"]
     emergency_events_by_trial = (
@@ -1840,7 +1876,9 @@ def simulate_plan_risk(
     initially_unserved = len(schedule.unassigned)
     sla_rates: list[float] = []
     all_demand_sla_rates: list[float] = []
-    late_totals: list[int] = []
+    all_demand_late_totals: list[int] = []
+    published_late_totals: list[int] = []
+    emergency_late_totals: list[int] = []
     overtime_totals: list[int] = []
     unserved_totals: list[int] = []
     failed_trials = 0
@@ -1864,6 +1902,10 @@ def simulate_plan_risk(
     emergency_incremental_overtime_totals: list[int] = []
     emergency_incremental_unserved_totals: list[int] = []
     emergency_affected_order_totals: list[int] = []
+    emergency_disposition_changed_totals: list[int] = []
+    emergency_newly_unserved_totals: list[int] = []
+    emergency_newly_late_totals: list[int] = []
+    emergency_lateness_increased_totals: list[int] = []
     trial_metrics: list[RiskTrialMetric] = []
 
     def trial_outcome(
@@ -1957,11 +1999,22 @@ def simulate_plan_risk(
                 state.unserved += 1
                 state.no_show_failure = True
                 state.work_order_late_minutes[order.id] = None
+                state.work_order_outcomes[order.id] = SimulatedWorkOrderOutcome(
+                    work_order_id=order.id,
+                    disposition="NO_SHOW_UNSERVED",
+                    technician_id=state.technician_id,
+                )
                 return
             late = max(0, finish - order.sla_deadline)
             state.total_late += late
             state.on_time += int(late == 0)
             state.work_order_late_minutes[order.id] = late
+            state.work_order_outcomes[order.id] = SimulatedWorkOrderOutcome(
+                work_order_id=order.id,
+                disposition="ON_TIME" if late == 0 else "LATE",
+                late_minutes=late,
+                technician_id=state.technician_id,
+            )
             state.window_failure = state.window_failure or start > order.window_end
 
         def finish_route(state: _RiskRouteState) -> None:
@@ -2064,7 +2117,7 @@ def simulate_plan_risk(
             travel = (planned_travel * (100 + delay_percent) + 99) // 100
             state.current = depart_at + travel + event.duration_minutes
             state.emergency_finish_time = state.current
-            state.total_late += max(0, state.current - event.sla_deadline)
+            state.emergency_late = max(0, state.current - event.sla_deadline)
             state.emergency_completed = True
             state.emergency_on_time = state.current <= event.sla_deadline
             state.location = event.location
@@ -2158,11 +2211,28 @@ def simulate_plan_risk(
         states: dict[str, _RiskRouteState] = {}
         unserved = initially_unserved
         work_order_late_minutes: dict[str, int | None] = {}
+        work_order_outcomes: dict[str, SimulatedWorkOrderOutcome] = {
+            item.work_order_id: SimulatedWorkOrderOutcome(
+                work_order_id=item.work_order_id,
+                disposition="PLAN_UNSERVED",
+            )
+            for item in schedule.unassigned
+        }
         for technician_id in sorted(technicians):
             if technician_id in absent:
                 absent_route = routes.get(technician_id, [])
                 unserved += len(absent_route)
                 work_order_late_minutes.update({item.work_order_id: None for item in absent_route})
+                work_order_outcomes.update(
+                    {
+                        item.work_order_id: SimulatedWorkOrderOutcome(
+                            work_order_id=item.work_order_id,
+                            disposition="ABSENCE_UNSERVED",
+                            technician_id=technician_id,
+                        )
+                        for item in absent_route
+                    }
+                )
                 continue
             states[technician_id] = new_state(technician_id)
 
@@ -2219,9 +2289,12 @@ def simulate_plan_risk(
             if technician_id != emergency_target:
                 finish_route(state)
             work_order_late_minutes.update(state.work_order_late_minutes)
+            work_order_outcomes.update(state.work_order_outcomes)
 
         on_time = sum(state.on_time for state in states.values())
-        total_late = sum(state.total_late for state in states.values())
+        published_total_late = sum(state.total_late for state in states.values())
+        emergency_late = sum(state.emergency_late for state in states.values())
+        total_late = published_total_late + emergency_late
         total_overtime = sum(state.total_overtime for state in states.values())
         unserved += sum(state.unserved for state in states.values())
         no_show_failure = any(state.no_show_failure for state in states.values())
@@ -2232,6 +2305,8 @@ def simulate_plan_risk(
         return {
             "on_time": on_time,
             "total_late": total_late,
+            "published_total_late": published_total_late,
+            "emergency_late": emergency_late,
             "total_overtime": total_overtime,
             "unserved": unserved,
             "no_show_failure": no_show_failure,
@@ -2250,6 +2325,7 @@ def simulate_plan_risk(
             "emergency_sla_failure": emergency_event is not None
             and (emergency_target is None or not emergency_on_time),
             "work_order_late_minutes": work_order_late_minutes,
+            "work_order_outcomes": work_order_outcomes,
         }
 
     for trial in range(request.trials):
@@ -2295,12 +2371,51 @@ def simulate_plan_risk(
             0,
             int(outcome["unserved"]) - int(baseline_outcome["unserved"]),
         )
-        baseline_dispositions = baseline_outcome["work_order_late_minutes"]
-        emergency_dispositions = outcome["work_order_late_minutes"]
+        baseline_dispositions = baseline_outcome["work_order_outcomes"]
+        emergency_dispositions = outcome["work_order_outcomes"]
+        outcome_ids = set(baseline_dispositions) | set(emergency_dispositions)
+        served_dispositions = {"ON_TIME", "LATE"}
+        emergency_disposition_changed = sum(
+            1
+            for work_order_id in outcome_ids
+            if baseline_dispositions.get(work_order_id) is None
+            or emergency_dispositions.get(work_order_id) is None
+            or baseline_dispositions[work_order_id].disposition != emergency_dispositions[work_order_id].disposition
+        )
+        emergency_newly_unserved = sum(
+            1
+            for work_order_id in outcome_ids
+            if baseline_dispositions.get(work_order_id) is not None
+            and emergency_dispositions.get(work_order_id) is not None
+            and baseline_dispositions[work_order_id].disposition in served_dispositions
+            and emergency_dispositions[work_order_id].disposition not in served_dispositions
+        )
+        emergency_newly_late = sum(
+            1
+            for work_order_id in outcome_ids
+            if baseline_dispositions.get(work_order_id) is not None
+            and emergency_dispositions.get(work_order_id) is not None
+            and baseline_dispositions[work_order_id].disposition == "ON_TIME"
+            and emergency_dispositions[work_order_id].disposition == "LATE"
+        )
+        emergency_lateness_increased = sum(
+            1
+            for work_order_id in outcome_ids
+            if baseline_dispositions.get(work_order_id) is not None
+            and emergency_dispositions.get(work_order_id) is not None
+            and baseline_dispositions[work_order_id].disposition == "LATE"
+            and emergency_dispositions[work_order_id].disposition == "LATE"
+            and (emergency_dispositions[work_order_id].late_minutes or 0)
+            > (baseline_dispositions[work_order_id].late_minutes or 0)
+        )
         emergency_affected_orders = sum(
             1
-            for work_order_id in set(baseline_dispositions) | set(emergency_dispositions)
-            if baseline_dispositions.get(work_order_id) != emergency_dispositions.get(work_order_id)
+            for work_order_id in outcome_ids
+            if baseline_dispositions.get(work_order_id) is None
+            or emergency_dispositions.get(work_order_id) is None
+            or baseline_dispositions[work_order_id].disposition != emergency_dispositions[work_order_id].disposition
+            or (baseline_dispositions[work_order_id].late_minutes or 0)
+            != (emergency_dispositions[work_order_id].late_minutes or 0)
         )
         published_sla_rate = int(outcome["on_time"]) / active_count if active_count else 1.0
         all_demand_count = active_count + int(emergency_event)
@@ -2308,7 +2423,10 @@ def simulate_plan_risk(
         all_demand_sla_rate = all_demand_on_time / all_demand_count if all_demand_count else 1.0
         sla_rates.append(published_sla_rate)
         all_demand_sla_rates.append(all_demand_sla_rate)
-        late_totals.append(int(outcome["total_late"]))
+        all_demand_late_totals.append(int(outcome["total_late"]))
+        published_late_totals.append(int(outcome["published_total_late"]))
+        if emergency_event and bool(outcome["emergency_completed"]):
+            emergency_late_totals.append(int(outcome["emergency_late"]))
         overtime_totals.append(int(outcome["total_overtime"]))
         unserved_totals.append(int(outcome["unserved"]))
         if absence_failure or no_show_failure or window_failure or overtime_failure or emergency_caused_failure:
@@ -2334,6 +2452,10 @@ def simulate_plan_risk(
             emergency_incremental_overtime_totals.append(emergency_incremental_overtime)
             emergency_incremental_unserved_totals.append(emergency_incremental_unserved)
             emergency_affected_order_totals.append(emergency_affected_orders)
+            emergency_disposition_changed_totals.append(emergency_disposition_changed)
+            emergency_newly_unserved_totals.append(emergency_newly_unserved)
+            emergency_newly_late_totals.append(emergency_newly_late)
+            emergency_lateness_increased_totals.append(emergency_lateness_increased)
         trial_metrics.append(
             RiskTrialMetric(
                 trial=trial,
@@ -2353,6 +2475,20 @@ def simulate_plan_risk(
                 emergency_incremental_overtime_minutes=emergency_incremental_overtime,
                 emergency_incremental_unserved_orders=emergency_incremental_unserved,
                 emergency_affected_work_order_count=emergency_affected_orders,
+                emergency_disposition_changed_count=emergency_disposition_changed,
+                emergency_newly_unserved_count=emergency_newly_unserved,
+                emergency_newly_late_count=emergency_newly_late,
+                emergency_lateness_increased_count=emergency_lateness_increased,
+                published_work_total_late_minutes=int(outcome["published_total_late"]),
+                all_demand_total_late_minutes=int(outcome["total_late"]),
+                emergency_late_minutes=(
+                    int(outcome["emergency_late"]) if emergency_event and bool(outcome["emergency_completed"]) else None
+                ),
+                work_order_outcomes=(
+                    [outcome["work_order_outcomes"][item] for item in sorted(outcome["work_order_outcomes"])]
+                    if request.artifact_detail_policy is RiskArtifactDetailPolicy.full_trial_detail
+                    else []
+                ),
                 total_overtime_minutes=int(outcome["total_overtime"]),
                 total_unserved_orders=int(outcome["unserved"]),
                 disrupted=bool(
@@ -2376,9 +2512,12 @@ def simulate_plan_risk(
     ci_high = bootstrap_means[int(0.975 * (len(bootstrap_means) - 1))]
     disruption_probability = round(failed_trials / request.trials, 4)
     expected_total_unserved = round(sum(unserved_totals) / request.trials, 2)
-    late_p50 = _percentile(late_totals, 0.5)
-    late_p90 = _percentile(late_totals, 0.9)
-    late_p95 = _percentile(late_totals, 0.95)
+    all_demand_late_p50 = _percentile(all_demand_late_totals, 0.5)
+    all_demand_late_p90 = _percentile(all_demand_late_totals, 0.9)
+    all_demand_late_p95 = _percentile(all_demand_late_totals, 0.95)
+    published_late_p50 = _percentile(published_late_totals, 0.5)
+    published_late_p90 = _percentile(published_late_totals, 0.9)
+    published_late_p95 = _percentile(published_late_totals, 0.95)
     scenario_set_hash = content_hash(scenario_set_manifest)
     emergency_event_probability = round(emergency_event_trials / request.trials, 4)
     emergency_caused_probability = round(emergency_caused_failure_trials / request.trials, 4)
@@ -2387,6 +2526,10 @@ def simulate_plan_risk(
     )
     emergency_on_time_rate = (
         round(emergency_on_time_trials / emergency_event_trials, 4) if emergency_event_trials else None
+    )
+    location_id_payload = scenario_set_manifest.get("emergency_location_work_order_ids")
+    emergency_location_work_order_ids = (
+        [str(item) for item in location_id_payload] if isinstance(location_id_payload, list) else []
     )
     return RiskSimulationResult(
         scenario_id=plan.scenario_id,
@@ -2403,6 +2546,9 @@ def simulate_plan_risk(
         execution_policy=request.execution_policy,
         emergency_dispatch_policy=request.emergency_dispatch_policy,
         emergency_responder_selection_policy=request.emergency_responder_selection_policy,
+        emergency_location_policy=request.emergency_location_policy,
+        emergency_location_work_order_ids=emergency_location_work_order_ids,
+        artifact_detail_policy=request.artifact_detail_policy,
         analysis_code_version=__version__,
         algorithm_version=DECISION_ALGORITHM_VERSION,
         build_sha=decision_build_sha(),
@@ -2437,19 +2583,49 @@ def simulate_plan_risk(
         emergency_affected_work_order_count=(
             round(statistics.fmean(emergency_affected_order_totals), 2) if emergency_affected_order_totals else None
         ),
+        emergency_disposition_changed_count=(
+            round(statistics.fmean(emergency_disposition_changed_totals), 2)
+            if emergency_disposition_changed_totals
+            else None
+        ),
+        emergency_newly_unserved_count=(
+            round(statistics.fmean(emergency_newly_unserved_totals), 2) if emergency_newly_unserved_totals else None
+        ),
+        emergency_newly_late_count=(
+            round(statistics.fmean(emergency_newly_late_totals), 2) if emergency_newly_late_totals else None
+        ),
+        emergency_lateness_increased_count=(
+            round(statistics.fmean(emergency_lateness_increased_totals), 2)
+            if emergency_lateness_increased_totals
+            else None
+        ),
+        emergency_metric_sample_count=emergency_event_trials,
+        emergency_completed_sample_count=len(emergency_late_totals),
         monte_carlo_mean_ci_low=round(ci_low, 4),
         monte_carlo_mean_ci_high=round(ci_high, 4),
         sla_rate_ci_low=round(ci_low, 4),
         sla_rate_ci_high=round(ci_high, 4),
-        full_day_total_late_minutes_p50=late_p50,
-        full_day_total_late_minutes_p90=late_p90,
-        full_day_total_late_minutes_p95=late_p95,
-        scope_total_late_minutes_p50=late_p50,
-        scope_total_late_minutes_p90=late_p90,
-        scope_total_late_minutes_p95=late_p95,
-        late_minutes_p50=late_p50,
-        late_minutes_p90=late_p90,
-        late_minutes_p95=late_p95,
+        published_work_total_late_minutes_p50=published_late_p50,
+        published_work_total_late_minutes_p90=published_late_p90,
+        published_work_total_late_minutes_p95=published_late_p95,
+        all_demand_total_late_minutes_p50=all_demand_late_p50,
+        all_demand_total_late_minutes_p90=all_demand_late_p90,
+        all_demand_total_late_minutes_p95=all_demand_late_p95,
+        emergency_late_minutes_mean=(
+            round(statistics.fmean(emergency_late_totals), 2) if emergency_late_totals else None
+        ),
+        emergency_late_minutes_p50=(_percentile(emergency_late_totals, 0.5) if emergency_late_totals else None),
+        emergency_late_minutes_p90=(_percentile(emergency_late_totals, 0.9) if emergency_late_totals else None),
+        # Deprecated aliases retain their historical all-demand mapping.
+        full_day_total_late_minutes_p50=all_demand_late_p50,
+        full_day_total_late_minutes_p90=all_demand_late_p90,
+        full_day_total_late_minutes_p95=all_demand_late_p95,
+        scope_total_late_minutes_p50=all_demand_late_p50,
+        scope_total_late_minutes_p90=all_demand_late_p90,
+        scope_total_late_minutes_p95=all_demand_late_p95,
+        late_minutes_p50=all_demand_late_p50,
+        late_minutes_p90=all_demand_late_p90,
+        late_minutes_p95=all_demand_late_p95,
         expected_overtime_minutes=round(sum(overtime_totals) / request.trials, 2),
         additional_disruption_probability=disruption_probability,
         technician_absence_event_probability=round(absence_event_trials / request.trials, 4),
@@ -2490,11 +2666,17 @@ def simulate_plan_risk(
             "外生随机数按 trial、事件类型和实体 ID 分流；同一场景与 seed 可做配对计划比较。",
             "技师缺勤会使其整条路线失效；客户不在场按 10 分钟现场处置后离开。",
             "突发事件发生概率与其实际造成窗口、加班、未服务或 SLA 恶化的概率分开列示。",
+            {
+                EmergencyLocationPolicy.active_demand_locations: "紧急需求位置只从本次分析范围内的当前待服务需求地点采样。",
+                EmergencyLocationPolicy.all_frozen_locations_as_spatial_proxy: "紧急需求位置从全部冻结工单地点采样，并明确把历史地点作为服务区域空间代理。",
+                EmergencyLocationPolicy.uniform_service_area: "紧急需求位置在冻结业务地点与技师出发点形成的矩形服务区内均匀采样。",
+                EmergencyLocationPolicy.external_empirical_distribution: "紧急需求位置使用外部经验分布。",
+            }[request.emergency_location_policy],
             "默认服从已发布开始时刻；只有显式 EARLIEST_FEASIBLE_EXECUTION 才按最早可行时刻执行。",
             "紧急工单采用 BETWEEN_VISITS_ONLY：不打断服务，也不在行驶途中改道；选人和后续路线共用同一条试验时间线。",
             "已知未分配需求与新增扰动概率分开列示，不把原有缺口称为随机失效。",
             "模拟均值抽样区间只描述 Monte Carlo 均值误差，不是现实业务参数的置信区间。",
-            "迟到分位数表示每次模拟在本次分析范围内的总迟到分钟，不是单张工单迟到分位数。",
+            "发布工单、全需求和已完成紧急单的迟到分钟分别统计；旧 late_minutes_* 别名兼容映射到全需求总迟到。",
             "发布承诺 SLA 只覆盖原计划工单；全需求 SLA 另将每个实际发生的紧急需求计入分母。",
         ],
         trial_metrics=trial_metrics,

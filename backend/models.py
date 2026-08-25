@@ -87,6 +87,10 @@ class PlanApplicability(BaseModel):
     commercial_current: bool = True
     reoptimization_opportunity: bool = False
     invalid_assignment_ids: list[str] = Field(default_factory=list)
+    evaluated_scenario_revision: int | None = Field(default=None, ge=0)
+    evaluated_scenario_snapshot_hash: str = ""
+    reducer_policy_version: str = "FIELD_SERVICE_PLAN_APPLICABILITY_V2"
+    projection_hash: str = ""
 
 
 class DecisionAnalysisScope(str, Enum):
@@ -158,10 +162,44 @@ class EmergencyResponderSelectionPolicy(str, Enum):
         return None
 
 
+class EmergencyLocationPolicy(str, Enum):
+    active_demand_locations = "ACTIVE_DEMAND_LOCATIONS"
+    all_frozen_locations_as_spatial_proxy = "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY"
+    uniform_service_area = "UNIFORM_SERVICE_AREA"
+    external_empirical_distribution = "EXTERNAL_EMPIRICAL_DISTRIBUTION"
+
+
+class RiskArtifactDetailPolicy(str, Enum):
+    summary_only = "SUMMARY_ONLY"
+    full_trial_detail = "FULL_TRIAL_DETAIL"
+
+
 class AnalysisIntegrityStatus(str, Enum):
     verified = "VERIFIED"
     failed = "FAILED"
     legacy_unattested = "LEGACY_UNATTESTED"
+
+
+class RevisionProofOrigin(str, Enum):
+    native_attested = "NATIVE_ATTESTED"
+    migration_backfilled = "MIGRATION_BACKFILLED"
+    legacy_unattested = "LEGACY_UNATTESTED"
+
+
+class RevisionChainStatus(str, Enum):
+    verified = "VERIFIED"
+    root_invalid = "ROOT_INVALID"
+    gap_detected = "GAP_DETECTED"
+    ancestor_invalid = "ANCESTOR_INVALID"
+
+
+class CurrentWorkOrderDisposition(str, Enum):
+    assigned_valid = "ASSIGNED_VALID"
+    assigned_invalid = "ASSIGNED_INVALID"
+    plan_unassigned = "PLAN_UNASSIGNED"
+    new_uncovered = "NEW_UNCOVERED"
+    started = "STARTED"
+    completed = "COMPLETED"
 
 
 class PlanUseCase(str, Enum):
@@ -560,6 +598,7 @@ class ManualReassignmentRequest(BaseModel):
     technician_id: Identifier
     planning_time: int = Field(ge=0, le=1800)
     expected_revision: int = Field(ge=0)
+    expected_active_plan_version_id: str | None = None
     idempotency_key: IdempotencyKey
 
 
@@ -578,6 +617,7 @@ class OptimizeRequest(BaseModel):
         "balanced"
     )
     profile_id: Identifier | None = None
+    expected_active_plan_version_id: str | None = None
 
 
 class ReplanRequest(BaseModel):
@@ -589,6 +629,7 @@ class ReplanRequest(BaseModel):
         "balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload", "stable"
     ] = "stable"
     profile_id: str | None = None
+    expected_active_plan_version_id: str | None = None
     idempotency_key: IdempotencyKey | None = None
     intake_idempotency_key: IdempotencyKey | None = None
 
@@ -750,6 +791,8 @@ class ScenarioRevision(BaseModel):
     scenario_snapshot_hash: str = ""
     previous_revision_hash: str | None = None
     revision_hash: str = ""
+    proof_origin: RevisionProofOrigin = RevisionProofOrigin.native_attested
+    chain_status: RevisionChainStatus = RevisionChainStatus.verified
     self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
     effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
 
@@ -878,8 +921,49 @@ class PlanVersionPatch(BaseModel):
     label: ShortLabel
 
 
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    retryable: bool = False
+    refresh_required: bool = False
+    current_revision: int | None = None
+    expected_revision: int | None = None
+    current_active_plan_id: str | None = None
+    expected_active_plan_id: str | None = None
+    resource_id: str | None = None
+    reservation_id: str | None = None
+
+
+class OperationalWorkOrderView(BaseModel):
+    work_order_id: Identifier
+    disposition: CurrentWorkOrderDisposition
+    assignment: ScheduleAssignment | None = None
+    start_allowed: bool = False
+    blocking_reason_code: str | None = None
+
+
+class OperationalMetrics(BaseModel):
+    active_demand_count: int = Field(ge=0)
+    valid_assigned_count: int = Field(ge=0)
+    invalid_assignment_count: int = Field(ge=0)
+    plan_unassigned_count: int = Field(ge=0)
+    new_uncovered_count: int = Field(ge=0)
+    current_actionable_coverage_rate: float = Field(ge=0, le=1)
+
+
+class ScenarioOperationalView(BaseModel):
+    scenario_id: Identifier
+    scenario_revision: int = Field(ge=0)
+    scenario_snapshot_hash: str
+    active_plan_version_id: str | None = None
+    plan_applicability: PlanApplicability | None = None
+    work_orders: list[OperationalWorkOrderView]
+    current_metrics: OperationalMetrics
+
+
 class ActivatePlanRequest(BaseModel):
     expected_revision: int = Field(ge=0)
+    expected_active_plan_version_id: str | None = None
     idempotency_key: IdempotencyKey
 
 
@@ -890,6 +974,7 @@ class CloneScenarioRequest(BaseModel):
 
 class ReattestPlanRequest(BaseModel):
     expected_revision: int = Field(ge=0)
+    expected_active_plan_version_id: str | None = None
     idempotency_key: IdempotencyKey
     mode: ReattestationMode = ReattestationMode.exact_snapshot
 
@@ -916,6 +1001,7 @@ class RollbackPreview(BaseModel):
 
 class RestoreRequest(BaseModel):
     expected_revision: int = Field(ge=0)
+    expected_active_plan_version_id: str | None = None
     confirmation_token: str = Field(min_length=16, max_length=128)
     reason: ShortLabel
     allow_reopen_completed: bool = Field(
@@ -1017,6 +1103,7 @@ class StrategyExperiment(BaseModel):
     profile_snapshots: list[StrategyProfile] = Field(default_factory=list)
     fingerprint: str = ""
     scenario_snapshot_hash: str = ""
+    expected_active_plan_version_id: str | None = None
     score_policy_version: str = "FIELD_SERVICE_SCORE_V2"
     score_policy_snapshot: dict[str, float] = Field(default_factory=dict)
     travel_model_version: str = "EUCLIDEAN_GRID_V2"
@@ -1033,6 +1120,7 @@ class StrategyExperiment(BaseModel):
 class ExperimentPublishRequest(BaseModel):
     candidate_id: str
     expected_revision: int = Field(ge=0)
+    expected_active_plan_version_id: str | None = None
 
 
 class DecisionCostPolicy(BaseModel):
@@ -1409,6 +1497,14 @@ class RiskSimulationParameters(BaseModel):
     emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
         EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
     )
+    emergency_location_policy: EmergencyLocationPolicy = EmergencyLocationPolicy.all_frozen_locations_as_spatial_proxy
+    artifact_detail_policy: RiskArtifactDetailPolicy = RiskArtifactDetailPolicy.summary_only
+
+    @model_validator(mode="after")
+    def validate_artifact_detail_volume(self) -> RiskSimulationParameters:
+        if self.artifact_detail_policy is RiskArtifactDetailPolicy.full_trial_detail and self.trials > 1_000:
+            raise ValueError("FULL_TRIAL_DETAIL 最多支持 1000 次试验；更大分析请使用 SUMMARY_ONLY")
+        return self
 
 
 class RiskSimulationRequest(RiskSimulationParameters):
@@ -1432,8 +1528,11 @@ class RiskSimulationResult(BaseModel):
     emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
         EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
     )
+    emergency_location_policy: EmergencyLocationPolicy = EmergencyLocationPolicy.all_frozen_locations_as_spatial_proxy
+    emergency_location_work_order_ids: list[Identifier] = Field(default_factory=list)
+    artifact_detail_policy: RiskArtifactDetailPolicy = RiskArtifactDetailPolicy.summary_only
     execution_policy_version: str = "FIELD_SERVICE_RISK_EXECUTION_V2"
-    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V5"
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V6"
     analysis_code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
@@ -1452,6 +1551,12 @@ class RiskSimulationResult(BaseModel):
     emergency_incremental_overtime_minutes: float | None = Field(default=None, ge=0)
     emergency_incremental_unserved_orders: float | None = Field(default=None, ge=0)
     emergency_affected_work_order_count: float | None = Field(default=None, ge=0)
+    emergency_disposition_changed_count: float | None = Field(default=None, ge=0)
+    emergency_newly_unserved_count: float | None = Field(default=None, ge=0)
+    emergency_newly_late_count: float | None = Field(default=None, ge=0)
+    emergency_lateness_increased_count: float | None = Field(default=None, ge=0)
+    emergency_metric_sample_count: int = Field(default=0, ge=0)
+    emergency_completed_sample_count: int = Field(default=0, ge=0)
     monte_carlo_mean_ci_low: float = Field(default=0, ge=0, le=1)
     monte_carlo_mean_ci_high: float = Field(default=0, ge=0, le=1)
     sla_rate_ci_low: float = Field(ge=0, le=1)
@@ -1462,6 +1567,15 @@ class RiskSimulationResult(BaseModel):
     scope_total_late_minutes_p50: int = Field(default=0, ge=0)
     scope_total_late_minutes_p90: int = Field(default=0, ge=0)
     scope_total_late_minutes_p95: int = Field(default=0, ge=0)
+    published_work_total_late_minutes_p50: int = Field(default=0, ge=0)
+    published_work_total_late_minutes_p90: int = Field(default=0, ge=0)
+    published_work_total_late_minutes_p95: int = Field(default=0, ge=0)
+    all_demand_total_late_minutes_p50: int = Field(default=0, ge=0)
+    all_demand_total_late_minutes_p90: int = Field(default=0, ge=0)
+    all_demand_total_late_minutes_p95: int = Field(default=0, ge=0)
+    emergency_late_minutes_mean: float | None = Field(default=None, ge=0)
+    emergency_late_minutes_p50: int | None = Field(default=None, ge=0)
+    emergency_late_minutes_p90: int | None = Field(default=None, ge=0)
     late_minutes_p50: int = Field(ge=0)
     late_minutes_p90: int = Field(ge=0)
     late_minutes_p95: int = Field(ge=0)
@@ -1544,7 +1658,7 @@ class DecisionAnalysisContext(BaseModel):
 
 
 class DecisionRuntimeManifest(BaseModel):
-    policy_version: str = "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V1"
+    policy_version: str = "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V2"
     hash_schema_version: str
     python_version: str
     ortools_version: str
@@ -1554,6 +1668,7 @@ class DecisionRuntimeManifest(BaseModel):
     architecture: str
     build_sha: str
     dependency_lock_hash: str
+    runtime_distributions: dict[str, str] = Field(default_factory=dict)
 
 
 # Read/source compatibility for integrations importing the v0.5.7 name.
@@ -1727,6 +1842,19 @@ class EmergencyDecisionInformationSet(BaseModel):
     deterministic_terminal_by_technician: dict[str, int] = Field(default_factory=dict)
 
 
+class SimulatedWorkOrderOutcome(BaseModel):
+    work_order_id: Identifier
+    disposition: Literal[
+        "ON_TIME",
+        "LATE",
+        "NO_SHOW_UNSERVED",
+        "ABSENCE_UNSERVED",
+        "PLAN_UNSERVED",
+    ]
+    late_minutes: int | None = Field(default=None, ge=0)
+    technician_id: Identifier | None = None
+
+
 class RiskTrialMetric(BaseModel):
     trial: int = Field(ge=0)
     sla_on_time_rate: float = Field(ge=0, le=1)
@@ -1748,6 +1876,14 @@ class RiskTrialMetric(BaseModel):
     emergency_incremental_overtime_minutes: int = Field(default=0, ge=0)
     emergency_incremental_unserved_orders: int = Field(default=0, ge=0)
     emergency_affected_work_order_count: int = Field(default=0, ge=0)
+    emergency_disposition_changed_count: int = Field(default=0, ge=0)
+    emergency_newly_unserved_count: int = Field(default=0, ge=0)
+    emergency_newly_late_count: int = Field(default=0, ge=0)
+    emergency_lateness_increased_count: int = Field(default=0, ge=0)
+    published_work_total_late_minutes: int = Field(default=0, ge=0)
+    all_demand_total_late_minutes: int = Field(default=0, ge=0)
+    emergency_late_minutes: int | None = Field(default=None, ge=0)
+    work_order_outcomes: list[SimulatedWorkOrderOutcome] = Field(default_factory=list)
 
 
 class RiskTrialOutcomeArtifact(BaseModel):
@@ -1756,6 +1892,7 @@ class RiskTrialOutcomeArtifact(BaseModel):
     scenario_id: str
     analysis_run_id: str
     scenario_set_hash: str
+    detail_policy: RiskArtifactDetailPolicy = RiskArtifactDetailPolicy.summary_only
     metrics: list[RiskTrialMetric]
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
@@ -1771,12 +1908,14 @@ class SimulationScenarioSetArtifact(BaseModel):
     id: str
     scenario_id: str
     analysis_run_id: str
-    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V5"
+    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V6"
     keyed_random_version: str = "FIELD_SERVICE_KEYED_RANDOM_V1"
     emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
     emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
         EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
     )
+    emergency_location_policy: EmergencyLocationPolicy = EmergencyLocationPolicy.all_frozen_locations_as_spatial_proxy
+    emergency_location_work_order_ids: list[Identifier] = Field(default_factory=list)
     scenario_snapshot_hash: str
     seed: int
     trials: int
@@ -1947,6 +2086,26 @@ class ScheduleVerificationReport(BaseModel):
     checked_at: str
 
 
+class PlanningReservation(BaseModel):
+    id: str
+    scenario_id: str
+    action: Literal["baseline", "optimize", "replan", "activate", "restore", "reattest", "experiment"]
+    scenario_revision: int
+    scenario_snapshot_hash: str
+    scenario_snapshot: ScheduleScenario
+    active_plan_version_id: str | None = None
+    active_plan_manifest_hash: str | None = None
+    source_plan_version_id: str | None = None
+    source_plan_manifest_hash: str | None = None
+    source_plan: PlanVersion | None = None
+    execution_watermark: int = Field(ge=0)
+    execution_context_hash: str | None = None
+    execution_context: ExecutionSourceContext | None = None
+    command_fingerprint: str
+    created_at: str
+    reservation_hash: str = ""
+
+
 class ScheduleRun(BaseModel):
     id: str
     scenario_id: str
@@ -1956,6 +2115,8 @@ class ScheduleRun(BaseModel):
     source_plan_version_id: str | None = None
     source_plan_snapshot_hash: str | None = None
     expected_active_plan_version_id: str | None = None
+    reservation_id: str | None = None
+    reservation_hash: str | None = None
     solver_name: str
     solver_version: str
     solver_config_hash: str
@@ -1980,6 +2141,8 @@ class ScheduleCandidate(BaseModel):
     scenario_snapshot_hash: str
     source_plan_version_id: str | None = None
     expected_active_plan_version_id: str | None = None
+    reservation_id: str | None = None
+    reservation_hash: str | None = None
     solver_config_hash: str
     solver_policy_fingerprint: str = ""
     schedule: ScheduleResult

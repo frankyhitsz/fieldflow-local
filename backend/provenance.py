@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import platform
 import sqlite3
@@ -14,7 +15,6 @@ DECISION_ALGORITHM_VERSION = "FIELD_SERVICE_DECISION_V3"
 DECISION_SOURCE_FILES = (
     "decision.py",
     "hashing.py",
-    "models.py",
     "planning.py",
     "provenance.py",
     "scheduler.py",
@@ -22,6 +22,50 @@ DECISION_SOURCE_FILES = (
     "travel.py",
     "verification.py",
 )
+
+
+def _decision_model_source_closure(backend_root: Path) -> list[dict[str, str]]:
+    """Hash only model definitions reachable from decision modules."""
+    model_path = backend_root / "models.py"
+    source = model_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    definitions: dict[str, ast.AST] = {}
+    for node in tree.body:
+        names: list[str] = []
+        if isinstance(node, ast.ClassDef | ast.FunctionDef):
+            names = [node.name]
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [target.id for target in targets if isinstance(target, ast.Name)]
+        for name in names:
+            definitions[name] = node
+
+    required: set[str] = set()
+    for filename in DECISION_SOURCE_FILES:
+        path = backend_root / filename
+        if not path.exists():
+            continue
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(module):
+            if isinstance(node, ast.ImportFrom) and node.module == "models":
+                required.update(alias.name for alias in node.names)
+
+    selected: set[str] = set()
+    pending = sorted(required)
+    while pending:
+        name = pending.pop()
+        if name in selected or name not in definitions:
+            continue
+        selected.add(name)
+        referenced = {node.id for node in ast.walk(definitions[name]) if isinstance(node, ast.Name)}
+        pending.extend(sorted(referenced - selected))
+    return [
+        {
+            "path": f"models.py#{name}",
+            "content": ast.get_source_segment(source, definitions[name]) or "",
+        }
+        for name in sorted(selected)
+    ]
 
 
 def build_plan_manifest_payload(plan: PlanVersion) -> dict[str, object]:
@@ -88,6 +132,7 @@ def decision_build_sha() -> str:
         for name in DECISION_SOURCE_FILES
         if (path := backend_root / name).exists()
     ]
+    source.extend(_decision_model_source_closure(backend_root))
     return f"dev-{content_hash(source)[:16]}"
 
 
@@ -98,11 +143,26 @@ def _package_version(name: str) -> str:
         return "not-installed"
 
 
+def _runtime_distribution_inventory(lock_path: Path) -> dict[str, str]:
+    inventory: dict[str, str] = {}
+    if not lock_path.exists():
+        return inventory
+    for raw_line in lock_path.read_text(encoding="utf-8").splitlines():
+        requirement = raw_line.split(";", 1)[0].strip()
+        if not requirement or requirement.startswith("#") or "==" not in requirement:
+            continue
+        distribution = requirement.split("==", 1)[0].strip()
+        normalized = distribution.lower().replace("_", "-")
+        inventory[normalized] = _package_version(distribution)
+    return dict(sorted(inventory.items()))
+
+
 @lru_cache(maxsize=1)
 def decision_runtime_manifest() -> RuntimeManifest:
     root = Path(__file__).resolve().parent.parent
+    runtime_lock = root / "requirements-runtime.lock"
     lock_inputs: list[dict[str, str]] = []
-    for relative in ("pyproject.toml", "requirements.lock"):
+    for relative in ("pyproject.toml", "requirements-runtime.lock"):
         path = root / relative
         if path.exists():
             lock_inputs.append({"path": relative, "content": path.read_text(encoding="utf-8")})
@@ -116,6 +176,7 @@ def decision_runtime_manifest() -> RuntimeManifest:
         architecture=platform.machine() or "unknown",
         build_sha=decision_build_sha(),
         dependency_lock_hash=content_hash(lock_inputs),
+        runtime_distributions=_runtime_distribution_inventory(runtime_lock),
     )
 
 

@@ -4,6 +4,7 @@
 export interface components {
   schemas: {
     ActivatePlanRequest: {
+          expected_active_plan_version_id?: (string) | (null);
           expected_revision: number;
           idempotency_key: string;
         };
@@ -295,6 +296,7 @@ export interface components {
           overlapping_work_orders?: Array<string>;
           unassigned_work_orders: number;
         };
+    CurrentWorkOrderDisposition: "ASSIGNED_VALID" | "ASSIGNED_INVALID" | "PLAN_UNASSIGNED" | "NEW_UNCOVERED" | "STARTED" | "COMPLETED";
     DecisionAnalysisRun: {
           active_booking_ids?: Array<string>;
           actual_execution_included?: boolean;
@@ -393,6 +395,9 @@ export interface components {
           policy_version?: string;
           pydantic_version: string;
           python_version: string;
+          runtime_distributions?: {
+            [key: string]: string;
+          };
           sqlite_version: string;
         };
     EmergencyDecisionInformationSet: {
@@ -418,6 +423,7 @@ export interface components {
           selection_policy?: components['schemas']["EmergencyResponderSelectionPolicy"];
         };
     EmergencyDispatchPolicy: "BETWEEN_VISITS_ONLY";
+    EmergencyLocationPolicy: "ACTIVE_DEMAND_LOCATIONS" | "ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY" | "UNIFORM_SERVICE_AREA" | "EXTERNAL_EMPIRICAL_DISTRIBUTION";
     EmergencyResponderSelectionPolicy: "MYOPIC_EARLIEST_EMERGENCY_FINISH";
     EmergencyWorkOrderCreate: {
           customer_name: string;
@@ -461,6 +467,7 @@ export interface components {
         };
     ExperimentPublishRequest: {
           candidate_id: string;
+          expected_active_plan_version_id?: (string) | (null);
           expected_revision: number;
         };
     ExternalAssignment: {
@@ -506,6 +513,7 @@ export interface components {
           work_order_id: string;
         };
     ManualReassignmentRequest: {
+          expected_active_plan_version_id?: (string) | (null);
           expected_revision: number;
           idempotency_key: string;
           planning_time: number;
@@ -522,7 +530,23 @@ export interface components {
           scenario: components['schemas']["ScheduleScenario"];
           schedule?: (components['schemas']["ScheduleResult"]) | (null);
         };
+    OperationalMetrics: {
+          active_demand_count: number;
+          current_actionable_coverage_rate: number;
+          invalid_assignment_count: number;
+          new_uncovered_count: number;
+          plan_unassigned_count: number;
+          valid_assigned_count: number;
+        };
+    OperationalWorkOrderView: {
+          assignment?: (components['schemas']["ScheduleAssignment"]) | (null);
+          blocking_reason_code?: (string) | (null);
+          disposition: components['schemas']["CurrentWorkOrderDisposition"];
+          start_allowed?: boolean;
+          work_order_id: string;
+        };
     OptimizeRequest: {
+          expected_active_plan_version_id?: (string) | (null);
           profile_id?: (string) | (null);
           strategy?: "balanced" | "completion" | "punctuality" | "low_travel" | "low_overtime" | "fair_workload";
           time_limit_seconds?: (number) | (null);
@@ -542,9 +566,13 @@ export interface components {
     PlanApplicability: {
           commercial_current?: boolean;
           coverage_complete?: boolean;
+          evaluated_scenario_revision?: (number) | (null);
+          evaluated_scenario_snapshot_hash?: string;
           invalid_assignment_ids?: Array<string>;
           metrics_current?: boolean;
           planning_current?: boolean;
+          projection_hash?: string;
+          reducer_policy_version?: string;
           reoptimization_opportunity?: boolean;
           route_executable?: boolean;
         };
@@ -653,6 +681,7 @@ export interface components {
           verified_schedule_hash: string;
         };
     ReattestPlanRequest: {
+          expected_active_plan_version_id?: (string) | (null);
           expected_revision: number;
           idempotency_key: string;
           mode?: components['schemas']["ReattestationMode"];
@@ -666,6 +695,7 @@ export interface components {
     ReplanRequest: {
           current_time?: (number) | (null);
           emergency_order?: (components['schemas']["EmergencyWorkOrderCreate"]) | (null);
+          expected_active_plan_version_id?: (string) | (null);
           idempotency_key?: (string) | (null);
           intake_idempotency_key?: (string) | (null);
           planning_time?: (number) | (null);
@@ -678,10 +708,12 @@ export interface components {
           /** 兼容旧客户端；执行事件不可变，服务端始终拒绝重新打开已完成工单 */
           allow_reopen_completed?: boolean;
           confirmation_token: string;
+          expected_active_plan_version_id?: (string) | (null);
           expected_revision: number;
           idempotency_key: string;
           reason: string;
         };
+    RiskArtifactDetailPolicy: "SUMMARY_ONLY" | "FULL_TRIAL_DETAIL";
     RiskComparisonResult: {
           delta?: {
             [key: string]: number;
@@ -742,8 +774,10 @@ export interface components {
         };
     RiskExecutionPolicy: "FOLLOW_PUBLISHED_SCHEDULE" | "EARLIEST_FEASIBLE_EXECUTION";
     RiskSimulationParameters: {
+          artifact_detail_policy?: components['schemas']["RiskArtifactDetailPolicy"];
           customer_no_show_basis_points?: number;
           emergency_dispatch_policy?: components['schemas']["EmergencyDispatchPolicy"];
+          emergency_location_policy?: components['schemas']["EmergencyLocationPolicy"];
           emergency_order_basis_points?: number;
           emergency_responder_selection_policy?: components['schemas']["EmergencyResponderSelectionPolicy"];
           execution_policy?: components['schemas']["RiskExecutionPolicy"];
@@ -755,8 +789,10 @@ export interface components {
         };
     RiskSimulationRequest: {
           analysis_scope?: (components['schemas']["DecisionAnalysisScope"]) | (null);
+          artifact_detail_policy?: components['schemas']["RiskArtifactDetailPolicy"];
           customer_no_show_basis_points?: number;
           emergency_dispatch_policy?: components['schemas']["EmergencyDispatchPolicy"];
+          emergency_location_policy?: components['schemas']["EmergencyLocationPolicy"];
           emergency_order_basis_points?: number;
           emergency_responder_selection_policy?: components['schemas']["EmergencyResponderSelectionPolicy"];
           execution_policy?: components['schemas']["RiskExecutionPolicy"];
@@ -776,9 +812,13 @@ export interface components {
           additional_disruption_probability: number;
           algorithm_version?: string;
           all_demand_sla_rate?: number;
+          all_demand_total_late_minutes_p50?: number;
+          all_demand_total_late_minutes_p90?: number;
+          all_demand_total_late_minutes_p95?: number;
           analysis_as_of_time?: (number) | (null);
           analysis_code_version: string;
           analysis_scope?: components['schemas']["DecisionAnalysisScope"];
+          artifact_detail_policy?: components['schemas']["RiskArtifactDetailPolicy"];
           assumptions?: Array<string>;
           baseline_unserved_orders: number;
           build_sha?: string;
@@ -790,14 +830,25 @@ export interface components {
           emergency_caused_sla_degradation_probability?: number;
           emergency_caused_unserved_probability?: number;
           emergency_caused_window_failure_probability?: number;
+          emergency_completed_sample_count?: number;
           emergency_completion_rate?: (number) | (null);
           emergency_dispatch_policy?: components['schemas']["EmergencyDispatchPolicy"];
+          emergency_disposition_changed_count?: (number) | (null);
           emergency_event_count?: number;
           emergency_event_probability?: number;
           emergency_failure_given_event_probability?: (number) | (null);
           emergency_incremental_late_minutes?: (number) | (null);
           emergency_incremental_overtime_minutes?: (number) | (null);
           emergency_incremental_unserved_orders?: (number) | (null);
+          emergency_late_minutes_mean?: (number) | (null);
+          emergency_late_minutes_p50?: (number) | (null);
+          emergency_late_minutes_p90?: (number) | (null);
+          emergency_lateness_increased_count?: (number) | (null);
+          emergency_location_policy?: components['schemas']["EmergencyLocationPolicy"];
+          emergency_location_work_order_ids?: Array<string>;
+          emergency_metric_sample_count?: number;
+          emergency_newly_late_count?: (number) | (null);
+          emergency_newly_unserved_count?: (number) | (null);
           emergency_on_time_rate?: (number) | (null);
           emergency_responder_selection_policy?: components['schemas']["EmergencyResponderSelectionPolicy"];
           emergency_unserved_probability?: (number) | (null);
@@ -823,6 +874,9 @@ export interface components {
           plan_number: number;
           plan_version_id: string;
           published_commitment_sla_rate?: number;
+          published_work_total_late_minutes_p50?: number;
+          published_work_total_late_minutes_p90?: number;
+          published_work_total_late_minutes_p95?: number;
           scenario_id: string;
           scenario_set_artifact_id?: (string) | (null);
           scenario_snapshot_hash: string;
@@ -844,25 +898,33 @@ export interface components {
         };
     RiskTrialMetric: {
           all_demand_sla_rate?: number;
+          all_demand_total_late_minutes?: number;
           disrupted: boolean;
           emergency_affected_work_order_count?: number;
           emergency_completed?: boolean;
           emergency_decision_information_set?: (components['schemas']["EmergencyDecisionInformationSet"]) | (null);
           emergency_dispatch_location?: (components['schemas']["Point"]) | (null);
           emergency_dispatch_time?: (number) | (null);
+          emergency_disposition_changed_count?: number;
           emergency_event?: boolean;
           emergency_finish_time?: (number) | (null);
           emergency_incremental_late_minutes?: number;
           emergency_incremental_overtime_minutes?: number;
           emergency_incremental_unserved_orders?: number;
+          emergency_late_minutes?: (number) | (null);
+          emergency_lateness_increased_count?: number;
+          emergency_newly_late_count?: number;
+          emergency_newly_unserved_count?: number;
           emergency_on_time?: boolean;
           emergency_route_terminal_time?: (number) | (null);
           emergency_technician_id?: (string) | (null);
           published_commitment_sla_rate?: number;
+          published_work_total_late_minutes?: number;
           sla_on_time_rate: number;
           total_overtime_minutes: number;
           total_unserved_orders: number;
           trial: number;
+          work_order_outcomes?: Array<components['schemas']["SimulatedWorkOrderOutcome"]>;
         };
     RiskTrialOutcomeArtifact: {
           analysis_run_id: string;
@@ -870,6 +932,7 @@ export interface components {
           artifact_type?: "RISK_TRIAL_OUTCOMES";
           attestation_requirement?: components['schemas']["AttestationRequirement"];
           created_at: string;
+          detail_policy?: components['schemas']["RiskArtifactDetailPolicy"];
           effective_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           id: string;
           integrity_status?: components['schemas']["AnalysisIntegrityStatus"];
@@ -913,6 +976,15 @@ export interface components {
           fixture_id?: string;
           name?: (string) | (null);
         };
+    ScenarioOperationalView: {
+          active_plan_version_id?: (string) | (null);
+          current_metrics: components['schemas']["OperationalMetrics"];
+          plan_applicability?: (components['schemas']["PlanApplicability"]) | (null);
+          scenario_id: string;
+          scenario_revision: number;
+          scenario_snapshot_hash: string;
+          work_orders: Array<components['schemas']["OperationalWorkOrderView"]>;
+        };
     ScheduleArtifact: {
           id: string;
           role: "baseline" | "selected" | "candidate";
@@ -945,6 +1017,8 @@ export interface components {
           planning_context?: (components['schemas']["PlanningContext"]) | (null);
           planning_context_hash?: (string) | (null);
           publishable: boolean;
+          reservation_hash?: (string) | (null);
+          reservation_id?: (string) | (null);
           run_id: string;
           scenario_id: string;
           scenario_revision: number;
@@ -1031,6 +1105,8 @@ export interface components {
           planning_context?: (components['schemas']["PlanningContext"]) | (null);
           planning_context_hash?: (string) | (null);
           requested_time_limit_ms: number;
+          reservation_hash?: (string) | (null);
+          reservation_id?: (string) | (null);
           scenario_id: string;
           scenario_revision: number;
           scenario_snapshot_hash: string;
@@ -1068,6 +1144,12 @@ export interface components {
           valid: boolean;
           warnings?: Array<components['schemas']["VerificationIssue"]>;
         };
+    SimulatedWorkOrderOutcome: {
+          disposition: "ON_TIME" | "LATE" | "NO_SHOW_UNSERVED" | "ABSENCE_UNSERVED" | "PLAN_UNSERVED";
+          late_minutes?: (number) | (null);
+          technician_id?: (string) | (null);
+          work_order_id: string;
+        };
     SimulationEmergencyEvent: {
           duration_minutes: number;
           event_id?: string;
@@ -1087,6 +1169,8 @@ export interface components {
           effective_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           emergency_dispatch_policy?: components['schemas']["EmergencyDispatchPolicy"];
           emergency_events?: Array<components['schemas']["SimulationEmergencyEvent"]>;
+          emergency_location_policy?: components['schemas']["EmergencyLocationPolicy"];
+          emergency_location_work_order_ids?: Array<string>;
           emergency_responder_selection_policy?: components['schemas']["EmergencyResponderSelectionPolicy"];
           exogenous_parameters: {
             [key: string]: number;
@@ -1170,6 +1254,7 @@ export interface components {
           data_revision: number;
           dataset: string;
           error?: (string) | (null);
+          expected_active_plan_version_id?: (string) | (null);
           fingerprint?: string;
           finished_at?: (string) | (null);
           id: string;

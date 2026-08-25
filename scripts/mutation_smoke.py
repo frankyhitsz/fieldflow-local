@@ -65,8 +65,8 @@ MUTATIONS = (
     Mutation(
         "publication-ignores-active-plan-cas",
         "backend/storage.py",
-        "if candidate.expected_active_plan_version_id != current_active_plan_id:",
-        "if False:  # mutation: ignore active Plan CAS",
+        'current_active_plan_id = current_row["active_plan_version_id"]',
+        "current_active_plan_id = candidate.expected_active_plan_version_id  # mutation: ignore actual active Plan",
         "tests/test_correctness_freeze.py",
         "candidate_publication_cas_rejects_newer_active_plan",
     ),

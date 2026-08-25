@@ -100,15 +100,17 @@ def test_emergency_intake_forces_pending_and_marks_all_applicability_axes(monkey
         assert persisted["status"] == "pending"
         active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
         assert active["coverage_status"] == "PARTIAL_NEW_DEMAND"
-        assert active["applicability"] == {
-            "route_executable": True,
-            "coverage_complete": False,
-            "planning_current": False,
-            "metrics_current": False,
-            "commercial_current": True,
-            "reoptimization_opportunity": False,
-            "invalid_assignment_ids": [],
-        }
+        applicability = active["applicability"]
+        assert applicability["route_executable"] is True
+        assert applicability["coverage_complete"] is False
+        assert applicability["planning_current"] is False
+        assert applicability["metrics_current"] is False
+        assert applicability["commercial_current"] is True
+        assert applicability["reoptimization_opportunity"] is False
+        assert applicability["invalid_assignment_ids"] == []
+        assert applicability["evaluated_scenario_revision"] == 1
+        assert applicability["evaluated_scenario_snapshot_hash"]
+        assert applicability["projection_hash"]
 
 
 def test_applicability_accumulates_invalid_assignments_and_recomputes_coverage(monkeypatch, tmp_path):
@@ -405,6 +407,49 @@ def test_execution_command_replay_reloads_event_and_rejects_missing_resource(mon
         assert missing.json()["detail"]["code"] == "EXECUTION_REPLAY_EVENT_MISSING"
 
 
+def test_execution_event_trust_labels_are_recomputed_not_read_from_payload(monkeypatch, tmp_path):
+    database = tmp_path / "execution-trust-projection.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        schedule = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in schedule["assignments"] if item["sequence"] == 1)
+        request = {
+            "technician_id": assignment["technician_id"],
+            "occurred_at": assignment["start_time"],
+            "expected_revision": 0,
+            "idempotency_key": "execution-trust-label-001",
+        }
+        endpoint = f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/start"
+        started = client.post(endpoint, json=request)
+        assert started.status_code == 200, started.text
+        event_id = started.json()["event"]["id"]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            row = connection.execute(
+                "SELECT payload FROM work_order_execution_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            payload = json.loads(row[0])
+            payload["self_integrity"] = "FAILED"
+            payload["source_plan_integrity"] = "FAILED"
+            payload["effective_integrity"] = "FAILED"
+            connection.execute(
+                "UPDATE work_order_execution_events SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), event_id),
+            )
+        listed = client.get("/api/scenarios/main/execution-events")
+        assert listed.status_code == 200, listed.text
+        event = listed.json()[0]
+        assert event["self_integrity"] == "VERIFIED"
+        assert event["source_plan_integrity"] == "VERIFIED"
+        assert event["effective_integrity"] == "VERIFIED"
+        replay = client.post(endpoint, json=request)
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["event"] == event
+
+
 def test_execution_command_replay_survives_application_restart(monkeypatch, tmp_path):
     database = tmp_path / "execution-replay-restart.db"
     monkeypatch.setenv("FIELDFLOW_DB", str(database))
@@ -451,10 +496,46 @@ def test_candidate_publication_cas_rejects_newer_active_plan(monkeypatch, tmp_pa
                 candidate_id=stale_candidate.id,
                 expected_revision=scenario.revision,
             )
-        assert caught.value.code == "ACTIVE_PLAN_VERSION_CONFLICT"
+        assert caught.value.code == "ACTIVE_PLAN_CHANGED_DURING_COMMAND"
         plans = store.list_plan_versions("main")
         assert [item.number for item in plans] == [1, 2]
         assert plans[-1].active
+
+
+def test_reattest_uses_request_active_plan_precondition(monkeypatch, tmp_path):
+    database = tmp_path / "reattest-active-precondition.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        legacy = client.get("/api/scenarios/main/plan-versions").json()[0]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP TRIGGER prevent_plan_attestation_change")
+            connection.execute(
+                "UPDATE plan_versions SET attestation_requirement='LEGACY_MIGRATED' WHERE id=?",
+                (legacy["id"],),
+            )
+
+        conflict = client.post(
+            f"/api/scenarios/main/plan-versions/{legacy['id']}/reattest",
+            json={
+                "expected_revision": 0,
+                "expected_active_plan_version_id": "PV-stale-client-view",
+                "idempotency_key": "reattest-active-precondition-001",
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"] == {
+            "code": "ACTIVE_PLAN_CHANGED_DURING_COMMAND",
+            "message": "命令开始前活动方案已变化，请刷新后重试",
+            "retryable": True,
+            "refresh_required": True,
+            "expected_active_plan_id": "PV-stale-client-view",
+            "current_active_plan_id": legacy["id"],
+        }
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
 
 
 def test_revision_proof_tampering_blocks_reset_and_is_found_at_startup(monkeypatch, tmp_path):
@@ -482,6 +563,109 @@ def test_revision_proof_tampering_blocks_reset_and_is_found_at_startup(monkeypat
         item["source_table"] == "scenario_revisions" and item["source_id"] == row[0]
         for item in restarted.list_integrity_issues()
     )
+
+
+def test_current_scenario_payload_tampering_blocks_reads_solving_and_laundering(monkeypatch, tmp_path):
+    database = tmp_path / "scenario-head-tamper.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        with closing(sqlite3.connect(database)) as connection, connection:
+            row = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()
+            payload = json.loads(row[0])
+            payload["work_orders"][0]["service_duration"] += 17
+            connection.execute(
+                "UPDATE scenarios SET payload=? WHERE id='main'",
+                (json.dumps(payload, ensure_ascii=False),),
+            )
+        for method, path, body in (
+            ("get", "/api/scenarios/main", None),
+            ("post", "/api/scenarios/main/baseline", None),
+            ("put", "/api/scenarios/main/work-orders/WO-1021", {"note": "不能洗入历史"}),
+        ):
+            response = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["code"] == "SCENARIO_HEAD_INTEGRITY_FAILED"
+        with closing(sqlite3.connect(database)) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM scenario_revisions WHERE scenario_id='main'").fetchone()[0]
+                == 1
+            )
+
+
+def test_invalid_revision_descendant_never_becomes_verified(tmp_path):
+    database = tmp_path / "revision-continuity.db"
+    store = Store(database)
+    scenario = store.get_scenario("main")
+    assert scenario is not None
+    for index in range(2):
+        scenario.description = f"revision {index + 1}"
+        scenario.revision += 1
+        store.save_scenario(scenario, f"revision {index + 1}", expected_revision=index)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        row = connection.execute(
+            "SELECT id, payload FROM scenario_revisions WHERE scenario_id='main' AND number=1"
+        ).fetchone()
+        payload = json.loads(row[1])
+        payload["scenario"]["description"] = "tampered ancestor"
+        connection.execute(
+            "UPDATE scenario_revisions SET payload=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), row[0]),
+        )
+    Store(database)
+    with closing(sqlite3.connect(database)) as connection:
+        statuses = connection.execute(
+            "SELECT number, chain_status FROM scenario_revisions WHERE scenario_id='main' ORDER BY number"
+        ).fetchall()
+    assert statuses == [(0, "VERIFIED"), (1, "ANCESTOR_INVALID"), (2, "ANCESTOR_INVALID")]
+
+
+def test_revision_numbers_must_start_at_d0_and_remain_contiguous(tmp_path):
+    database = tmp_path / "revision-gap.db"
+    store = Store(database)
+    scenario = store.get_scenario("main")
+    assert scenario is not None
+    scenario.description = "D001"
+    scenario.revision = 1
+    store.save_scenario(scenario, "create D001", expected_revision=0)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        row = connection.execute(
+            "SELECT id, payload FROM scenario_revisions WHERE scenario_id='main' AND number=1"
+        ).fetchone()
+        payload = json.loads(row[1])
+        payload["number"] = 2
+        payload["scenario"]["revision"] = 2
+        connection.execute(
+            "UPDATE scenario_revisions SET number=2, payload=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), row[0]),
+        )
+    Store(database)
+    with closing(sqlite3.connect(database)) as connection:
+        statuses = connection.execute(
+            "SELECT number, chain_status FROM scenario_revisions WHERE scenario_id='main' ORDER BY number"
+        ).fetchall()
+    assert statuses == [(0, "VERIFIED"), (2, "GAP_DETECTED")]
+
+    root_database = tmp_path / "revision-root.db"
+    Store(root_database)
+    with closing(sqlite3.connect(root_database)) as connection, connection:
+        row = connection.execute(
+            "SELECT id, payload FROM scenario_revisions WHERE scenario_id='main' AND number=0"
+        ).fetchone()
+        payload = json.loads(row[1])
+        payload["number"] = 5
+        payload["scenario"]["revision"] = 5
+        connection.execute(
+            "UPDATE scenario_revisions SET number=5, payload=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), row[0]),
+        )
+    Store(root_database)
+    with closing(sqlite3.connect(root_database)) as connection:
+        assert connection.execute(
+            "SELECT number, chain_status FROM scenario_revisions WHERE scenario_id='main'"
+        ).fetchone() == (5, "ROOT_INVALID")
 
 
 def test_schedule_comparison_includes_route_timing_lock_and_source_identity(monkeypatch, tmp_path):

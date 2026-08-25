@@ -383,7 +383,7 @@ def test_malformed_scenario_detail_returns_structured_error_and_keeps_quarantine
             connection.execute("UPDATE scenarios SET payload='{' WHERE id='main'")
         detail = client.get("/api/scenarios/main")
         assert detail.status_code == 409
-        assert detail.json()["detail"]["code"] == "RECORD_INTEGRITY_FAILED"
+        assert detail.json()["detail"]["code"] == "SCENARIO_HEAD_INTEGRITY_FAILED"
         assert detail.json()["detail"]["record_type"] == "SCENARIO"
         listed = client.get("/api/scenarios")
         assert listed.status_code == 200
@@ -562,6 +562,59 @@ def test_stale_assignment_cannot_start_after_skill_change(monkeypatch, tmp_path)
         )
         assert response.status_code == 409
         assert response.json()["detail"]["code"] == "INVALID_ASSIGNMENT_CANNOT_START"
+
+
+def test_operational_view_separates_invalid_new_and_completed_work(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "operational-dispositions.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        _, started_assignment, pending = _prepare_stale_assignment_case(client)
+        scenario = client.get("/api/scenarios/main").json()
+        technician = next(item for item in scenario["technicians"] if item["id"] == pending["technician_id"])
+        missing_skill = next(item for item in ["electrical", "hvac", "network"] if item not in technician["skills"])
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{pending['work_order_id']}",
+            json={"required_skills": [missing_skill]},
+        )
+        assert edited.status_code == 200, edited.text
+        new_order = {
+            **edited.json()["work_orders"][0],
+            "id": "WO-NEW-OPERATIONAL",
+            "customer_name": "新增客户",
+            "title": "新增需求",
+            "status": "pending",
+        }
+        created = client.post(
+            "/api/v2/scenarios/main/work-orders",
+            headers={"If-Match": f"D{edited.json()['revision']}"},
+            json={key: value for key, value in new_order.items() if key != "status"},
+        )
+        assert created.status_code == 200, created.text
+        completed = client.post(
+            f"/api/scenarios/main/work-orders/{started_assignment['work_order_id']}/complete",
+            json={
+                "technician_id": started_assignment["technician_id"],
+                "occurred_at": started_assignment["finish_time"],
+                "expected_revision": created.json()["revision"],
+                "idempotency_key": "operational-complete-001",
+            },
+        )
+        assert completed.status_code == 200, completed.text
+        view_response = client.get("/api/scenarios/main/operational-view")
+        assert view_response.status_code == 200, view_response.text
+        view = view_response.json()
+        dispositions = {item["work_order_id"]: item for item in view["work_orders"]}
+        assert len(dispositions) == len(view["work_orders"]) == len(completed.json()["scenario"]["work_orders"])
+        assert dispositions[started_assignment["work_order_id"]]["disposition"] == "COMPLETED"
+        assert dispositions[pending["work_order_id"]]["disposition"] == "ASSIGNED_INVALID"
+        assert dispositions[pending["work_order_id"]]["start_allowed"] is False
+        assert dispositions["WO-NEW-OPERATIONAL"]["disposition"] == "NEW_UNCOVERED"
+        metrics = view["current_metrics"]
+        assert metrics["invalid_assignment_count"] == 1
+        assert metrics["new_uncovered_count"] == 1
+        assert metrics["valid_assigned_count"] < metrics["active_demand_count"]
 
 
 def test_stale_assignment_cannot_start_after_location_change(monkeypatch, tmp_path):
@@ -1148,7 +1201,7 @@ def test_manual_reassignment_reports_durable_lock_when_replan_fails(monkeypatch,
         assert body["replan_status"] == "FAILED"
         assert body["active_plan_preserved"] is True
         assert body["schedule"] is None
-        assert body["error"]["error_type"] == "RuntimeError"
+        assert body["error"]["code"] == "REPLAN_FAILED_AFTER_LOCK"
         assert {tuple(item.values()) for item in body["scenario"]["locked_assignments"]} >= {
             (order["id"], target["id"])
         }
@@ -1258,6 +1311,46 @@ def test_concurrent_manual_reassignment_uses_one_lock_run_and_plan(monkeypatch, 
             len([item for item in client.get("/api/scenarios/main/schedule-runs").json() if item["action"] == "replan"])
             == 1
         )
+        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
+
+
+def test_manual_reassignment_cannot_publish_from_stale_active_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "manual-stale-source.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    original_start = main_module.start_schedule_run
+    manual_at_reservation = threading.Event()
+    release_manual = threading.Event()
+
+    def controlled_start(*args, **kwargs):
+        if (
+            args[1] == "replan"
+            and str(kwargs.get("run_id", "")).startswith("RUN-MR-")
+            and not manual_at_reservation.is_set()
+        ):
+            manual_at_reservation.set()
+            assert release_manual.wait(timeout=10)
+        return original_start(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "start_schedule_run", controlled_start)
+    with TestClient(main_module.app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        payload = _manual_reassignment_payload(client, "manual-stale-source-001")
+        baseline_plan = client.get("/api/scenarios/main/plan-versions").json()[0]
+        payload["expected_active_plan_version_id"] = baseline_plan["id"]
+        manual = executor.submit(lambda: client.post("/api/scenarios/main/manual-reassignment", json=payload))
+        assert manual_at_reservation.wait(timeout=10)
+        newer = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": payload["planning_time"], "time_limit_seconds": 1},
+        )
+        assert newer.status_code == 200, newer.text
+        release_manual.set()
+        stale = manual.result(timeout=10)
+        assert stale.status_code == 200, stale.text
+        assert stale.json()["replan_status"] == "FAILED"
+        assert stale.json()["lock_persisted"] is True
+        assert stale.json()["error"]["code"] == "REPLAN_FAILED_AFTER_LOCK"
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
 
 
@@ -1442,7 +1535,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -1479,6 +1572,68 @@ def test_concurrent_idempotent_optimize_runs_solver_only_once(monkeypatch, tmp_p
         replay = main_module.run_optimize("main", request, idempotency_key)
         assert replay.id == first.id
     assert calls == 1
+
+
+def test_slow_replan_cannot_overwrite_newer_replan_and_does_not_consume_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "atomic-replan-reservation.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    original = main_module.replan_schedule
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    counter_lock = threading.Lock()
+    calls = 0
+
+    def controlled_solver(*args, **kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "replan_schedule", controlled_solver)
+    with TestClient(main_module.app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        first = executor.submit(
+            lambda: client.post(
+                "/api/scenarios/main/replan",
+                json={"planning_time": 600, "time_limit_seconds": 1},
+            )
+        )
+        assert first_entered.wait(timeout=10)
+        second = client.post(
+            "/api/scenarios/main/replan",
+            json={"planning_time": 601, "time_limit_seconds": 1},
+        )
+        assert second.status_code == 200, second.text
+        release_first.set()
+        stale = first.result(timeout=10)
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["detail"]["code"] == "ACTIVE_PLAN_CHANGED_DURING_COMMAND"
+
+        plans = client.get("/api/scenarios/main/plan-versions").json()
+        assert [item["number"] for item in plans] == [1, 2]
+        runs = [item for item in client.get("/api/scenarios/main/schedule-runs").json() if item["action"] == "replan"]
+        assert len(runs) == 2
+        assert all(
+            item["source_plan_version_id"] == item["expected_active_plan_version_id"] == plans[0]["id"] for item in runs
+        )
+        for run in runs:
+            reservation = main_module.require_store().get_planning_reservation(run["reservation_id"])
+            assert reservation is not None
+            assert reservation.source_plan_version_id == reservation.active_plan_version_id == plans[0]["id"]
+
+        next_plan = client.post(
+            "/api/scenarios/main/optimize",
+            json={"strategy": "balanced", "time_limit_seconds": 1},
+        )
+        assert next_plan.status_code == 200, next_plan.text
+        assert next_plan.json()["version"] == 3
+        assert baseline["version"] == 1
 
 
 def test_replan_idempotency_key_cannot_replay_an_old_aggregate(monkeypatch, tmp_path):
@@ -2542,7 +2697,16 @@ def test_new_demand_preserves_existing_routes_as_partial_coverage(monkeypatch, t
         active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
         assert active["selected"]["id"] == baseline["id"]
         assert active["coverage_status"] == "PARTIAL_NEW_DEMAND"
-        assert active["applicability"] == {
+        applicability = active["applicability"]
+        assert {
+            "route_executable": applicability["route_executable"],
+            "coverage_complete": applicability["coverage_complete"],
+            "planning_current": applicability["planning_current"],
+            "metrics_current": applicability["metrics_current"],
+            "commercial_current": applicability["commercial_current"],
+            "reoptimization_opportunity": applicability["reoptimization_opportunity"],
+            "invalid_assignment_ids": applicability["invalid_assignment_ids"],
+        } == {
             "route_executable": True,
             "coverage_complete": False,
             "planning_current": False,
@@ -2551,6 +2715,10 @@ def test_new_demand_preserves_existing_routes_as_partial_coverage(monkeypatch, t
             "reoptimization_opportunity": False,
             "invalid_assignment_ids": [],
         }
+        assert applicability["evaluated_scenario_revision"] == 1
+        assert applicability["evaluated_scenario_snapshot_hash"]
+        assert applicability["projection_hash"]
+        assert applicability["reducer_policy_version"] == "FIELD_SERVICE_PLAN_APPLICABILITY_V2"
 
 
 def test_crud_if_match_rejects_stale_dispatcher_revision(monkeypatch, tmp_path):

@@ -1,10 +1,39 @@
 # FieldFlow Local 任务记录
 
-更新时间：2026-08-25
+更新时间：2026-08-26
 
 ## 本轮目标
 
-按 2026-08-25 19:49 更新的 `pro-plan.md` 完成 v0.5.9 Trust Closure。发布门禁是执行事实只能经过可信读取路径、求解结果同时绑定 D 与活动 V、紧急投影与实际时间线一致、当前未覆盖需求不能被冻结 KPI 隐藏，并让数据修订历史成为可校验的恢复源。
+按更新后的 `pro-plan.md` 完成 v0.5.10 Command Trust Closure。发布门禁是规划来源与活动 V 原子预留、当前 Scenario 锚定修订链头、适用性投影绑定当前 D、主界面使用统一 disposition、发布错误保持结构化，以及 Risk V6 的空间和迟到口径可追溯。
+
+## v0.5.10 实施记录
+
+### 第一轮：命令与场景信任闭包
+
+- [x] 新增 PlanningReservation；在同一个写事务中冻结并验证 Scenario、活动/来源 Plan、执行水位和上下文，同时建立 ScheduleRun。Run、Candidate 和发布事务都绑定 reservation ID/hash。
+- [x] optimize、replan、activate、restore、reattest、人工改派和实验发布增加活动 V 前置条件；慢重排、并发重排和人工改派竞态使用 `Event` 精确控制，陈旧结果不发布也不占 V。
+- [x] Schema v23 增加 Scenario 链头和当前快照证明；当前 payload、关系 ID、D 编号、快照 hash 与最新 revision 不一致时，GET、编辑、求解和发布全部失败关闭。
+- [x] revision 强制 D000 和连续编号；原生写入改为 O(1) 链头验证，启动扫描标记 root/gap/invalid descendant；迁移回填与原生证明分开。
+
+### 第二轮：运营投影、重放与风险 V6
+
+- [x] 新增 Operational View，六类 disposition 统一驱动当前覆盖 KPI、工单队列、风险排序、地图、时间轴、详情和开工门禁。
+- [x] PlanApplicability 绑定 evaluated D、Scenario hash、reducer policy 和 projection hash；执行 start/complete 后同步重绑当前投影。
+- [x] 发布冲突统一为结构化 ErrorDetail；AST 检查禁止相关 handler 返回 plain string，前端 ApiError 保留 code 和冲突诊断。
+- [x] 执行事件 trust label 由可信加载器覆盖；人工改派终态从当前 Scenario 和已验证 Plan 重建，不信命令缓存中的完整结果。
+- [x] Risk V6 增加显式紧急位置政策、published/all-demand/emergency 迟到指标、逐工单 outcome 和四类影响计数；零事件保持 null。默认只保存摘要，完整 trial 明细限制为 1000。
+
+### 第三轮：依赖、契约与缺陷审计
+
+- [x] runtime/dev 依赖锁分开；决策运行时 V2 只绑定 runtime lock 并记录实际生产 distribution inventory。明确支持 Linux/macOS，uvloop 使用平台 marker，CI 增加 macOS Python 3.12 后端任务。
+- [x] 决策源码指纹从整个 `models.py` 收窄为 AST 可达模型闭包；OpenAPI 和生成 TypeScript 同步，ManualReassignment/Operational 契约直接派生自生成 schema。
+- [x] 定向回归发现并修复：突发入库推进 D 后再加载旧适用性造成自冲突、v20 坏 JSON 在清洗前计算 v23 proof、人工改派失败终态重放遗漏 lock revision。
+- [x] 第三轮错误契约扫描继续发现 16 个直接返回字符串或缺少 code 的 409；全部改为稳定 code/message，并新增 AST 门禁覆盖所有字面量 409。
+- [x] 本地静态检查、271 项后端测试（覆盖率 88.45%）、8/8 mutation smoke、15 项 React 测试、生产构建、Demo、Benchmark 和 runtime/dev/npm 依赖审计通过；Playwright API 生命周期通过。两套本机 Chromium 均在页面启动阶段被 macOS 以 SIGTRAP/SIGABRT 终止，未出现页面断言失败。
+- [ ] 推送后由 GitHub Linux Chromium 完成 5 项页面/API E2E，并由 Python 3.11、Python 3.12 和 macOS Python 3.12 任务复核全部门禁。
+- [ ] 提交并推送 main，确认 GitHub Actions 全部通过。
+
+逐项裁决见 `docs/pro-plan-v0.5.10-assessment.md`。
 
 ## v0.5.9 实施记录
 

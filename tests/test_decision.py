@@ -33,10 +33,12 @@ from backend.models import (
     DecisionAnalysisScope,
     DecisionCostPolicy,
     EmergencyDispatchPolicy,
+    EmergencyLocationPolicy,
     LaborCostMode,
     PlanVersion,
     Point,
     PublicationVerificationArtifact,
+    RiskArtifactDetailPolicy,
     RiskExecutionPolicy,
     RiskSimulationRequest,
     Skill,
@@ -48,6 +50,7 @@ from backend.models import (
     WorkOrderStatus,
 )
 from backend.provenance import (
+    _decision_model_source_closure,
     build_plan_manifest_payload,
     decision_build_sha,
     decision_runtime_manifest,
@@ -450,6 +453,26 @@ def test_release_sha_does_not_change_decision_runtime_identity(monkeypatch):
     release_manifest.cache_clear()
 
 
+def test_runtime_manifest_includes_only_locked_runtime_distributions():
+    manifest = decision_runtime_manifest()
+    assert manifest.policy_version == "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V2"
+    assert manifest.runtime_distributions["fastapi"] != "not-installed"
+    assert manifest.runtime_distributions["ortools"] == manifest.ortools_version
+    assert "pytest" not in manifest.runtime_distributions
+    assert "ruff" not in manifest.runtime_distributions
+
+
+def test_decision_model_fingerprint_uses_reachable_model_closure():
+    from pathlib import Path
+
+    definitions = {
+        item["path"] for item in _decision_model_source_closure(Path(__file__).resolve().parents[1] / "backend")
+    }
+    assert "models.py#RiskSimulationResult" in definitions
+    assert "models.py#PlanVersion" in definitions
+    assert "models.py#PlanVersionPatch" not in definitions
+
+
 def test_analysis_scope_is_part_of_canonical_input_hash():
     plan = _plan()
     provider = EuclideanTravelTimeProvider()
@@ -622,6 +645,12 @@ def test_risk_simulation_is_seeded_and_percentiles_are_monotonic():
     assert first.scope_total_late_minutes_p50 == first.late_minutes_p50
     assert first.scope_total_late_minutes_p90 == first.late_minutes_p90
     assert first.scope_total_late_minutes_p95 == first.late_minutes_p95
+    assert first.all_demand_total_late_minutes_p95 == first.late_minutes_p95
+    assert (
+        first.published_work_total_late_minutes_p50
+        <= first.published_work_total_late_minutes_p90
+        <= first.published_work_total_late_minutes_p95
+    )
     assert first.emergency_dispatch_policy is EmergencyDispatchPolicy.between_visits_only
     assert first.monte_carlo_mean_ci_low == first.sla_rate_ci_low
     assert first.monte_carlo_mean_ci_high == first.sla_rate_ci_high
@@ -726,6 +755,65 @@ def test_emergency_demand_is_generated_before_plan_selects_a_responder():
     changed = json.loads(json.dumps(manifest))
     changed["emergency_events"][0]["duration_minutes"] += 1
     assert content_hash(manifest) != content_hash(changed)
+
+
+def test_emergency_location_policy_is_explicit_and_active_scope_filters_locations():
+    plan = _plan()
+    assert plan.scenario_snapshot is not None
+    target = plan.scenario_snapshot.work_orders[0]
+    request = RiskSimulationRequest(
+        seed=29,
+        trials=50,
+        emergency_order_basis_points=10_000,
+        emergency_location_policy=EmergencyLocationPolicy.active_demand_locations,
+    )
+    manifest = build_simulation_scenario_set(
+        plan.scenario_snapshot,
+        request,
+        29,
+        active_work_order_ids=[target.id],
+    )
+    assert manifest["emergency_location_policy"] == "ACTIVE_DEMAND_LOCATIONS"
+    assert manifest["emergency_location_work_order_ids"] == [target.id]
+    assert {(event["location"]["x"], event["location"]["y"]) for event in manifest["emergency_events"]} == {
+        (target.location.x, target.location.y)
+    }
+
+
+def test_risk_v6_separates_published_and_emergency_late_minutes_and_outcomes():
+    plan = _plan()
+    expected_work_order_count = len(plan.selected.assignments) + len(plan.selected.unassigned)
+    result = simulate_plan_risk(
+        plan,
+        RiskSimulationRequest(
+            seed=43,
+            trials=50,
+            emergency_order_basis_points=10_000,
+            artifact_detail_policy=RiskArtifactDetailPolicy.full_trial_detail,
+        ),
+    )
+    assert result.simulation_policy_version == "FIELD_SERVICE_SIMULATION_V6"
+    assert result.emergency_metric_sample_count == 50
+    assert result.emergency_completed_sample_count == sum(metric.emergency_completed for metric in result.trial_metrics)
+    for metric in result.trial_metrics:
+        assert metric.all_demand_total_late_minutes == (
+            metric.published_work_total_late_minutes + (metric.emergency_late_minutes or 0)
+        )
+        assert len(metric.work_order_outcomes) == expected_work_order_count
+        assert metric.emergency_affected_work_order_count >= metric.emergency_lateness_increased_count
+        assert metric.emergency_affected_work_order_count >= metric.emergency_newly_unserved_count
+    if result.emergency_completed_sample_count:
+        assert result.emergency_late_minutes_mean is not None
+        assert result.emergency_late_minutes_p50 is not None
+        assert result.emergency_late_minutes_p90 is not None
+
+
+def test_full_risk_trial_detail_has_bounded_volume():
+    with pytest.raises(ValueError, match="最多支持 1000"):
+        RiskSimulationRequest(
+            trials=1_001,
+            artifact_detail_policy=RiskArtifactDetailPolicy.full_trial_detail,
+        )
 
 
 def test_legacy_replan_without_publication_context_rejects_route_sensitive_analysis():
@@ -907,6 +995,9 @@ def test_no_emergency_event_returns_not_applicable_conditional_metrics():
     assert result.emergency_on_time_rate is None
     assert result.emergency_unserved_probability is None
     assert result.emergency_failure_given_event_probability is None
+    assert result.emergency_metric_sample_count == 0
+    assert result.emergency_completed_sample_count == 0
+    assert result.emergency_late_minutes_mean is None
     assert result.monte_carlo_interval_method == "PERCENTILE_BOOTSTRAP_V1"
     assert all(not metric.emergency_event for metric in result.trial_metrics)
 
@@ -2759,6 +2850,18 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
             "UPDATE scenarios SET payload=? WHERE id='main'",
             (json.dumps(payload, ensure_ascii=False),),
         )
+        revision_payload = json.loads(
+            connection.execute(
+                "SELECT payload FROM scenario_revisions WHERE scenario_id='main' AND number=0"
+            ).fetchone()[0]
+        )
+        revision_technician = revision_payload["scenario"]["technicians"][0]
+        revision_technician.pop("cost_per_minute_cents")
+        revision_technician["cost_per_minute"] = 1.25
+        connection.execute(
+            "UPDATE scenario_revisions SET payload=? WHERE scenario_id='main' AND number=0",
+            (json.dumps(revision_payload, ensure_ascii=False),),
+        )
         connection.execute("PRAGMA user_version=9")
 
     migrated = Store(database).get_scenario("main")
@@ -2768,7 +2871,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -2822,7 +2925,7 @@ def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
 
 
 def test_v14_retry_schema_migration_preserves_analysis_artifacts(monkeypatch, tmp_path):

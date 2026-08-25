@@ -69,6 +69,8 @@ nav { display: grid; gap: 5px; }
 .solver-badge.no-solution, .solver-badge.invalid-model, .solver-badge.failed, .solver-badge.cancelled { color: var(--cinnabar); border-color: #d5a99e; }
 .solver-badge.infeasible > span, .solver-badge.time-limit > span, .solver-badge.time-limit-no-solution > span,
 .solver-badge.no-solution > span, .solver-badge.invalid-model > span, .solver-badge.failed > span, .solver-badge.cancelled > span { background: var(--cinnabar); }
+.run-block.invalid { background: repeating-linear-gradient(135deg, #b6533f 0 5px, #f2d8d0 5px 10px) !important; border: 1px solid #8f3f30; color: #411f18; }
+.order-card.invalid { border-left: 3px solid var(--cinnabar); }
 .ghost-btn, .command-actions button { border: 1px solid var(--line); background: rgba(255,255,252,.72); border-radius: 3px; padding: 8px 12px; display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12px; white-space: nowrap; }
 .ghost-btn:hover, .command-actions button:hover { border-color: #929f97; background: var(--white); }
 

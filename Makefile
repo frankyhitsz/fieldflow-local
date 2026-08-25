@@ -7,7 +7,7 @@ PORT ?= 8000
 
 setup:
 	python3 -m venv .venv
-	.venv/bin/pip install -r requirements.lock
+	.venv/bin/pip install -r requirements-dev.lock
 	.venv/bin/pip install -e . --no-deps
 	cd frontend && npm ci --cache $(NPM_CACHE)
 
@@ -25,7 +25,8 @@ mutation-smoke:
 	$(PYTHON) scripts/mutation_smoke.py
 
 audit:
-	.venv/bin/pip-audit --cache-dir /tmp/fieldflow-pip-audit -r requirements.lock
+	.venv/bin/pip-audit --cache-dir /tmp/fieldflow-pip-audit -r requirements-runtime.lock
+	.venv/bin/pip-audit --cache-dir /tmp/fieldflow-pip-audit -r requirements-dev.lock
 	cd frontend && npm audit --cache $(NPM_CACHE) --omit=dev --audit-level=high
 
 test-frontend:
