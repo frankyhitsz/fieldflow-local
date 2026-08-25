@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import os
+import random
 import re
 import statistics
 import threading
@@ -61,8 +61,6 @@ from .models import (
     ManualReassignmentResult,
     OptimizeRequest,
     PairedMetricSummary,
-    PlanApplicability,
-    PlanCoverageStatus,
     PlanningContext,
     PlanUseCase,
     PlanVersion,
@@ -95,6 +93,7 @@ from .models import (
     Technician,
     TechnicianUpdate,
     WorkOrder,
+    WorkOrderCreate,
     WorkOrderExecutionEvent,
     WorkOrderExecutionRequest,
     WorkOrderExecutionResult,
@@ -102,12 +101,13 @@ from .models import (
     WorkOrderUpdate,
 )
 from .normalization import normalize_schedule
-from .planning import scenario_assignment_feasibility_payload
+from .planning import plan_scoped_assignment_feasibility_payload
 from .provenance import (
     DECISION_ALGORITHM_VERSION,
     build_decision_input_manifest,
     decision_build_sha,
     decision_runtime_manifest,
+    release_manifest,
 )
 from .report import build_report
 from .scheduler import (
@@ -118,7 +118,13 @@ from .scheduler import (
     replan_schedule,
     scenario_for_profile,
 )
-from .storage import DecisionAnalysisIntegrityError, PublicationConflict, ScenarioRevisionConflict, Store
+from .storage import (
+    ActivePlanConflict,
+    DecisionAnalysisIntegrityError,
+    PublicationConflict,
+    ScenarioRevisionConflict,
+    Store,
+)
 from .verification import verify_schedule
 
 DB_PATH = Path(os.getenv("FIELDFLOW_DB", Path(__file__).resolve().parents[1] / "fieldflow.db"))
@@ -227,6 +233,7 @@ def save_scenario_change(
     active_plan = require_store().active_plan_version(scenario.id)
     preserve_active_plan = (
         preserve_active_plan
+        or active_plan is not None
         or impact
         in {
             FieldImpact.metadata_only,
@@ -239,36 +246,6 @@ def save_scenario_change(
         }
         or any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders)
     )
-    applicability = active_plan.applicability.model_copy(deep=True) if active_plan else PlanApplicability()
-    coverage_status = active_plan.coverage_status if active_plan else PlanCoverageStatus.current_and_complete
-    if impact is FieldImpact.commercial_only:
-        applicability.commercial_current = False
-        applicability.metrics_current = False
-        coverage_status = PlanCoverageStatus.stale_data_changed
-    elif impact in {FieldImpact.planning_objective, FieldImpact.planning_constraint}:
-        applicability.planning_current = False
-        applicability.metrics_current = False
-        coverage_status = PlanCoverageStatus.stale_data_changed
-    elif impact is FieldImpact.new_demand:
-        applicability.coverage_complete = False
-        applicability.planning_current = False
-        applicability.metrics_current = False
-        coverage_status = PlanCoverageStatus.partial_new_demand
-    elif impact is FieldImpact.capacity_added:
-        applicability.planning_current = False
-        applicability.metrics_current = False
-        applicability.reoptimization_opportunity = True
-    elif impact is FieldImpact.removed_unassigned_demand:
-        applicability.coverage_complete = True
-        applicability.planning_current = False
-        applicability.metrics_current = False
-        coverage_status = PlanCoverageStatus.current_and_complete
-    elif impact in {FieldImpact.assignment_feasibility, FieldImpact.execution}:
-        applicability.route_executable = False
-        applicability.planning_current = False
-        applicability.metrics_current = False
-        applicability.invalid_assignment_ids = sorted(set(invalid_assignment_ids or []))
-        coverage_status = PlanCoverageStatus.stale_data_changed
     try:
         require_store().save_scenario(
             scenario,
@@ -276,8 +253,10 @@ def save_scenario_change(
             expected_revision=expected_revision,
             preserve_active_plan=preserve_active_plan,
             mark_plan_stale=impact is not FieldImpact.metadata_only,
-            plan_coverage_status=coverage_status,
-            plan_applicability=applicability if impact is not FieldImpact.metadata_only else None,
+            change_impact=impact,
+            invalid_assignment_ids=invalid_assignment_ids,
+            expected_active_plan_id=active_plan.id if active_plan else None,
+            check_active_plan=True,
         )
     except ScenarioRevisionConflict as error:
         raise HTTPException(
@@ -286,6 +265,16 @@ def save_scenario_change(
                 "message": "业务数据已被其他操作更新，请刷新后重试",
                 "expected_revision": error.expected,
                 "current_revision": error.current,
+            },
+        ) from error
+    except ActivePlanConflict as error:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "ACTIVE_PLAN_CHANGED",
+                "message": "活动方案已变化，本次数据修改未应用，请刷新后重试",
+                "expected_active_plan_id": error.expected,
+                "current_active_plan_id": error.current,
             },
         ) from error
     return scenario
@@ -297,10 +286,23 @@ def normalize_order(order: WorkOrder) -> WorkOrder:
     return order
 
 
-def validate_if_match_revision(scenario: ScheduleScenario, if_match: str | None) -> None:
-    """Honor client-side optimistic concurrency while retaining legacy-client compatibility."""
+def validate_if_match_revision(
+    scenario: ScheduleScenario,
+    if_match: str | None,
+    *,
+    required: bool = False,
+) -> None:
+    """Require an explicit aggregate revision for dispatcher data edits."""
     if if_match is None:
-        return
+        if not required:
+            return
+        raise HTTPException(
+            428,
+            detail={
+                "code": "PRECONDITION_REQUIRED",
+                "message": "此写操作必须携带 If-Match 数据修订号，例如 D003",
+            },
+        )
     token = if_match.strip().removeprefix("W/").strip('"')
     match = re.fullmatch(r"(?:D)?(\d+)", token, flags=re.IGNORECASE)
     if not match:
@@ -878,8 +880,10 @@ def list_integrity_issues() -> list[dict[str, str]]:
 
 
 @router.get("/api/scenarios/{scenario_id}", response_model=ScheduleScenario)
-def get_scenario(scenario_id: str) -> ScheduleScenario:
-    return require_scenario(scenario_id)
+def get_scenario(scenario_id: str, response: Response) -> ScheduleScenario:
+    scenario = require_scenario(scenario_id)
+    response.headers["ETag"] = f'"D{scenario.revision}"'
+    return scenario
 
 
 @router.post("/api/scenarios", response_model=ScheduleScenario)
@@ -901,13 +905,15 @@ def create_scenario(request: ScenarioCreate) -> ScheduleScenario:
     return scenario
 
 
-@router.post("/api/scenarios/{scenario_id}/reset", response_model=ScheduleScenario)
+@router.post("/api/scenarios/{scenario_id}/reset", response_model=ScheduleScenario, deprecated=True)
+@router.post("/api/v2/scenarios/{scenario_id}/reset", response_model=ScheduleScenario)
 def reset_scenario(
     scenario_id: str,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     current = require_scenario(scenario_id)
-    validate_if_match_revision(current, if_match)
+    validate_if_match_revision(current, if_match, required=http_request.url.path.startswith("/api/v2/"))
     execution_events = require_store().list_execution_events(scenario_id)
     if execution_events:
         raise HTTPException(
@@ -950,29 +956,38 @@ def get_work_orders(scenario_id: str = Query("main")):
     return require_scenario(scenario_id).work_orders
 
 
-@router.post("/api/scenarios/{scenario_id}/work-orders", response_model=ScheduleScenario)
+@router.post("/api/scenarios/{scenario_id}/work-orders", response_model=ScheduleScenario, deprecated=True)
+@router.post("/api/v2/scenarios/{scenario_id}/work-orders", response_model=ScheduleScenario)
 def create_work_order(
     scenario_id: str,
-    work_order: WorkOrder,
+    request: WorkOrderCreate,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     scenario = require_scenario(scenario_id)
-    validate_if_match_revision(scenario, if_match)
+    validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
+    work_order = request.to_work_order()
     if any(item.id == work_order.id for item in scenario.work_orders):
         raise HTTPException(409, f"工单 {work_order.id} 已存在")
     scenario.work_orders.append(normalize_order(work_order))
     return save_scenario_change(scenario, f"新增工单 {work_order.id}", impact=FieldImpact.new_demand)
 
 
-@router.put("/api/scenarios/{scenario_id}/work-orders/{work_order_id}", response_model=ScheduleScenario)
+@router.put(
+    "/api/scenarios/{scenario_id}/work-orders/{work_order_id}",
+    response_model=ScheduleScenario,
+    deprecated=True,
+)
+@router.put("/api/v2/scenarios/{scenario_id}/work-orders/{work_order_id}", response_model=ScheduleScenario)
 def update_work_order(
     scenario_id: str,
     work_order_id: str,
     request: WorkOrderUpdate,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     scenario = require_scenario(scenario_id)
-    validate_if_match_revision(scenario, if_match)
+    validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     index = next((i for i, item in enumerate(scenario.work_orders) if item.id == work_order_id), None)
     if index is None:
         raise HTTPException(404, f"工单 {work_order_id} 不存在")
@@ -980,9 +995,6 @@ def update_work_order(
     updates = request.model_dump(exclude_unset=True)
     if updates.get("note") is None and "note" in updates:
         updates["note"] = ""
-    requested_status = updates.get("status")
-    if requested_status is not None and requested_status is not original.status:
-        raise HTTPException(409, "工单状态只能通过开始服务或完成服务操作变更")
     if original.status.value in {"started", "completed"}:
         immutable_fields = {
             "customer_name",
@@ -1000,7 +1012,7 @@ def update_work_order(
             "reported_at",
         }
         if any(key in updates and updates[key] != original.model_dump().get(key) for key in immutable_fields):
-            raise HTTPException(409, "已开始或已完成的工单只能修改备注和状态")
+            raise HTTPException(409, "已开始或已完成的工单只能修改备注")
     payload = original.model_dump()
     payload.update(updates)
     if updates.get("is_emergency") is False:
@@ -1100,14 +1112,20 @@ def list_execution_events(scenario_id: str) -> list[WorkOrderExecutionEvent]:
     return require_store().list_execution_events(scenario_id)
 
 
-@router.delete("/api/scenarios/{scenario_id}/work-orders/{work_order_id}", response_model=ScheduleScenario)
+@router.delete(
+    "/api/scenarios/{scenario_id}/work-orders/{work_order_id}",
+    response_model=ScheduleScenario,
+    deprecated=True,
+)
+@router.delete("/api/v2/scenarios/{scenario_id}/work-orders/{work_order_id}", response_model=ScheduleScenario)
 def delete_work_order(
     scenario_id: str,
     work_order_id: str,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     scenario = require_scenario(scenario_id)
-    validate_if_match_revision(scenario, if_match)
+    validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     order = next((item for item in scenario.work_orders if item.id == work_order_id), None)
     if not order:
         raise HTTPException(404, f"工单 {work_order_id} 不存在")
@@ -1131,29 +1149,37 @@ def delete_work_order(
     )
 
 
-@router.post("/api/scenarios/{scenario_id}/technicians", response_model=ScheduleScenario)
+@router.post("/api/scenarios/{scenario_id}/technicians", response_model=ScheduleScenario, deprecated=True)
+@router.post("/api/v2/scenarios/{scenario_id}/technicians", response_model=ScheduleScenario)
 def create_technician(
     scenario_id: str,
     technician: Technician,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     scenario = require_scenario(scenario_id)
-    validate_if_match_revision(scenario, if_match)
+    validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     if any(item.id == technician.id for item in scenario.technicians):
         raise HTTPException(409, f"技师 {technician.id} 已存在")
     scenario.technicians.append(technician)
     return save_scenario_change(scenario, f"新增技师 {technician.id}", impact=FieldImpact.capacity_added)
 
 
-@router.put("/api/scenarios/{scenario_id}/technicians/{technician_id}", response_model=ScheduleScenario)
+@router.put(
+    "/api/scenarios/{scenario_id}/technicians/{technician_id}",
+    response_model=ScheduleScenario,
+    deprecated=True,
+)
+@router.put("/api/v2/scenarios/{scenario_id}/technicians/{technician_id}", response_model=ScheduleScenario)
 def update_technician(
     scenario_id: str,
     technician_id: str,
     request: TechnicianUpdate,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     scenario = require_scenario(scenario_id)
-    validate_if_match_revision(scenario, if_match)
+    validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     index = next((i for i, item in enumerate(scenario.technicians) if item.id == technician_id), None)
     if index is None:
         raise HTTPException(404, f"技师 {technician_id} 不存在")
@@ -1242,14 +1268,16 @@ def _lock_assignment(
     )
 
 
-@router.post("/api/scenarios/{scenario_id}/lock", response_model=ScheduleScenario)
+@router.post("/api/scenarios/{scenario_id}/lock", response_model=ScheduleScenario, deprecated=True)
+@router.post("/api/v2/scenarios/{scenario_id}/lock", response_model=ScheduleScenario)
 def lock_assignment(
     scenario_id: str,
     request: LockRequest,
+    http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
     scenario = require_scenario(scenario_id)
-    validate_if_match_revision(scenario, if_match)
+    validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     return _lock_assignment(scenario_id, request, expected_revision=scenario.revision)
 
 
@@ -1761,7 +1789,7 @@ def _run_replan(
     on_run_created: Callable[[ScheduleRun], None] | None = None,
 ) -> ScheduleResult:
     scenario = require_scenario(scenario_id)
-    incoming = request.emergency_order
+    incoming = request.emergency_order.to_work_order() if request.emergency_order else None
     idempotency_key = request.idempotency_key or (f"emergency-replan:{scenario_id}:{incoming.id}" if incoming else None)
     request_fingerprint = None
     if idempotency_key:
@@ -2299,7 +2327,7 @@ def execute_decision_analysis_run(
         risk_request = RiskSimulationRequest.model_validate(
             {**risk_parameters.model_dump(mode="json"), "analysis_scope": context.analysis_scope}
         )
-        policy_version = "FIELD_SERVICE_SIMULATION_V4"
+        policy_version = "FIELD_SERVICE_SIMULATION_V5"
         policy_snapshot = risk_request.model_dump(mode="json")
     request_snapshot = request.model_dump(mode="json")
     runtime_manifest = decision_runtime_manifest()
@@ -2338,6 +2366,7 @@ def execute_decision_analysis_run(
             algorithm_version=DECISION_ALGORITHM_VERSION,
             build_sha=decision_build_sha(),
             runtime_manifest=runtime_manifest,
+            release_manifest=release_manifest(),
             input_hash=input_hash,
             input_manifest=input_manifest,
             request_snapshot=request_snapshot,
@@ -2910,26 +2939,46 @@ def paired_metric_summary(
     after_values: list[float],
     *,
     higher_is_better: bool,
-) -> PairedMetricSummary:
-    if len(before_values) != len(after_values) or not before_values:
+    conditioning_event: str | None = None,
+) -> PairedMetricSummary | None:
+    if len(before_values) != len(after_values):
         raise HTTPException(
             409,
             detail={"code": "PAIRED_TRIAL_EVIDENCE_MISMATCH", "message": "配对 trial 证据数量不一致"},
         )
+    if not before_values:
+        return None
     deltas = [after - before for before, after in zip(before_values, after_values, strict=True)]
-    mean_delta = statistics.fmean(deltas)
-    standard_error = statistics.stdev(deltas) / math.sqrt(len(deltas)) if len(deltas) > 1 else 0.0
-    margin = 1.96 * standard_error
     wins = sum(1 for delta in deltas if delta > 0) if higher_is_better else sum(1 for delta in deltas if delta < 0)
     losses = sum(1 for delta in deltas if delta < 0) if higher_is_better else sum(1 for delta in deltas if delta > 0)
     ties = len(deltas) - wins - losses
+    if conditioning_event and len(deltas) < 20:
+        return PairedMetricSummary(
+            win_count=wins,
+            tie_count=ties,
+            loss_count=losses,
+            effective_sample_count=len(deltas),
+            conditioning_event=conditioning_event,
+            interval_method="NOT_ESTIMATED",
+            interpretation_status="INSUFFICIENT_EVENT_TRIALS",
+        )
+    mean_delta = statistics.fmean(deltas)
+    if len(deltas) == 1:
+        ci_low = ci_high = mean_delta
+    else:
+        rng = random.Random(int(content_hash(deltas)[:16], 16))
+        samples = sorted(statistics.fmean(deltas[rng.randrange(len(deltas))] for _ in deltas) for _ in range(2_000))
+        ci_low = samples[int(0.025 * (len(samples) - 1))]
+        ci_high = samples[int(0.975 * (len(samples) - 1))]
     return PairedMetricSummary(
         mean_delta=round(mean_delta, 6),
-        ci_low=round(mean_delta - margin, 6),
-        ci_high=round(mean_delta + margin, 6),
+        ci_low=round(ci_low, 6),
+        ci_high=round(ci_high, 6),
         win_count=wins,
         tie_count=ties,
         loss_count=losses,
+        effective_sample_count=len(deltas),
+        conditioning_event=conditioning_event,
     )
 
 
@@ -2969,12 +3018,62 @@ def compare_plan_risk_paired(
                 "message": "两个方案的业务快照不同，不能声称使用共同随机场景做配对比较",
             },
         )
+    before_context = resolve_decision_analysis_context(scenario_id, before_plan, request.analysis_scope)
+    after_context = resolve_decision_analysis_context(scenario_id, after_plan, request.analysis_scope)
+    if before_context != after_context:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PAIRED_ANALYSIS_CONTEXT_MISMATCH",
+                "message": "两个方案的分析范围、时点或发布上下文不同，不能创建配对分析",
+            },
+        )
+    if not before_plan.scenario_snapshot or not after_plan.scenario_snapshot:
+        raise HTTPException(409, detail={"code": "PAIRED_SIMULATION_SNAPSHOT_MISSING", "message": "方案快照缺失"})
+    before_seed = before_plan.scenario_snapshot.seed if request.seed is None else request.seed
+    after_seed = after_plan.scenario_snapshot.seed if request.seed is None else request.seed
+    before_scenario_set_identity = content_hash(
+        build_simulation_scenario_set(
+            before_plan.scenario_snapshot,
+            request,
+            before_seed,
+            before_context.analysis_as_of_time or 0,
+        )
+    )
+    after_scenario_set_identity = content_hash(
+        build_simulation_scenario_set(
+            after_plan.scenario_snapshot,
+            request,
+            after_seed,
+            after_context.analysis_as_of_time or 0,
+        )
+    )
+    if before_scenario_set_identity != after_scenario_set_identity:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PAIRED_SCENARIO_SET_MISMATCH",
+                "message": "两个方案无法构造同一共同随机场景集，未创建子分析",
+            },
+        )
     payload = request.model_dump(mode="json", exclude={"analysis_scope"})
     run_request = TypeAdapter(DecisionAnalysisRunRequest).validate_python(
         {"analysis_type": "RISK", "analysis_scope": request.analysis_scope, "request": payload}
     )
-    before_run = execute_decision_analysis_run(scenario_id, before_plan, run_request, Response())
-    after_run = execute_decision_analysis_run(scenario_id, after_plan, run_request, Response())
+    before_run = execute_decision_analysis_run(
+        scenario_id,
+        before_plan,
+        run_request,
+        Response(),
+        context_override=before_context,
+    )
+    after_run = execute_decision_analysis_run(
+        scenario_id,
+        after_plan,
+        run_request,
+        Response(),
+        context_override=after_context,
+    )
     if (
         before_run.status != "COMPLETED"
         or after_run.status != "COMPLETED"
@@ -3115,15 +3214,28 @@ def compare_plan_risk_paired(
         [item.all_demand_sla_rate for item in after_metrics],
         higher_is_better=True,
     )
-    paired_emergency_completion = paired_metric_summary(
+    emergency_pairs = [
+        (before_item, after_item)
+        for before_item, after_item in zip(before_metrics, after_metrics, strict=True)
+        if before_item.emergency_event and after_item.emergency_event
+    ]
+    paired_unconditional_emergency_completion = paired_metric_summary(
         [float(item.emergency_completed) for item in before_metrics],
         [float(item.emergency_completed) for item in after_metrics],
         higher_is_better=True,
     )
-    paired_emergency_on_time = paired_metric_summary(
-        [float(item.emergency_on_time) for item in before_metrics],
-        [float(item.emergency_on_time) for item in after_metrics],
+    assert paired_unconditional_emergency_completion is not None
+    paired_emergency_completion = paired_metric_summary(
+        [float(before_item.emergency_completed) for before_item, _after_item in emergency_pairs],
+        [float(after_item.emergency_completed) for _before_item, after_item in emergency_pairs],
         higher_is_better=True,
+        conditioning_event="EMERGENCY_EVENT_OCCURRED",
+    )
+    paired_emergency_on_time = paired_metric_summary(
+        [float(before_item.emergency_on_time) for before_item, _after_item in emergency_pairs],
+        [float(after_item.emergency_on_time) for _before_item, after_item in emergency_pairs],
+        higher_is_better=True,
+        conditioning_event="EMERGENCY_EVENT_OCCURRED",
     )
     paired_overtime = paired_metric_summary(
         [float(item.total_overtime_minutes) for item in before_metrics],
@@ -3140,11 +3252,17 @@ def compare_plan_risk_paired(
         [float(item.disrupted) for item in after_metrics],
         higher_is_better=False,
     )
+    assert paired_published_sla is not None
+    assert paired_all_demand_sla is not None
+    assert paired_overtime is not None
+    assert paired_unserved is not None
+    assert paired_disruption is not None
     business_result = RiskComparisonResult(
         paired_published_sla_delta=paired_published_sla,
         paired_all_demand_sla_delta=paired_all_demand_sla,
         paired_emergency_completion_delta=paired_emergency_completion,
         paired_emergency_on_time_delta=paired_emergency_on_time,
+        paired_unconditional_emergency_completion_impact=paired_unconditional_emergency_completion,
         paired_overtime_delta=paired_overtime,
         paired_unserved_delta=paired_unserved,
         paired_disruption_delta=paired_disruption,
@@ -3469,8 +3587,10 @@ def reattest_plan_version(
         )
     if request.mode is ReattestationMode.planning_equivalent:
         provider = require_store().travel_provider
-        current_fingerprint = content_hash(scenario_assignment_feasibility_payload(current, provider))
-        source_fingerprint = content_hash(scenario_assignment_feasibility_payload(source.scenario_snapshot, provider))
+        current_fingerprint = content_hash(plan_scoped_assignment_feasibility_payload(current, source, provider))
+        source_fingerprint = content_hash(
+            plan_scoped_assignment_feasibility_payload(source.scenario_snapshot, source, provider)
+        )
         mismatch_code = "REATTESTATION_PLANNING_INPUT_MISMATCH"
         mismatch_message = "当前分配可行性输入与历史冻结快照不同，不能按规划等价模式重新认证"
     else:
@@ -4467,7 +4587,8 @@ def create_app(
             status_code=409,
             content={
                 "detail": {
-                    "code": "MALFORMED_ATTESTED_RECORD",
+                    "code": "RECORD_INTEGRITY_FAILED",
+                    "legacy_code": "MALFORMED_ATTESTED_RECORD",
                     "message": str(error),
                     "record_id": error.record_id,
                     "record_type": error.record_type,

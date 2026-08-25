@@ -369,7 +369,7 @@ def test_malformed_plan_is_quarantined_without_blocking_history_list(monkeypatch
         assert any(item["source_table"] == "plan_versions" and item["source_id"] == plan["id"] for item in issues)
         detail = client.get(f"/api/scenarios/main/plan-versions/{plan['id']}")
         assert detail.status_code == 409
-        assert detail.json()["detail"]["code"] == "MALFORMED_ATTESTED_RECORD"
+        assert detail.json()["detail"]["code"] == "RECORD_INTEGRITY_FAILED"
 
 
 def test_malformed_scenario_detail_returns_structured_error_and_keeps_quarantine_evidence(monkeypatch, tmp_path):
@@ -383,7 +383,7 @@ def test_malformed_scenario_detail_returns_structured_error_and_keeps_quarantine
             connection.execute("UPDATE scenarios SET payload='{' WHERE id='main'")
         detail = client.get("/api/scenarios/main")
         assert detail.status_code == 409
-        assert detail.json()["detail"]["code"] == "MALFORMED_ATTESTED_RECORD"
+        assert detail.json()["detail"]["code"] == "RECORD_INTEGRITY_FAILED"
         assert detail.json()["detail"]["record_type"] == "SCENARIO"
         listed = client.get("/api/scenarios")
         assert listed.status_code == 200
@@ -561,7 +561,7 @@ def test_stale_assignment_cannot_start_after_skill_change(monkeypatch, tmp_path)
             },
         )
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+        assert response.json()["detail"]["code"] == "INVALID_ASSIGNMENT_CANNOT_START"
 
 
 def test_stale_assignment_cannot_start_after_location_change(monkeypatch, tmp_path):
@@ -585,7 +585,7 @@ def test_stale_assignment_cannot_start_after_location_change(monkeypatch, tmp_pa
             },
         )
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+        assert response.json()["detail"]["code"] == "INVALID_ASSIGNMENT_CANNOT_START"
 
 
 def test_stale_assignment_cannot_start_after_time_window_change(monkeypatch, tmp_path):
@@ -614,7 +614,7 @@ def test_stale_assignment_cannot_start_after_time_window_change(monkeypatch, tmp
             },
         )
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+        assert response.json()["detail"]["code"] == "INVALID_ASSIGNMENT_CANNOT_START"
 
 
 def test_stale_assignment_cannot_violate_new_lock(monkeypatch, tmp_path):
@@ -649,7 +649,7 @@ def test_stale_assignment_cannot_violate_new_lock(monkeypatch, tmp_path):
             },
         )
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "PENDING_ASSIGNMENT_STALE"
+        assert response.json()["detail"]["code"] == "INVALID_ASSIGNMENT_CANNOT_START"
 
 
 def test_metadata_only_edit_does_not_invalidate_pending_assignment(monkeypatch, tmp_path):
@@ -1442,7 +1442,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -2192,7 +2192,7 @@ def test_scenario_aggregate_and_work_order_state_machine(monkeypatch, tmp_path):
             client.put(
                 f"/api/scenarios/main/work-orders/{assigned['work_order_id']}", json={"status": "started"}
             ).status_code
-            == 409
+            == 422
         )
         locked = client.post(
             "/api/scenarios/main/lock",
@@ -2259,7 +2259,7 @@ def test_scenario_aggregate_and_work_order_state_machine(monkeypatch, tmp_path):
         rollback = client.put(
             f"/api/scenarios/main/work-orders/{assigned['work_order_id']}", json={"status": "pending"}
         )
-        assert rollback.status_code == 409
+        assert rollback.status_code == 422
         immutable = client.put(
             f"/api/scenarios/main/work-orders/{assigned['work_order_id']}", json={"title": "rewrite"}
         )
@@ -2376,7 +2376,6 @@ def test_compound_emergency_replan_is_idempotent(monkeypatch, tmp_path):
         "sla_deadline": 660,
         "priority": "urgent",
         "drop_penalty": 10000,
-        "status": "pending",
         "vip": True,
         "is_emergency": True,
         "reported_at": 600,
@@ -2533,11 +2532,11 @@ def test_new_demand_preserves_existing_routes_as_partial_coverage(monkeypatch, t
                 "id": "WO-NEW-DEMAND",
                 "customer_name": "新增客户",
                 "title": "新增待排需求",
-                "status": "pending",
                 "is_emergency": False,
                 "reported_at": None,
             }
         )
+        order.pop("status", None)
         created = client.post("/api/scenarios/main/work-orders", json=order)
         assert created.status_code == 200, created.text
         active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
@@ -2660,7 +2659,6 @@ def test_failed_compound_emergency_replan_keeps_demand_and_last_plan(monkeypatch
         "sla_deadline": 660,
         "priority": "urgent",
         "drop_penalty": 10000,
-        "status": "pending",
         "vip": True,
         "is_emergency": True,
         "reported_at": 600,
@@ -2750,7 +2748,6 @@ def test_emergency_preparation_failure_is_persisted_and_idempotent(monkeypatch, 
         "sla_deadline": 660,
         "priority": "urgent",
         "drop_penalty": 10000,
-        "status": "pending",
         "vip": True,
         "is_emergency": True,
         "reported_at": 600,

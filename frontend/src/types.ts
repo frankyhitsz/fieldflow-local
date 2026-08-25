@@ -1,25 +1,11 @@
-export type Point = { x: number; y: number }
-export type Technician = {
-  id: string; name: string; skills: string[]; shift_start: number; shift_end: number
-  start_location: Point; overtime_limit: number; cost_per_minute_cents: number; color: string
-}
-export type WorkOrder = {
-  id: string; customer_name: string; title: string; required_skills: string[]; location: Point
-  service_duration: number; window_start: number; window_end: number; sla_deadline: number
-  priority: 'urgent' | 'high' | 'normal' | 'low'; drop_penalty: number
-  status: 'pending' | 'started' | 'completed'; vip: boolean; is_emergency: boolean
-  reported_at: number | null; note: string
-}
-export type ExecutionEvent = {
-  id: string; scenario_id: string; work_order_id: string; technician_id: string
-  action: 'start' | 'complete'; sequence: number; occurred_at: number; scenario_revision: number
-  plan_version_id: string; idempotency_key: string; created_at: string
-  booking_id: string; source_assignment_hash: string; source_sequence: number
-  planned_start_at: number | null; planned_finish_at: number | null
-  actual_duration_minutes: number | null; customer_window_late_start_minutes: number
-  planned_start_variance_minutes: number | null; actual_late_start_minutes: number
-  early_start_override_reason: string | null; estimated_remaining_minutes: number | null; note: string
-}
+import type { components as OpenApiComponents } from './generated/openapi'
+
+type ApiSchemas = OpenApiComponents['schemas']
+
+export type Point = ApiSchemas['Point']
+export type Technician = Required<ApiSchemas['Technician']>
+export type WorkOrder = Required<ApiSchemas['WorkOrder']>
+export type ExecutionEvent = Required<ApiSchemas['WorkOrderExecutionEvent']>
 export type ExecutionResult = { scenario: Scenario; event: ExecutionEvent }
 export type ManualReassignmentResult = {
   lock_persisted: boolean; replan_status: 'COMPLETED' | 'FAILED'; active_plan_preserved: boolean
@@ -108,7 +94,8 @@ export type PlanVersion = {
   publication_planning_context?: Record<string, unknown> | null
   publication_verification_artifact?: Record<string, unknown> | null
   attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'
-  schedule_integrity: IntegrityStatus; source_solver_provenance: string | null
+  schedule_integrity: IntegrityStatus
+  source_solver_provenance: { claimed_solver_name: string | null; claimed_solver_version: string | null; claimed_policy_snapshot: Schedule['solver_policy']; integrity: IntegrityStatus } | null
   inherited_source_solver_policy: Schedule['solver_policy']; replay_validation_policy: string | null
   reattestation_mode: 'EXACT_SNAPSHOT' | 'PLANNING_EQUIVALENT' | null
   integrity_status: IntegrityStatus; self_integrity: IntegrityStatus; effective_integrity: IntegrityStatus
@@ -218,12 +205,15 @@ export type RiskSimulation = AnalysisContextFields & {
   schedule_signature: string; travel_model_fingerprint: string
   execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE' | 'EARLIEST_FEASIBLE_EXECUTION'; execution_policy_version: string
   emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'
-  emergency_responder_selection_policy: 'EARLIEST_FEASIBLE_COMPLETION'
+  emergency_responder_selection_policy: 'MYOPIC_EARLIEST_EMERGENCY_FINISH'
   simulation_policy_version: string; analysis_code_version: string; simulation_input_hash: string; seed: number; trials: number
   simulation_scenario_set_hash: string
   expected_sla_on_time_rate: number; sla_rate_ci_low: number; sla_rate_ci_high: number
   published_commitment_sla_rate: number; all_demand_sla_rate: number
-  emergency_completion_rate: number; emergency_on_time_rate: number; emergency_unserved_probability: number
+  emergency_event_count: number
+  emergency_completion_rate: number | null; emergency_on_time_rate: number | null; emergency_unserved_probability: number | null
+  emergency_incremental_late_minutes: number | null; emergency_incremental_overtime_minutes: number | null
+  emergency_incremental_unserved_orders: number | null; emergency_affected_work_order_count: number | null
   monte_carlo_mean_ci_low: number; monte_carlo_mean_ci_high: number
   full_day_total_late_minutes_p50: number; full_day_total_late_minutes_p90: number; full_day_total_late_minutes_p95: number
   scope_total_late_minutes_p50: number; scope_total_late_minutes_p90: number; scope_total_late_minutes_p95: number
@@ -285,7 +275,7 @@ export type CapacityCounterfactualArtifact = {
 
 export type SimulationScenarioSetArtifact = {
   artifact_type: 'SIMULATION_SCENARIO_SET'; id: string; scenario_id: string; analysis_run_id: string
-  policy_version: string; keyed_random_version: string; emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'; emergency_responder_selection_policy: 'EARLIEST_FEASIBLE_COMPLETION'; scenario_snapshot_hash: string; seed: number; trials: number
+  policy_version: string; keyed_random_version: string; emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'; emergency_responder_selection_policy: 'MYOPIC_EARLIEST_EMERGENCY_FINISH'; scenario_snapshot_hash: string; seed: number; trials: number
   technician_ids: string[]; work_order_ids: string[]; exogenous_parameters: Record<string, number>
   emergency_events: { trial: number; event_id: string; technician_id: string | null; event_time: number; location: Point; duration_minutes: number; required_skill: string; sla_deadline: number }[]
   scenario_set_hash: string; artifact_hash: string; integrity_status: IntegrityStatus; self_integrity: IntegrityStatus; parent_analysis_integrity: IntegrityStatus; effective_integrity: IntegrityStatus; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string

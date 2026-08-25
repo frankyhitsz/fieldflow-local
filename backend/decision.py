@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -24,10 +23,14 @@ from .models import (
     CapacityViolation,
     CostAnalysis,
     CostCadence,
+    CostComponent,
+    CostComponentKind,
+    CostLedger,
     CostUnitType,
     DecisionAnalysisContext,
     DecisionAnalysisScope,
     DecisionCostPolicy,
+    EmergencyDecisionInformationSet,
     EmergencyDispatchPolicy,
     EmergencyResponderSelectionPolicy,
     ExternalAssignment,
@@ -46,6 +49,7 @@ from .models import (
     SimulationEmergencyEvent,
     Skill,
     Technician,
+    TechnicianCostSource,
     UnassignedWorkOrder,
     WorkOrderDisposition,
 )
@@ -111,6 +115,7 @@ class _RiskTrialOutcome(TypedDict):
     emergency_dispatch_time: int | None
     emergency_finish_time: int | None
     emergency_dispatch_location: Point | None
+    emergency_decision_information_set: EmergencyDecisionInformationSet | None
     emergency_sla_failure: bool
 
 
@@ -418,6 +423,8 @@ def analyze_plan_cost(
     paid_shift_start_by_technician: dict[str, int] | None = None,
     paid_shift_default_start: int | None = None,
     paid_shift_only_if_scheduled: bool = False,
+    technician_cost_sources: dict[str, TechnicianCostSource] | None = None,
+    analysis_scope: DecisionAnalysisScope = DecisionAnalysisScope.frozen_full_plan,
 ) -> PlanCostBreakdown:
     """Calculate operating exposure using integer cents only.
 
@@ -439,14 +446,16 @@ def analyze_plan_cost(
     overtime_base_cost = 0
     overtime_premium_cost = 0
     full_day_committed_labor_cost = 0
+    ledger_components: list[CostComponent] = []
     scheduled_technicians = {item.technician_id for item in schedule.assignments}
     for kpi in schedule.kpis.technician:
         technician = technicians.get(kpi.technician_id)
         if technician is None:
             continue
         paid_shift_mode = policy.labor_cost_mode is LaborCostMode.paid_shift
+        source = (technician_cost_sources or {}).get(technician.id, TechnicianCostSource())
         full_shift_minutes = technician.shift_end - technician.shift_start
-        if paid_shift_mode:
+        if paid_shift_mode and source.include_regular_wage:
             full_day_committed_labor_cost += full_shift_minutes * technician.cost_per_minute_cents
         if paid_shift_mode and paid_shift_only_if_scheduled and technician.id not in scheduled_technicians:
             regular_minutes = 0
@@ -458,15 +467,35 @@ def analyze_plan_cost(
             regular_minutes = max(0, technician.shift_end - max(technician.shift_start, incremental_start))
         else:
             regular_minutes = full_shift_minutes if paid_shift_mode else kpi.occupied_minutes
-        regular_labor = regular_minutes * technician.cost_per_minute_cents
-        overtime_base = kpi.overtime_minutes * technician.cost_per_minute_cents if paid_shift_mode else 0
+        regular_labor = regular_minutes * technician.cost_per_minute_cents if source.include_regular_wage else 0
+        overtime_base = (
+            kpi.overtime_minutes * technician.cost_per_minute_cents
+            if paid_shift_mode and source.include_overtime_base
+            else 0
+        )
         overtime_premium = (
             kpi.overtime_minutes * technician.cost_per_minute_cents * policy.overtime_premium_basis_points // 10_000
+            if source.include_overtime_premium
+            else 0
         )
         technician_costs[technician.id] = regular_labor + overtime_base + overtime_premium
         regular_labor_cost += regular_labor
         overtime_base_cost += overtime_base
         overtime_premium_cost += overtime_premium
+        for component, amount in (
+            (CostComponentKind.regular_labor, regular_labor),
+            (CostComponentKind.overtime_base, overtime_base),
+            (CostComponentKind.overtime_premium, overtime_premium),
+        ):
+            if amount:
+                ledger_components.append(
+                    CostComponent(
+                        component=component,
+                        source_id=technician.id,
+                        amount_cents=amount,
+                        scope=analysis_scope,
+                    )
+                )
 
     travel_cost = schedule.kpis.total_travel_minutes * policy.travel_cost_per_minute_cents
     sla_penalty = sum(item.sla_late_minutes for item in schedule.assignments)
@@ -486,6 +515,21 @@ def analyze_plan_cost(
         if order.vip:
             unserved_revenue += policy.vip_revenue_premium_cents
     outsourcing_cost = outsourced_orders * policy.outsourcing_cost_per_order_cents
+    for component, source_id, amount in (
+        (CostComponentKind.travel, "TRAVEL_PROVIDER", travel_cost),
+        (CostComponentKind.outsourcing, "DECISION_COST_POLICY", outsourcing_cost),
+        (CostComponentKind.sla_penalty, "PUBLISHED_ASSIGNMENTS", sla_penalty),
+        (CostComponentKind.unserved_revenue, "UNASSIGNED_ORDERS", unserved_revenue),
+    ):
+        if amount:
+            ledger_components.append(
+                CostComponent(
+                    component=component,
+                    source_id=source_id,
+                    amount_cents=amount,
+                    scope=analysis_scope,
+                )
+            )
     cash = regular_labor_cost + overtime_base_cost + overtime_premium_cost + travel_cost + outsourcing_cost
     service_failure_loss = sla_penalty + unserved_revenue
     total = cash + service_failure_loss
@@ -508,6 +552,7 @@ def analyze_plan_cost(
             full_day_committed_labor_cost if policy.labor_cost_mode is LaborCostMode.paid_shift else regular_labor_cost
         ),
         remaining_incremental_labor_cost_cents=regular_labor_cost,
+        ledger=CostLedger(components=ledger_components),
     )
 
 
@@ -553,6 +598,7 @@ def cost_analysis(
         paid_shift_start_by_technician=entry_starts,
         paid_shift_default_start=context.analysis_as_of_time if remaining_scope else None,
         paid_shift_only_if_scheduled=remaining_scope,
+        analysis_scope=context.analysis_scope,
     )
     assumptions = [
         (
@@ -1277,7 +1323,13 @@ def capacity_analysis(
         base = baseline_schedule(scenario, 0, strategy="baseline", provider=provider)
         evaluation_method = "CONTROLLED_DETERMINISTIC_GREEDY_REOPTIMIZATION_V2"
         reference_policy_fingerprint = base.solver_policy.fingerprint if base.solver_policy else ""
-    base_cost = analyze_plan_cost(scenario, base, policy, **paid_shift_kwargs)
+    base_cost = analyze_plan_cost(
+        scenario,
+        base,
+        policy,
+        **paid_shift_kwargs,
+        analysis_scope=context.analysis_scope,
+    )
     build_sha = decision_build_sha()
     analysis_input_hash = expected_input_hash or canonical_decision_input_hash(
         plan, "CAPACITY", request, context, provider
@@ -1331,6 +1383,7 @@ def capacity_analysis(
                 policy,
                 outsourced_orders=outsourced if use_cost_policy else 0,
                 **paid_shift_kwargs,
+                analysis_scope=context.analysis_scope,
             )
             daily_alternative_total = (
                 alternative_cost.total_economic_impact_cents - alternative_cost.unserved_revenue_cents
@@ -1388,44 +1441,34 @@ def capacity_analysis(
                         "容量选项没有使用与参考排程相同的求解政策",
                         option_id=option_id,
                     )
-            alternative_cost = analyze_plan_cost(alternative, alternative_schedule, policy, **paid_shift_kwargs)
-            if option_id == "add_technician" and request.capacity_policy.add_technician_cost_mode.value == "FIXED_ONLY":
-                affected_value = changed_inputs.get("affected_technician_ids", [])
-                affected_ids = affected_value if isinstance(affected_value, list) else []
-                candidate_id = next(
-                    (str(item) for item in affected_ids if str(item) not in {tech.id for tech in scenario.technicians}),
-                    None,
-                )
-                candidate = next((item for item in alternative.technicians if item.id == candidate_id), None)
-                candidate_kpi = next(
-                    (item for item in alternative_schedule.kpis.technician if item.technician_id == candidate_id),
-                    None,
-                )
-                if candidate and candidate_kpi:
-                    paid_shift = policy.labor_cost_mode is LaborCostMode.paid_shift
-                    regular_minutes = (
-                        candidate.shift_end - candidate.shift_start if paid_shift else candidate_kpi.occupied_minutes
+            affected_value = changed_inputs.get("affected_technician_ids", [])
+            affected_ids = affected_value if isinstance(affected_value, list) else []
+            candidate_id = next(
+                (str(item) for item in affected_ids if str(item) not in {tech.id for tech in scenario.technicians}),
+                None,
+            )
+            cost_sources = (
+                {
+                    candidate_id: TechnicianCostSource(
+                        include_regular_wage=False,
+                        include_overtime_base=False,
+                        include_overtime_premium=False,
+                        source="CAPACITY_FIXED_ONLY",
                     )
-                    regular = regular_minutes * candidate.cost_per_minute_cents
-                    overtime_base = (
-                        candidate_kpi.overtime_minutes * candidate.cost_per_minute_cents if paid_shift else 0
-                    )
-                    overtime_premium = (
-                        candidate_kpi.overtime_minutes
-                        * candidate.cost_per_minute_cents
-                        * policy.overtime_premium_basis_points
-                        // 10_000
-                    )
-                    labor_total = regular + overtime_base + overtime_premium
-                    alternative_cost.regular_labor_cost_cents -= regular
-                    alternative_cost.overtime_base_cost_cents -= overtime_base
-                    alternative_cost.overtime_premium_cost_cents -= overtime_premium
-                    alternative_cost.labor_cost_cents -= regular
-                    alternative_cost.overtime_cost_cents -= overtime_premium
-                    alternative_cost.cash_operating_cost_cents -= labor_total
-                    alternative_cost.total_economic_impact_cents -= labor_total
-                    alternative_cost.total_cost_cents -= labor_total
-                    alternative_cost.technician_cost_cents.pop(candidate.id, None)
+                }
+                if option_id == "add_technician"
+                and candidate_id
+                and request.capacity_policy.add_technician_cost_mode.value == "FIXED_ONLY"
+                else None
+            )
+            alternative_cost = analyze_plan_cost(
+                alternative,
+                alternative_schedule,
+                policy,
+                **paid_shift_kwargs,
+                technician_cost_sources=cost_sources,
+                analysis_scope=context.analysis_scope,
+            )
             daily_alternative_total = alternative_cost.total_economic_impact_cents
             completion_rate = alternative_schedule.kpis.completion_rate
             sla_rate = alternative_schedule.kpis.committed_on_time_rate
@@ -1618,6 +1661,7 @@ def capacity_analysis(
                 work_order_dispositions=dispositions,
                 counterfactual_kpis=counterfactual_kpis,
                 conditional_upper_bound_kpis=counterfactual_kpis if external_conditional else None,
+                counterfactual_cost=alternative_cost,
             )
         )
     return CapacityAnalysis(
@@ -1727,7 +1771,7 @@ def build_simulation_scenario_set(
             )
         )
     return {
-        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V4",
+        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V5",
         "keyed_random_version": "FIELD_SERVICE_KEYED_RANDOM_V1",
         "emergency_dispatch_policy": request.emergency_dispatch_policy.value,
         "emergency_responder_selection_policy": request.emergency_responder_selection_policy.value,
@@ -1812,6 +1856,10 @@ def simulate_plan_risk(
     emergency_caused_sla_trials = 0
     emergency_completed_trials = 0
     emergency_on_time_trials = 0
+    emergency_incremental_late_totals: list[int] = []
+    emergency_incremental_overtime_totals: list[int] = []
+    emergency_incremental_unserved_totals: list[int] = []
+    emergency_affected_order_totals: list[int] = []
     trial_metrics: list[RiskTrialMetric] = []
 
     def trial_outcome(
@@ -1826,11 +1874,11 @@ def simulate_plan_risk(
             )
         if (
             request.emergency_responder_selection_policy
-            is not EmergencyResponderSelectionPolicy.earliest_feasible_completion
+            is not EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
         ):
             raise DecisionAnalysisError(
                 "UNSUPPORTED_EMERGENCY_RESPONDER_SELECTION_POLICY",
-                "当前版本只支持按紧急服务最早可行完成时间选择响应技师",
+                "当前版本只支持基于事件时点信息的紧急服务最早预计完成策略",
             )
 
         def new_state(technician_id: str) -> _RiskRouteState:
@@ -2019,34 +2067,144 @@ def simulate_plan_risk(
             state.returned = False
             return state.current
 
+        def event_information_projection(event: SimulationEmergencyEvent, technician_id: str) -> _RiskRouteState:
+            """Project the next dispatch checkpoint without exposing post-event outcomes."""
+            state = new_state(technician_id)
+            route = routes.get(technician_id, [])
+            while state.next_assignment_index < len(route):
+                if event.event_time <= state.current:
+                    return state
+                assignment = route[state.next_assignment_index]
+                order = orders[assignment.work_order_id]
+                arrival, start, finish, no_show = order_timing(state, assignment)
+                if finish <= event.event_time:
+                    # This outcome is history at the decision time and may be observed.
+                    complete_assignment(state, assignment, start, finish, no_show)
+                    continue
+                if event.event_time <= arrival:
+                    # The technician is still travelling. Only the fact that arrival has
+                    # not happened is known; use the deterministic travel projection.
+                    planned_arrival = state.current + provider.minutes(state.location, order.location, state.current)
+                    state.current = max(event.event_time + 1, planned_arrival)
+                    state.location = order.location
+                    state.predecessor_id = order.id
+                    state.ready_assignment_index = state.next_assignment_index
+                    return state
+                if event.event_time < start:
+                    # Waiting at the customer is already a between-visits checkpoint.
+                    state.current = event.event_time
+                    state.location = order.location
+                    state.predecessor_id = order.id
+                    state.ready_assignment_index = state.next_assignment_index
+                    return state
+                # Service is observed to be in progress, but its eventual random finish
+                # is not. Estimate only the deterministic remaining service duration.
+                deterministic_remaining = max(1, order.service_duration - (event.event_time - start))
+                state.current = event.event_time + deterministic_remaining
+                state.location = order.location
+                state.predecessor_id = order.id
+                state.next_assignment_index += 1
+                state.ready_assignment_index = None
+                return state
+
+            technician = technicians[technician_id]
+            route_entry = route_entries.get(technician_id)
+            return_location = route_entry.return_location if route_entry else technician.start_location
+            if state.location != return_location:
+                planned_return = state.current + provider.minutes(state.location, return_location, state.current)
+                state.current = max(event.event_time + 1, planned_return)
+                state.location = return_location
+                state.predecessor_id = f"DEPOT:{technician_id}"
+                state.returned = True
+            else:
+                state.current = max(state.current, event.event_time)
+            return state
+
+        def deterministic_candidate_projection(
+            state: _RiskRouteState,
+            event: SimulationEmergencyEvent,
+        ) -> tuple[int, int]:
+            """Estimate eligibility without reading any post-decision random draw."""
+            technician = technicians[state.technician_id]
+            depart_at = max(state.current, event.event_time)
+            emergency_finish = (
+                depart_at + provider.minutes(state.location, event.location, depart_at) + event.duration_minutes
+            )
+            current = emergency_finish
+            location = event.location
+            route = routes.get(state.technician_id, [])
+            for assignment in route[state.next_assignment_index :]:
+                order = orders[assignment.work_order_id]
+                if (
+                    state.ready_assignment_index == state.next_assignment_index
+                    and assignment is route[state.next_assignment_index]
+                ):
+                    arrival = current
+                else:
+                    arrival = current + provider.minutes(location, order.location, current)
+                start = max(arrival, order.window_start, order.reported_at or 0)
+                if request.execution_policy is RiskExecutionPolicy.follow_published_schedule:
+                    start = max(start, assignment.start_time)
+                current = start + order.service_duration
+                location = order.location
+            route_entry = route_entries.get(state.technician_id)
+            return_location = route_entry.return_location if route_entry else technician.start_location
+            terminal = current + provider.minutes(location, return_location, current)
+            return emergency_finish, terminal
+
         states: dict[str, _RiskRouteState] = {}
         unserved = initially_unserved
         for technician_id in sorted(technicians):
             if technician_id in absent:
                 unserved += len(routes.get(technician_id, []))
                 continue
-            state = new_state(technician_id)
-            if emergency_event is not None:
-                advance_to_dispatch_checkpoint(state, emergency_event)
-            states[technician_id] = state
+            states[technician_id] = new_state(technician_id)
 
         emergency_target: str | None = None
+        decision_information_set: EmergencyDecisionInformationSet | None = None
         if emergency_event is not None:
-            choices: list[tuple[int, str, _RiskRouteState]] = []
-            for technician_id, state in states.items():
+            choices: list[tuple[int, str]] = []
+            excluded: dict[str, str] = {}
+            deterministic_dispatches: dict[str, int] = {}
+            deterministic_finishes: dict[str, int] = {}
+            for technician_id in sorted(technicians):
+                if technician_id in absent:
+                    excluded[technician_id] = "TECHNICIAN_ABSENT"
+                    continue
                 technician = technicians[technician_id]
                 if emergency_event.required_skill not in technician.skills:
+                    excluded[technician_id] = "REQUIRED_SKILL_MISSING"
                     continue
-                projected = deepcopy(state)
-                emergency_finish = apply_emergency(projected, emergency_event)
-                finish_route(projected)
-                if not projected.overtime_failure:
-                    choices.append((emergency_finish, technician_id, projected))
+                projected_state = event_information_projection(emergency_event, technician_id)
+                deterministic_dispatches[technician_id] = projected_state.current
+                emergency_finish, deterministic_terminal = deterministic_candidate_projection(
+                    projected_state, emergency_event
+                )
+                deterministic_finishes[technician_id] = emergency_finish
+                if deterministic_terminal > technician.shift_end + technician.overtime_limit:
+                    excluded[technician_id] = "DETERMINISTIC_MINIMUM_RETURN_EXCEEDS_OVERTIME_LIMIT"
+                    continue
+                choices.append((emergency_finish, technician_id))
             if choices:
-                _finish, emergency_target, selected_state = min(choices, key=lambda item: (item[0], item[1]))
-                states[emergency_target] = selected_state
+                _finish, emergency_target = min(choices, key=lambda item: (item[0], item[1]))
+                selected_state = states[emergency_target]
+                advance_to_dispatch_checkpoint(selected_state, emergency_event)
+                apply_emergency(selected_state, emergency_event)
+                finish_route(selected_state)
             else:
                 unserved += 1
+            selected_state = states.get(emergency_target) if emergency_target else None
+            decision_information_set = EmergencyDecisionInformationSet(
+                event_time=emergency_event.event_time,
+                decision_time=emergency_event.event_time,
+                candidate_technician_ids=sorted(technicians),
+                excluded_candidate_reasons=excluded,
+                selected_technician_id=emergency_target,
+                dispatch_time=selected_state.emergency_dispatch_time if selected_state else None,
+                dispatch_location=selected_state.emergency_dispatch_location if selected_state else None,
+                deterministic_dispatch_by_technician=deterministic_dispatches,
+                deterministic_finish_by_technician=deterministic_finishes,
+            )
 
         for technician_id, state in states.items():
             if technician_id != emergency_target:
@@ -2077,6 +2235,7 @@ def simulate_plan_risk(
             "emergency_dispatch_location": (
                 states[emergency_target].emergency_dispatch_location if emergency_target else None
             ),
+            "emergency_decision_information_set": decision_information_set,
             "emergency_sla_failure": emergency_event is not None
             and (emergency_target is None or not emergency_on_time),
         }
@@ -2115,6 +2274,18 @@ def simulate_plan_risk(
         emergency_caused_failure = (
             emergency_caused_window or emergency_caused_overtime or emergency_caused_unserved or emergency_caused_sla
         )
+        emergency_incremental_late = max(0, int(outcome["total_late"]) - int(baseline_outcome["total_late"]))
+        emergency_incremental_overtime = max(
+            0,
+            int(outcome["total_overtime"]) - int(baseline_outcome["total_overtime"]),
+        )
+        emergency_incremental_unserved = max(
+            0,
+            int(outcome["unserved"]) - int(baseline_outcome["unserved"]),
+        )
+        emergency_affected_orders = max(0, int(baseline_outcome["on_time"]) - int(outcome["on_time"])) + (
+            emergency_incremental_unserved
+        )
         published_sla_rate = int(outcome["on_time"]) / active_count if active_count else 1.0
         all_demand_count = active_count + int(emergency_event)
         all_demand_on_time = int(outcome["on_time"]) + int(bool(outcome["emergency_on_time"]))
@@ -2142,18 +2313,29 @@ def simulate_plan_risk(
         emergency_caused_sla_trials += int(emergency_caused_sla)
         emergency_completed_trials += int(bool(outcome["emergency_completed"]))
         emergency_on_time_trials += int(bool(outcome["emergency_on_time"]))
+        if emergency_event:
+            emergency_incremental_late_totals.append(emergency_incremental_late)
+            emergency_incremental_overtime_totals.append(emergency_incremental_overtime)
+            emergency_incremental_unserved_totals.append(emergency_incremental_unserved)
+            emergency_affected_order_totals.append(emergency_affected_orders)
         trial_metrics.append(
             RiskTrialMetric(
                 trial=trial,
                 sla_on_time_rate=published_sla_rate,
                 published_commitment_sla_rate=published_sla_rate,
                 all_demand_sla_rate=all_demand_sla_rate,
+                emergency_event=emergency_event,
                 emergency_completed=bool(outcome["emergency_completed"]),
                 emergency_on_time=bool(outcome["emergency_on_time"]),
                 emergency_technician_id=outcome["emergency_technician_id"],
                 emergency_dispatch_time=outcome["emergency_dispatch_time"],
                 emergency_finish_time=outcome["emergency_finish_time"],
                 emergency_dispatch_location=outcome["emergency_dispatch_location"],
+                emergency_decision_information_set=outcome["emergency_decision_information_set"],
+                emergency_incremental_late_minutes=emergency_incremental_late,
+                emergency_incremental_overtime_minutes=emergency_incremental_overtime,
+                emergency_incremental_unserved_orders=emergency_incremental_unserved,
+                emergency_affected_work_order_count=emergency_affected_orders,
                 total_overtime_minutes=int(outcome["total_overtime"]),
                 total_unserved_orders=int(outcome["unserved"]),
                 disrupted=bool(
@@ -2178,10 +2360,10 @@ def simulate_plan_risk(
     emergency_event_probability = round(emergency_event_trials / request.trials, 4)
     emergency_caused_probability = round(emergency_caused_failure_trials / request.trials, 4)
     emergency_completion_rate = (
-        round(emergency_completed_trials / emergency_event_trials, 4) if emergency_event_trials else 1.0
+        round(emergency_completed_trials / emergency_event_trials, 4) if emergency_event_trials else None
     )
     emergency_on_time_rate = (
-        round(emergency_on_time_trials / emergency_event_trials, 4) if emergency_event_trials else 1.0
+        round(emergency_on_time_trials / emergency_event_trials, 4) if emergency_event_trials else None
     )
     return RiskSimulationResult(
         scenario_id=plan.scenario_id,
@@ -2208,12 +2390,29 @@ def simulate_plan_risk(
         expected_sla_on_time_rate=round(mean_sla, 4),
         published_commitment_sla_rate=round(mean_sla, 4),
         all_demand_sla_rate=round(sum(all_demand_sla_rates) / request.trials, 4),
+        emergency_event_count=emergency_event_trials,
         emergency_completion_rate=emergency_completion_rate,
         emergency_on_time_rate=emergency_on_time_rate,
         emergency_unserved_probability=(
             round((emergency_event_trials - emergency_completed_trials) / emergency_event_trials, 4)
             if emergency_event_trials
-            else 0
+            else None
+        ),
+        emergency_incremental_late_minutes=(
+            round(statistics.fmean(emergency_incremental_late_totals), 2) if emergency_incremental_late_totals else None
+        ),
+        emergency_incremental_overtime_minutes=(
+            round(statistics.fmean(emergency_incremental_overtime_totals), 2)
+            if emergency_incremental_overtime_totals
+            else None
+        ),
+        emergency_incremental_unserved_orders=(
+            round(statistics.fmean(emergency_incremental_unserved_totals), 2)
+            if emergency_incremental_unserved_totals
+            else None
+        ),
+        emergency_affected_work_order_count=(
+            round(statistics.fmean(emergency_affected_order_totals), 2) if emergency_affected_order_totals else None
         ),
         monte_carlo_mean_ci_low=round(ci_low, 4),
         monte_carlo_mean_ci_high=round(ci_high, 4),

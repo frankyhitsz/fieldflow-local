@@ -45,7 +45,12 @@ from backend.models import (
     TechnicianUpdate,
     WorkOrderStatus,
 )
-from backend.provenance import build_plan_manifest_payload, decision_build_sha
+from backend.provenance import (
+    build_plan_manifest_payload,
+    decision_build_sha,
+    decision_runtime_manifest,
+    release_manifest,
+)
 from backend.scheduler import baseline_schedule, calculate_kpis
 from backend.storage import Store
 from backend.travel import EuclideanTravelTimeProvider
@@ -415,15 +420,31 @@ def test_build_sha_is_part_of_canonical_decision_input_hash(monkeypatch):
     plan = _plan()
     provider = EuclideanTravelTimeProvider()
     context = DecisionAnalysisContext(analysis_scope=DecisionAnalysisScope.ex_ante_frozen_plan)
-    monkeypatch.setenv("FIELDFLOW_BUILD_SHA", "commit-a")
+    monkeypatch.setenv("FIELDFLOW_DECISION_BUILD_SHA", "decision-a")
     decision_build_sha.cache_clear()
     first = canonical_decision_input_hash(plan, "COST", {"policy": "same"}, context, provider)
-    monkeypatch.setenv("FIELDFLOW_BUILD_SHA", "commit-b")
+    monkeypatch.setenv("FIELDFLOW_DECISION_BUILD_SHA", "decision-b")
     decision_build_sha.cache_clear()
     second = canonical_decision_input_hash(plan, "COST", {"policy": "same"}, context, provider)
-    monkeypatch.delenv("FIELDFLOW_BUILD_SHA")
+    monkeypatch.delenv("FIELDFLOW_DECISION_BUILD_SHA")
     decision_build_sha.cache_clear()
     assert first != second
+
+
+def test_release_sha_does_not_change_decision_runtime_identity(monkeypatch):
+    monkeypatch.setenv("FIELDFLOW_RELEASE_SHA", "docs-only-release-a")
+    decision_runtime_manifest.cache_clear()
+    release_manifest.cache_clear()
+    first_runtime = content_hash(decision_runtime_manifest())
+    first_release = content_hash(release_manifest())
+    monkeypatch.setenv("FIELDFLOW_RELEASE_SHA", "docs-only-release-b")
+    decision_runtime_manifest.cache_clear()
+    release_manifest.cache_clear()
+    assert content_hash(decision_runtime_manifest()) == first_runtime
+    assert content_hash(release_manifest()) != first_release
+    monkeypatch.delenv("FIELDFLOW_RELEASE_SHA")
+    decision_runtime_manifest.cache_clear()
+    release_manifest.cache_clear()
 
 
 def test_analysis_scope_is_part_of_canonical_input_hash():
@@ -851,7 +872,221 @@ def test_emergency_demand_is_included_in_all_demand_sla_population():
     assert any(metric.all_demand_sla_rate != metric.published_commitment_sla_rate for metric in result.trial_metrics)
 
 
-def test_emergency_dispatch_uses_realized_travel_checkpoint_for_selection_and_execution():
+def test_no_emergency_event_returns_not_applicable_conditional_metrics():
+    result = simulate_plan_risk(
+        _plan(),
+        RiskSimulationRequest(seed=37, trials=50, emergency_order_basis_points=0),
+    )
+    assert result.emergency_event_count == 0
+    assert result.emergency_completion_rate is None
+    assert result.emergency_on_time_rate is None
+    assert result.emergency_unserved_probability is None
+    assert all(not metric.emergency_event for metric in result.trial_metrics)
+
+
+def _assert_post_decision_draw_does_not_change_responder(monkeypatch, event_type: str) -> None:
+    import backend.decision as decision_module
+
+    plan = _plan()
+    request = RiskSimulationRequest(
+        seed=83,
+        trials=50,
+        emergency_order_basis_points=10_000,
+        technician_absence_basis_points=0,
+        customer_no_show_basis_points=5_000,
+        travel_delay_max_percent=100,
+        service_duration_jitter_percent=100,
+    )
+    original = decision_module._keyed_draw
+    baseline = simulate_plan_risk(plan, request)
+    future_orders: dict[int, set[str]] = {}
+    future_return_technicians: dict[int, set[str]] = {}
+    for metric in baseline.trial_metrics:
+        evidence = metric.emergency_decision_information_set
+        assert evidence is not None
+        future_orders[metric.trial] = {
+            item.work_order_id for item in plan.selected.assignments if item.start_time > evidence.decision_time
+        }
+        future_return_technicians[metric.trial] = {
+            technician.id
+            for technician in plan.scenario_snapshot.technicians
+            if max(
+                (item.finish_time for item in plan.selected.assignments if item.technician_id == technician.id),
+                default=technician.shift_start,
+            )
+            > evidence.decision_time
+        }
+
+    def changed_future_draw(seed, trial, draw_type, *entity_ids, modulo):
+        if draw_type == event_type:
+            if draw_type in {"service_duration", "no_show"} and entity_ids:
+                if str(entity_ids[0]) in future_orders[trial]:
+                    return 0 if draw_type == "no_show" else modulo - 1
+            if draw_type == "return_travel" and len(entity_ids) > 1:
+                technician_id = str(entity_ids[1]).removeprefix("DEPOT:")
+                if technician_id in future_return_technicians[trial]:
+                    return modulo - 1
+        return original(seed, trial, draw_type, *entity_ids, modulo=modulo)
+
+    monkeypatch.setattr(decision_module, "_keyed_draw", changed_future_draw)
+    changed = simulate_plan_risk(plan, request)
+    assert [item.emergency_technician_id for item in changed.trial_metrics] == [
+        item.emergency_technician_id for item in baseline.trial_metrics
+    ]
+
+
+def test_future_service_jitter_does_not_change_responder(monkeypatch):
+    _assert_post_decision_draw_does_not_change_responder(monkeypatch, "service_duration")
+
+
+def test_future_no_show_does_not_change_responder(monkeypatch):
+    _assert_post_decision_draw_does_not_change_responder(monkeypatch, "no_show")
+
+
+def test_future_return_delay_does_not_change_responder(monkeypatch):
+    _assert_post_decision_draw_does_not_change_responder(monkeypatch, "return_travel")
+
+
+def test_in_progress_service_future_duration_does_not_change_responder(monkeypatch):
+    import backend.decision as decision_module
+
+    plan = _plan()
+    assert plan.scenario_snapshot is not None
+    request = RiskSimulationRequest(
+        seed=31,
+        trials=50,
+        emergency_order_basis_points=10_000,
+        technician_absence_basis_points=0,
+        customer_no_show_basis_points=0,
+        travel_delay_max_percent=0,
+        service_duration_jitter_percent=100,
+    )
+    manifest = build_simulation_scenario_set(plan.scenario_snapshot, request, request.seed or 31)
+    events = {int(item["trial"]): int(item["event_time"]) for item in manifest["emergency_events"]}
+    active_by_trial = {
+        trial: {
+            assignment.work_order_id
+            for assignment in plan.selected.assignments
+            if assignment.start_time <= event_time < assignment.finish_time
+        }
+        for trial, event_time in events.items()
+    }
+    original = decision_module._keyed_draw
+
+    def run_with_active_duration(draw_value: int):
+        def controlled(seed, trial, draw_type, *entity_ids, modulo):
+            if (
+                draw_type == "service_duration"
+                and entity_ids
+                and str(entity_ids[0]) in active_by_trial.get(trial, set())
+            ):
+                return min(draw_value, modulo - 1)
+            return original(seed, trial, draw_type, *entity_ids, modulo=modulo)
+
+        monkeypatch.setattr(decision_module, "_keyed_draw", controlled)
+        return simulate_plan_risk(plan, request)
+
+    normal_duration = run_with_active_duration(100)
+    long_duration = run_with_active_duration(200)
+    assert any(active_by_trial.values())
+    assert [item.emergency_technician_id for item in normal_duration.trial_metrics] == [
+        item.emergency_technician_id for item in long_duration.trial_metrics
+    ]
+
+
+def test_observed_pre_event_delay_can_change_responder(monkeypatch):
+    import backend.decision as decision_module
+
+    plan = _plan()
+    request = RiskSimulationRequest(
+        seed=23,
+        trials=50,
+        emergency_order_basis_points=10_000,
+        technician_absence_basis_points=0,
+        customer_no_show_basis_points=0,
+        travel_delay_max_percent=100,
+        service_duration_jitter_percent=0,
+    )
+    original = decision_module._keyed_draw
+
+    def run_with_travel_delay(draw_value: int):
+        def controlled(seed, trial, draw_type, *entity_ids, modulo):
+            if draw_type == "travel":
+                return min(draw_value, modulo - 1)
+            return original(seed, trial, draw_type, *entity_ids, modulo=modulo)
+
+        monkeypatch.setattr(decision_module, "_keyed_draw", controlled)
+        return simulate_plan_risk(plan, request)
+
+    no_delay = run_with_travel_delay(0)
+    maximum_delay = run_with_travel_delay(100)
+    assert any(
+        before.emergency_technician_id != after.emergency_technician_id
+        for before, after in zip(no_delay.trial_metrics, maximum_delay.trial_metrics, strict=True)
+    )
+
+
+def test_responder_selection_uses_only_event_information_set():
+    result = simulate_plan_risk(
+        _plan(),
+        RiskSimulationRequest(
+            seed=29,
+            trials=50,
+            emergency_order_basis_points=10_000,
+            technician_absence_basis_points=0,
+        ),
+    )
+    for metric in result.trial_metrics:
+        evidence = metric.emergency_decision_information_set
+        assert evidence is not None
+        assert evidence.policy_version == "FIELD_SERVICE_EMERGENCY_INFORMATION_SET_V1"
+        assert evidence.selection_policy.value == "MYOPIC_EARLIEST_EMERGENCY_FINISH"
+        assert evidence.candidate_technician_ids
+        assert evidence.selected_technician_id == metric.emergency_technician_id
+        assert evidence.dispatch_time == metric.emergency_dispatch_time
+        if evidence.selected_technician_id:
+            assert evidence.selected_technician_id not in evidence.excluded_candidate_reasons
+            assert evidence.selected_technician_id in evidence.deterministic_finish_by_technician
+
+
+def test_emergency_during_service_waits_until_completion():
+    plan = _plan()
+    assert plan.scenario_snapshot is not None
+    request = RiskSimulationRequest(
+        seed=31,
+        trials=50,
+        emergency_order_basis_points=10_000,
+        technician_absence_basis_points=0,
+        customer_no_show_basis_points=0,
+        travel_delay_max_percent=0,
+        service_duration_jitter_percent=0,
+    )
+    manifest = build_simulation_scenario_set(plan.scenario_snapshot, request, 31)
+    events = {item["trial"]: item for item in manifest["emergency_events"]}
+    result = simulate_plan_risk(plan, request)
+    checked = False
+    for metric in result.trial_metrics:
+        if not metric.emergency_technician_id:
+            continue
+        event = events[metric.trial]
+        active = next(
+            (
+                item
+                for item in plan.selected.assignments
+                if item.technician_id == metric.emergency_technician_id
+                and item.start_time <= event["event_time"] < item.finish_time
+            ),
+            None,
+        )
+        if active:
+            assert metric.emergency_dispatch_time is not None
+            assert metric.emergency_dispatch_time >= active.finish_time
+            checked = True
+            break
+    assert checked
+
+
+def test_emergency_during_travel_reaches_next_checkpoint():
     plan = _plan()
     assert plan.scenario_snapshot is not None
     for technician in plan.scenario_snapshot.technicians:
@@ -1268,7 +1503,8 @@ def test_legacy_plan_is_view_only_until_reattestation_creates_a_new_version(monk
         assert new_plan["source_version_id"] == legacy["id"]
         assert new_plan["effective_integrity"] == "VERIFIED"
         assert new_plan["schedule_integrity"] == "VERIFIED"
-        assert new_plan["source_solver_provenance"] == legacy["selected"]["solver_name"]
+        assert new_plan["source_solver_provenance"]["claimed_solver_name"] == legacy["selected"]["solver_name"]
+        assert new_plan["source_solver_provenance"]["integrity"] == "LEGACY_UNATTESTED"
         assert new_plan["inherited_source_solver_policy"] is not None
         assert new_plan["replay_validation_policy"] == "FIELD_SERVICE_REATTESTATION_V1"
         assert new_plan["reattestation_mode"] == "EXACT_SNAPSHOT"
@@ -1301,6 +1537,7 @@ def test_planning_equivalent_reattestation_ignores_metadata_but_exact_mode_does_
         edited = client.put(
             "/api/scenarios/main/work-orders/WO-1021",
             json={"title": "只修改客户可见标题"},
+            headers={"If-Match": "D0"},
         )
         assert edited.status_code == 200
         exact = client.post(
@@ -1324,6 +1561,42 @@ def test_planning_equivalent_reattestation_ignores_metadata_but_exact_mode_does_
         assert equivalent.status_code == 200, equivalent.text
         assert equivalent.json()["reattestation_mode"] == "PLANNING_EQUIVALENT"
         assert equivalent.json()["scenario_snapshot"]["work_orders"][0]["title"] == "只修改客户可见标题"
+
+
+def test_planning_equivalent_reattestation_ignores_unused_capacity_addition(monkeypatch, tmp_path):
+    database = tmp_path / "planning-equivalent-unused-tech.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        legacy = client.get("/api/scenarios/main/plan-versions").json()[0]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP TRIGGER prevent_plan_attestation_change")
+            connection.execute(
+                "UPDATE plan_versions SET attestation_requirement='LEGACY_MIGRATED' WHERE id=?",
+                (legacy["id"],),
+            )
+        template = client.get("/api/scenarios/main").json()["technicians"][0]
+        added = client.post(
+            "/api/v2/scenarios/main/technicians",
+            headers={"If-Match": "D0"},
+            json={**template, "id": "TECH-UNUSED-REATTEST", "name": "未参与历史路线"},
+        )
+        assert added.status_code == 200
+        reattested = client.post(
+            f"/api/scenarios/main/plan-versions/{legacy['id']}/reattest",
+            json={
+                "expected_revision": 1,
+                "idempotency_key": "reattest-unused-tech-001",
+                "mode": "PLANNING_EQUIVALENT",
+            },
+        )
+        assert reattested.status_code == 200, reattested.text
+        assert any(
+            item["id"] == "TECH-UNUSED-REATTEST" for item in reattested.json()["scenario_snapshot"]["technicians"]
+        )
 
 
 def test_analysis_run_request_is_discriminated_and_rejects_silent_overrides(monkeypatch, tmp_path):
@@ -1701,8 +1974,21 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
             "paired_disruption_delta",
         ):
             summary = body[field]
-            assert summary["win_count"] + summary["tie_count"] + summary["loss_count"] == 50
+            observed = summary["win_count"] + summary["tie_count"] + summary["loss_count"]
+            assert observed == summary["effective_sample_count"]
+            if "emergency" in field:
+                assert 0 < observed <= 50
+                assert summary["conditioning_event"] == "EMERGENCY_EVENT_OCCURRED"
+                if observed < 20:
+                    assert summary["interpretation_status"] == "INSUFFICIENT_EVENT_TRIALS"
+                    assert summary["interval_method"] == "NOT_ESTIMATED"
+                    assert summary["mean_delta"] is summary["ci_low"] is summary["ci_high"] is None
+                    continue
+            else:
+                assert observed == 50
+            assert summary["interpretation_status"] == "ESTIMATED"
             assert summary["ci_low"] <= summary["mean_delta"] <= summary["ci_high"]
+        assert body["result"]["paired_unconditional_emergency_completion_impact"]["effective_sample_count"] == 50
         assert body["result"]["paired_published_sla_delta"] == body["paired_sla_delta"]
         stored = client.get(f"/api/scenarios/main/risk-comparisons/{body['id']}")
         assert stored.status_code == 200
@@ -2096,7 +2382,7 @@ def test_malformed_artifact_is_structured_and_invalidates_parent(monkeypatch, tm
         detail = client.get(f"/api/scenarios/main/analysis-runs/{run['id']}/artifacts/{artifact['id']}")
         assert parent["integrity_status"] == "FAILED" and parent["result"] is None
         assert detail.status_code == 409
-        assert detail.json()["detail"]["code"] == "MALFORMED_ATTESTED_RECORD"
+        assert detail.json()["detail"]["code"] == "RECORD_INTEGRITY_FAILED"
 
 
 def test_failed_error_payload_is_attested(monkeypatch, tmp_path):
@@ -2272,6 +2558,40 @@ def test_replan_cost_capacity_and_risk_share_publication_remaining_scope(monkeyp
             paid_shift["result"]["breakdown"]["full_day_committed_labor_cost_cents"]
             >= paid_shift["result"]["breakdown"]["remaining_incremental_labor_cost_cents"]
         )
+        fixed_only_capacity = client.post(
+            endpoint,
+            json={
+                "analysis_type": "CAPACITY",
+                "request": {
+                    "option_ids": ["add_technician"],
+                    "cost_policy": {"labor_cost_mode": "PAID_SHIFT"},
+                    "capacity_policy": {"add_technician_cost_mode": "FIXED_ONLY"},
+                    "candidate_technician": {
+                        "name": "固定成本候选",
+                        "skills": ["electrical", "hvac", "network"],
+                        "shift_start": 480,
+                        "shift_end": 1020,
+                        "start_location": {"x": 50, "y": 50},
+                        "overtime_limit": 60,
+                        "cost_per_minute_cents": 100,
+                    },
+                },
+            },
+        ).json()
+        assert fixed_only_capacity["status"] == "COMPLETED"
+        option = fixed_only_capacity["result"]["options"][0]
+        cost = option["counterfactual_cost"]
+        candidate_id = option["changed_inputs"]["candidate_technician_id"]
+        assert all(value >= 0 for key, value in cost.items() if key.endswith("_cents") and isinstance(value, int))
+        assert cost["technician_cost_cents"].get(candidate_id, 0) == 0
+        assert all(item["source_id"] != candidate_id for item in cost["ledger"]["components"])
+        assert cost["cash_operating_cost_cents"] == (
+            cost["regular_labor_cost_cents"]
+            + cost["overtime_base_cost_cents"]
+            + cost["overtime_premium_cost_cents"]
+            + cost["travel_cost_cents"]
+            + cost["outsourcing_cost_cents"]
+        )
         for analysis_type in ("COST", "CAPACITY"):
             multi_day = client.post(
                 endpoint,
@@ -2362,7 +2682,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -2416,7 +2736,7 @@ def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
 
 
 def test_v14_retry_schema_migration_preserves_analysis_artifacts(monkeypatch, tmp_path):

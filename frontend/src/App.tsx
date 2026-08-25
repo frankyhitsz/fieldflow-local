@@ -189,7 +189,7 @@ function Timeline({ scenario, schedule, onSelect, currentTime }: { scenario: Sce
   </section>
 }
 
-function ExplanationPanel({ scenario, schedule, orderId, readOnly = false, onClose, onLock, onEdit, onAssign, onExecute }: { scenario: Scenario; schedule?: Schedule; orderId: string; readOnly?: boolean; onClose: () => void; onLock: (assignment: Assignment, locked: boolean) => void; onEdit: (order: WorkOrder) => void; onAssign: (orderId: string, technicianId: string) => void; onExecute: (assignment: Assignment, action: 'start' | 'complete') => void }) {
+function ExplanationPanel({ scenario, schedule, orderId, readOnly = false, invalidAssignment = false, onClose, onLock, onEdit, onAssign, onExecute }: { scenario: Scenario; schedule?: Schedule; orderId: string; readOnly?: boolean; invalidAssignment?: boolean; onClose: () => void; onLock: (assignment: Assignment, locked: boolean) => void; onEdit: (order: WorkOrder) => void; onAssign: (orderId: string, technicianId: string) => void; onExecute: (assignment: Assignment, action: 'start' | 'complete') => void }) {
   const order = scenario.work_orders.find(o => o.id === orderId)
   const assignment = schedule?.assignments.find(a => a.work_order_id === orderId)
   const unassigned = schedule?.unassigned.find(u => u.work_order_id === orderId)
@@ -200,15 +200,16 @@ function ExplanationPanel({ scenario, schedule, orderId, readOnly = false, onClo
   return <aside className="detail-drawer" aria-label="工单详情">
     <div className="drawer-top"><div><span className={`priority ${order.priority}`}>{priorityLabel[order.priority]}</span>{order.is_emergency && <span className="emergency-tag">突发</span>}<span className="mono">{order.id}</span></div><div>{!readOnly && <button className="icon-btn" onClick={() => onEdit(order)} aria-label="编辑工单"><Edit3 size={16} /></button>}<button className="icon-btn" onClick={onClose} aria-label="关闭工单详情"><X size={18} /></button></div></div>
     {readOnly && <div className="readonly-note">这是只读历史。如需使用，请回到版本页恢复。</div>}
+    {invalidAssignment && <div className="readonly-note">这项分配所依据的业务条件已变化，开始服务前必须局部重排。</div>}
     <h2>{order.customer_name}</h2><p className="detail-title">{order.title}</p><span className={`execution-status ${order.status}`}>{{ pending: '待处理', started: '服务中', completed: '已完成' }[order.status]}</span>
     <div className="detail-grid"><div><small>允许开始窗口</small><strong>{hhmm(order.window_start)}–{hhmm(order.window_end)}</strong></div><div><small>SLA 截止</small><strong className={assignment?.sla_late_minutes ? 'danger' : ''}>{hhmm(order.sla_deadline)}</strong></div><div><small>服务时长</small><strong>{order.service_duration} 分钟</strong></div><div><small>所需技能</small><strong>{order.required_skills.map(s => skillLabel[s]).join('、')}</strong></div></div>
     {assignment ? <>
       <div className="assignment-summary"><div className="tech-avatar" style={{ '--tech': tech?.color } as React.CSSProperties}>{tech?.name.slice(-1)}</div><div><small>当前分配</small><strong>{tech?.name} · {hhmm(assignment.start_time)} 到场</strong></div><span>{assignment.travel_minutes}′ 行程</span></div>
       <div className="explain"><h3><Sparkles size={15} />安排原因</h3><ol>{assignment.explanation.map((line, i) => <li key={i}><span>{i + 1}</span>{line}</li>)}</ol></div>
-      {!readOnly && order.status === 'pending' && <div className="execution-actions"><button className={`lock-action ${assignment.locked ? 'locked' : ''}`} onClick={() => onLock(assignment, !assignment.locked)}>{assignment.locked ? <Unlock size={16} /> : <Lock size={16} />}{assignment.locked ? '解除人工锁定' : '锁定此工单与技师'}</button><button className="start-action" onClick={() => onExecute(assignment, 'start')}><Clock3 size={16} />开始服务</button></div>}
+      {!readOnly && order.status === 'pending' && <div className="execution-actions"><button disabled={invalidAssignment} className={`lock-action ${assignment.locked ? 'locked' : ''}`} onClick={() => onLock(assignment, !assignment.locked)}>{assignment.locked ? <Unlock size={16} /> : <Lock size={16} />}{assignment.locked ? '解除人工锁定' : '锁定此工单与技师'}</button><button disabled={invalidAssignment} className="start-action" onClick={() => onExecute(assignment, 'start')}><Clock3 size={16} />{invalidAssignment ? '分配已失效' : '开始服务'}</button></div>}
       {!readOnly && order.status === 'started' && <button className="complete-action" onClick={() => onExecute(assignment, 'complete')}><Check size={16} />完成服务</button>}
     </> : <UnassignedDetail item={unassigned} candidates={candidates} />}
-    {!readOnly && order.status === 'pending' && candidates.length > 0 && <div className="manual-assign"><label>手工改派</label><div><select value={manualTech} onChange={e => setManualTech(e.target.value)}>{candidates.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.skills.map(skill => skillLabel[skill]).join('、')}</option>)}</select><button disabled={!manualTech || manualTech === assignment?.technician_id} onClick={() => onAssign(order.id, manualTech)}>改派并锁定</button></div><small>保存后会局部重排未开始工单，已执行安排不变。</small></div>}
+    {!readOnly && order.status === 'pending' && candidates.length > 0 && <div className="manual-assign"><label>手工改派</label><div><select value={manualTech} onChange={e => setManualTech(e.target.value)}>{candidates.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.skills.map(skill => skillLabel[skill]).join('、')}</option>)}</select><button disabled={!manualTech || (!invalidAssignment && manualTech === assignment?.technician_id)} onClick={() => onAssign(order.id, manualTech)}>改派并锁定</button></div><small>保存后会局部重排未开始工单，已执行安排不变。</small></div>}
     {order.note && <div className="order-note"><b>现场备注</b>{order.note}</div>}
   </aside>
 }
@@ -367,6 +368,12 @@ export default function App() {
   const activePlan = plans.find(item => item.active)
   const displayingActivePlan = !historicalScenario && !!schedule && activePlan?.selected.id === schedule.id
   const partialCoverage = displayingActivePlan && activePlan?.applicability.coverage_complete === false
+  const plannedWorkOrderIds = new Set([
+    ...(activePlan?.selected.assignments.map(item => item.work_order_id) || []),
+    ...(activePlan?.selected.unassigned.map(item => item.work_order_id) || []),
+  ])
+  const uncoveredDemand = scenario.work_orders.filter(order => order.status !== 'completed' && !plannedWorkOrderIds.has(order.id))
+  const uncoveredEmergency = uncoveredDemand.some(order => order.is_emergency)
   const routeInvalidated = displayingActivePlan && activePlan?.applicability.route_executable === false
   const reoptimizationAvailable = displayingActivePlan && activePlan?.applicability.reoptimization_opportunity === true
   const metricsOutdated = displayingActivePlan && activePlan?.applicability.metrics_current === false
@@ -516,7 +523,7 @@ export default function App() {
       {working && <div className="working"><RefreshCw size={14} />{working}</div>}
     </section>
     {!schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务数据已修改，现有方案不再适用</strong><span>生成基线或推荐方案后再开始派单。</span></div></div>}
-    {partialCoverage && schedule && <div className="stale-banner partial"><AlertTriangle size={16} /><div><strong>突发工单已保存，最后发布方案尚未覆盖全部需求</strong><span>V{String(schedule.version).padStart(3, '0')} 仍保留原承诺；请处理未计划工单后重新重排。</span></div></div>}
+    {partialCoverage && schedule && <div className="stale-banner partial"><AlertTriangle size={16} /><div><strong>{uncoveredEmergency ? '紧急需求已保存，最后发布方案尚未覆盖' : '新增需求尚未进入最后发布方案'}</strong><span>V{String(schedule.version).padStart(3, '0')} 的原有承诺仍可查看；当前有 {uncoveredDemand.length} 张新工单待排，请尽快局部重排。</span></div></div>}
     {routeInvalidated && schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务变更影响了已发布路线</strong><span>V{String(schedule.version).padStart(3, '0')} 仅保留用于核对；请先局部重排再继续派单。</span></div></div>}
     {reoptimizationAvailable && !partialCoverage && schedule && <div className="stale-banner partial"><WandSparkles size={16} /><div><strong>新增技师容量可用于优化</strong><span>现有路线仍可执行；重新优化后才能把新增容量纳入方案和指标。</span></div></div>}
     {metricsOutdated && !partialCoverage && !routeInvalidated && !reoptimizationAvailable && schedule && <div className="stale-banner partial"><CalendarDays size={16} /><div><strong>现有路线仍可执行，展示指标已过期</strong><span>业务目标、成本或未分配需求发生变化；请重新优化以更新指标。</span></div></div>}
@@ -593,7 +600,7 @@ export default function App() {
       {view === 'lab' && <StrategyLab key={scenario.id} scenario={scenario} profiles={profiles} loadingDataset={!!loadingScenarioId} onSelectDataset={id => { void loadScenario(id); setView('lab') }} onReloadProfiles={async () => setProfiles(await api.strategyProfiles())} onPublished={async plan => { if (activeScenarioId.current !== plan.scenario_id) return; const [fresh, planItems] = await Promise.all([api.scenario(plan.scenario_id), api.planVersions(plan.scenario_id)]); if (activeScenarioId.current !== plan.scenario_id) return; setScenario(fresh); setPlans(planItems); setSchedule(plan.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch') }} onToast={setToast} />}
       {view === 'review' && <ReviewView key={(plans.find(item => item.selected.id === schedule?.id) || activePlan)?.id} scenarioId={scenario.id} planVersionId={(plans.find(item => item.selected.id === schedule?.id) || activePlan)?.id} schedule={schedule} baseline={baseline} />}
     </main>
-    {selected && <ExplanationPanel key={`${selected.id}:${schedule?.id || 'unscheduled'}`} scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
+    {selected && <ExplanationPanel key={`${selected.id}:${schedule?.id || 'unscheduled'}`} scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} invalidAssignment={!!activePlan?.applicability.invalid_assignment_ids.includes(selected.id)} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
       setWorking('正在改派并局部重排')
       try {
         const result = await api.manualReassignment(scenario.id, orderId, technicianId, replanTime, scenario.revision, commandKey('manual-reassignment'))

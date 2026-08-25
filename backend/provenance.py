@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .hashing import HASH_SCHEMA_VERSION, content_hash
-from .models import DecisionAnalysisContext, DecisionInputManifest, PlanVersion, RuntimeManifest
+from .models import DecisionAnalysisContext, DecisionInputManifest, PlanVersion, ReleaseManifest, RuntimeManifest
 
 DECISION_ALGORITHM_VERSION = "FIELD_SERVICE_DECISION_V3"
 
@@ -65,7 +65,7 @@ def build_plan_manifest_payload(plan: PlanVersion) -> dict[str, object]:
 
 @lru_cache(maxsize=1)
 def decision_build_sha() -> str:
-    injected = os.getenv("FIELDFLOW_BUILD_SHA", "").strip()
+    injected = os.getenv("FIELDFLOW_DECISION_BUILD_SHA", "").strip()
     if injected:
         return injected
     backend_root = Path(__file__).resolve().parent
@@ -90,7 +90,7 @@ def _package_version(name: str) -> str:
 def decision_runtime_manifest() -> RuntimeManifest:
     root = Path(__file__).resolve().parent.parent
     lock_inputs: list[dict[str, str]] = []
-    for relative in ("pyproject.toml", "requirements.txt", "frontend/package-lock.json"):
+    for relative in ("pyproject.toml",):
         path = root / relative
         if path.exists():
             lock_inputs.append({"path": relative, "content": path.read_text(encoding="utf-8")})
@@ -104,6 +104,18 @@ def decision_runtime_manifest() -> RuntimeManifest:
         architecture=platform.machine() or "unknown",
         build_sha=decision_build_sha(),
         dependency_lock_hash=content_hash(lock_inputs),
+    )
+
+
+@lru_cache(maxsize=1)
+def release_manifest() -> ReleaseManifest:
+    root = Path(__file__).resolve().parent.parent
+    frontend_lock = root / "frontend" / "package-lock.json"
+    return ReleaseManifest(
+        release_build_sha=os.getenv("FIELDFLOW_RELEASE_SHA", "dev-unreleased").strip() or "dev-unreleased",
+        frontend_dependency_lock_hash=(
+            content_hash(frontend_lock.read_text(encoding="utf-8")) if frontend_lock.exists() else "missing"
+        ),
     )
 
 

@@ -139,7 +139,14 @@ class EmergencyDispatchPolicy(str, Enum):
 
 
 class EmergencyResponderSelectionPolicy(str, Enum):
-    earliest_feasible_completion = "EARLIEST_FEASIBLE_COMPLETION"
+    myopic_earliest_emergency_finish = "MYOPIC_EARLIEST_EMERGENCY_FINISH"
+
+    @classmethod
+    def _missing_(cls, value: object) -> EmergencyResponderSelectionPolicy | None:
+        # Read compatibility for v0.5.7 requests and persisted scenario sets.
+        if value == "EARLIEST_FEASIBLE_COMPLETION":
+            return cls.myopic_earliest_emergency_finish
+        return None
 
 
 class AnalysisIntegrityStatus(str, Enum):
@@ -198,6 +205,15 @@ class AdditionalTechnicianCostMode(str, Enum):
     wage_only = "WAGE_ONLY"
     fixed_only = "FIXED_ONLY"
     wage_plus_fixed = "WAGE_PLUS_FIXED"
+
+
+class TechnicianCostSource(BaseModel):
+    """Source rules applied while calculating one technician's labor components."""
+
+    include_regular_wage: bool = True
+    include_overtime_base: bool = True
+    include_overtime_premium: bool = True
+    source: Literal["COST_POLICY", "CAPACITY_FIXED_ONLY"] = "COST_POLICY"
 
 
 class FreezeReason(str, Enum):
@@ -279,6 +295,40 @@ class WorkOrder(BaseModel):
             raise ValueError("emergency work order requires reported_at")
         self.required_skills = list(dict.fromkeys(self.required_skills))
         return self
+
+
+class WorkOrderCreate(BaseModel):
+    """Public create command; execution state is intentionally not client-controlled."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Identifier
+    customer_name: DisplayName
+    title: DisplayName
+    required_skills: list[Skill]
+    location: Point
+    service_duration: int = Field(gt=0, le=480)
+    window_start: int = Field(ge=0, le=1800)
+    window_end: int = Field(ge=0, le=1800)
+    sla_deadline: int = Field(ge=0, le=1800)
+    priority: Priority = Priority.normal
+    drop_penalty: int = Field(default=1200, gt=0)
+    vip: bool = False
+    is_emergency: bool = False
+    reported_at: int | None = Field(default=None, ge=0, le=1800)
+    note: ShortDescription = ""
+
+    @model_validator(mode="after")
+    def validate_as_pending_work_order(self) -> WorkOrderCreate:
+        WorkOrder.model_validate({**self.model_dump(mode="python"), "status": WorkOrderStatus.pending})
+        return self
+
+    def to_work_order(self) -> WorkOrder:
+        return WorkOrder.model_validate({**self.model_dump(mode="python"), "status": WorkOrderStatus.pending})
+
+
+class EmergencyWorkOrderCreate(WorkOrderCreate):
+    is_emergency: Literal[True] = True
 
 
 class LockedAssignment(BaseModel):
@@ -516,7 +566,7 @@ class OptimizeRequest(BaseModel):
 
 
 class ReplanRequest(BaseModel):
-    emergency_order: WorkOrder | None = None
+    emergency_order: EmergencyWorkOrderCreate | None = None
     current_time: int | None = Field(default=None, ge=0, le=1800)
     planning_time: int | None = Field(default=None, ge=0, le=1800)
     time_limit_seconds: float | None = Field(default=None, ge=1, le=30)
@@ -540,6 +590,8 @@ class ReplanRequest(BaseModel):
 
 
 class WorkOrderUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     customer_name: DisplayName | None = None
     title: DisplayName | None = None
     required_skills: list[Skill] | None = Field(default=None, min_length=1)
@@ -550,7 +602,6 @@ class WorkOrderUpdate(BaseModel):
     sla_deadline: int | None = Field(default=None, ge=0, le=1800)
     priority: Priority | None = None
     drop_penalty: int | None = Field(default=None, gt=0)
-    status: WorkOrderStatus | None = None
     vip: bool | None = None
     is_emergency: bool | None = None
     reported_at: int | None = Field(default=None, ge=0, le=1800)
@@ -602,6 +653,7 @@ class WorkOrderExecutionEvent(BaseModel):
     early_start_override_reason: str | None = None
     estimated_remaining_minutes: int | None = Field(default=None, ge=1, le=480)
     note: str = ""
+    event_content_hash: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -717,6 +769,13 @@ class PublicationVerificationArtifact(BaseModel):
     artifact_hash: str
 
 
+class SourceSolverProvenance(BaseModel):
+    claimed_solver_name: str | None = None
+    claimed_solver_version: str | None = None
+    claimed_policy_snapshot: SolverPolicySnapshot | None = None
+    integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+
+
 class PlanVersion(BaseModel):
     id: str
     scenario_id: str
@@ -760,7 +819,7 @@ class PlanVersion(BaseModel):
     self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     schedule_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
-    source_solver_provenance: str | None = None
+    source_solver_provenance: SourceSolverProvenance | None = None
     inherited_source_solver_policy: SolverPolicySnapshot | None = None
     replay_validation_policy: str | None = None
     reattestation_mode: ReattestationMode | None = None
@@ -771,6 +830,12 @@ class PlanVersion(BaseModel):
         if not isinstance(value, dict):
             return value
         migrated = dict(value)
+        source_provenance = migrated.get("source_solver_provenance")
+        if isinstance(source_provenance, str):
+            migrated["source_solver_provenance"] = {
+                "claimed_solver_name": source_provenance,
+                "integrity": AnalysisIntegrityStatus.legacy_unattested.value,
+            }
         status = migrated.get("integrity_status", AnalysisIntegrityStatus.legacy_unattested.value)
         migrated.setdefault("self_integrity", status)
         migrated.setdefault("effective_integrity", status)
@@ -1011,6 +1076,28 @@ class SkillInvestmentTarget(BaseModel):
     skill: Skill
 
 
+class CostComponentKind(str, Enum):
+    regular_labor = "REGULAR_LABOR"
+    overtime_base = "OVERTIME_BASE"
+    overtime_premium = "OVERTIME_PREMIUM"
+    travel = "TRAVEL"
+    outsourcing = "OUTSOURCING"
+    sla_penalty = "SLA_PENALTY"
+    unserved_revenue = "UNSERVED_REVENUE"
+
+
+class CostComponent(BaseModel):
+    component: CostComponentKind
+    source_id: str
+    amount_cents: int = Field(ge=0)
+    scope: DecisionAnalysisScope
+
+
+class CostLedger(BaseModel):
+    policy_version: str = "FIELD_SERVICE_COST_LEDGER_V1"
+    components: list[CostComponent] = Field(default_factory=list)
+
+
 class PlanCostBreakdown(BaseModel):
     regular_labor_cost_cents: int = Field(default=0, ge=0)
     overtime_base_cost_cents: int = Field(default=0, ge=0)
@@ -1033,6 +1120,7 @@ class PlanCostBreakdown(BaseModel):
     technician_cost_cents: dict[str, int] = Field(default_factory=dict)
     full_day_committed_labor_cost_cents: int = Field(default=0, ge=0)
     remaining_incremental_labor_cost_cents: int = Field(default=0, ge=0)
+    ledger: CostLedger | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1238,6 +1326,7 @@ class CapacityOptionResult(BaseModel):
     work_order_dispositions: list[WorkOrderDisposition] = Field(default_factory=list)
     counterfactual_kpis: CapacityCounterfactualKPI | None = None
     conditional_upper_bound_kpis: CapacityCounterfactualKPI | None = None
+    counterfactual_cost: PlanCostBreakdown | None = None
 
 
 class CapacityAnalysis(BaseModel):
@@ -1285,7 +1374,7 @@ class RiskSimulationParameters(BaseModel):
     execution_policy: RiskExecutionPolicy = RiskExecutionPolicy.follow_published_schedule
     emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
     emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
-        EmergencyResponderSelectionPolicy.earliest_feasible_completion
+        EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
     )
 
 
@@ -1308,10 +1397,10 @@ class RiskSimulationResult(BaseModel):
     execution_policy: RiskExecutionPolicy
     emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
     emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
-        EmergencyResponderSelectionPolicy.earliest_feasible_completion
+        EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
     )
     execution_policy_version: str = "FIELD_SERVICE_RISK_EXECUTION_V2"
-    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V4"
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V5"
     analysis_code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
@@ -1322,9 +1411,14 @@ class RiskSimulationResult(BaseModel):
     expected_sla_on_time_rate: float = Field(ge=0, le=1)
     published_commitment_sla_rate: float = Field(default=0, ge=0, le=1)
     all_demand_sla_rate: float = Field(default=0, ge=0, le=1)
-    emergency_completion_rate: float = Field(default=1, ge=0, le=1)
-    emergency_on_time_rate: float = Field(default=1, ge=0, le=1)
-    emergency_unserved_probability: float = Field(default=0, ge=0, le=1)
+    emergency_event_count: int = Field(default=0, ge=0)
+    emergency_completion_rate: float | None = Field(default=None, ge=0, le=1)
+    emergency_on_time_rate: float | None = Field(default=None, ge=0, le=1)
+    emergency_unserved_probability: float | None = Field(default=None, ge=0, le=1)
+    emergency_incremental_late_minutes: float | None = Field(default=None, ge=0)
+    emergency_incremental_overtime_minutes: float | None = Field(default=None, ge=0)
+    emergency_incremental_unserved_orders: float | None = Field(default=None, ge=0)
+    emergency_affected_work_order_count: float | None = Field(default=None, ge=0)
     monte_carlo_mean_ci_low: float = Field(default=0, ge=0, le=1)
     monte_carlo_mean_ci_high: float = Field(default=0, ge=0, le=1)
     sla_rate_ci_low: float = Field(ge=0, le=1)
@@ -1415,8 +1509,8 @@ class DecisionAnalysisContext(BaseModel):
     active_booking_ids: list[str] = Field(default_factory=list)
 
 
-class RuntimeManifest(BaseModel):
-    policy_version: str = "FIELD_SERVICE_RUNTIME_MANIFEST_V1"
+class DecisionRuntimeManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V1"
     hash_schema_version: str
     python_version: str
     ortools_version: str
@@ -1426,6 +1520,16 @@ class RuntimeManifest(BaseModel):
     architecture: str
     build_sha: str
     dependency_lock_hash: str
+
+
+# Read/source compatibility for integrations importing the v0.5.7 name.
+RuntimeManifest = DecisionRuntimeManifest
+
+
+class ReleaseManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_RELEASE_MANIFEST_V1"
+    release_build_sha: str
+    frontend_dependency_lock_hash: str
 
 
 class DecisionInputManifest(BaseModel):
@@ -1487,7 +1591,8 @@ class DecisionAnalysisRun(BaseModel):
     code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
-    runtime_manifest: RuntimeManifest | None = None
+    runtime_manifest: DecisionRuntimeManifest | None = None
+    release_manifest: ReleaseManifest | None = None
     input_hash: str
     input_manifest: DecisionInputManifest | None = None
     request_snapshot: dict[str, Any] = Field(default_factory=dict)
@@ -1569,6 +1674,24 @@ class SimulationEmergencyEvent(BaseModel):
     sla_deadline: int = Field(default=2280, ge=0, le=2760)
 
 
+class EmergencyDecisionInformationSet(BaseModel):
+    """Evidence available when the emergency responder decision is made."""
+
+    policy_version: str = "FIELD_SERVICE_EMERGENCY_INFORMATION_SET_V1"
+    selection_policy: EmergencyResponderSelectionPolicy = (
+        EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
+    )
+    event_time: int = Field(ge=0, le=2280)
+    decision_time: int = Field(ge=0, le=2760)
+    candidate_technician_ids: list[Identifier] = Field(default_factory=list)
+    excluded_candidate_reasons: dict[str, str] = Field(default_factory=dict)
+    selected_technician_id: Identifier | None = None
+    dispatch_time: int | None = Field(default=None, ge=0, le=2760)
+    dispatch_location: Point | None = None
+    deterministic_dispatch_by_technician: dict[str, int] = Field(default_factory=dict)
+    deterministic_finish_by_technician: dict[str, int] = Field(default_factory=dict)
+
+
 class RiskTrialMetric(BaseModel):
     trial: int = Field(ge=0)
     sla_on_time_rate: float = Field(ge=0, le=1)
@@ -1577,12 +1700,18 @@ class RiskTrialMetric(BaseModel):
     disrupted: bool
     published_commitment_sla_rate: float = Field(default=0, ge=0, le=1)
     all_demand_sla_rate: float = Field(default=0, ge=0, le=1)
+    emergency_event: bool = False
     emergency_completed: bool = False
     emergency_on_time: bool = False
     emergency_technician_id: Identifier | None = None
     emergency_dispatch_time: int | None = Field(default=None, ge=0, le=2760)
     emergency_finish_time: int | None = Field(default=None, ge=0, le=3240)
     emergency_dispatch_location: Point | None = None
+    emergency_decision_information_set: EmergencyDecisionInformationSet | None = None
+    emergency_incremental_late_minutes: int = Field(default=0, ge=0)
+    emergency_incremental_overtime_minutes: int = Field(default=0, ge=0)
+    emergency_incremental_unserved_orders: int = Field(default=0, ge=0)
+    emergency_affected_work_order_count: int = Field(default=0, ge=0)
 
 
 class RiskTrialOutcomeArtifact(BaseModel):
@@ -1606,11 +1735,11 @@ class SimulationScenarioSetArtifact(BaseModel):
     id: str
     scenario_id: str
     analysis_run_id: str
-    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V4"
+    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V5"
     keyed_random_version: str = "FIELD_SERVICE_KEYED_RANDOM_V1"
     emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
     emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
-        EmergencyResponderSelectionPolicy.earliest_feasible_completion
+        EmergencyResponderSelectionPolicy.myopic_earliest_emergency_finish
     )
     scenario_snapshot_hash: str
     seed: int
@@ -1633,19 +1762,24 @@ DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSe
 
 
 class PairedMetricSummary(BaseModel):
-    mean_delta: float
-    ci_low: float
-    ci_high: float
+    mean_delta: float | None = None
+    ci_low: float | None = None
+    ci_high: float | None = None
     win_count: int = Field(ge=0)
     tie_count: int = Field(ge=0)
     loss_count: int = Field(ge=0)
+    effective_sample_count: int = Field(default=0, ge=0)
+    conditioning_event: str | None = None
+    interval_method: str = "PAIRED_BOOTSTRAP_V1"
+    interpretation_status: Literal["ESTIMATED", "INSUFFICIENT_EVENT_TRIALS"] = "ESTIMATED"
 
 
 class RiskComparisonResult(BaseModel):
     paired_published_sla_delta: PairedMetricSummary
     paired_all_demand_sla_delta: PairedMetricSummary
-    paired_emergency_completion_delta: PairedMetricSummary
-    paired_emergency_on_time_delta: PairedMetricSummary
+    paired_emergency_completion_delta: PairedMetricSummary | None
+    paired_emergency_on_time_delta: PairedMetricSummary | None
+    paired_unconditional_emergency_completion_impact: PairedMetricSummary
     paired_overtime_delta: PairedMetricSummary
     paired_unserved_delta: PairedMetricSummary
     paired_disruption_delta: PairedMetricSummary

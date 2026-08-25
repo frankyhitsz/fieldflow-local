@@ -47,7 +47,7 @@ const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', descripti
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; existingFailed?: boolean } = {}) {
+function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; existingFailed?: boolean; noEmergency?: boolean } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const analysisRequest = url.endsWith('/analysis-runs') && init?.body ? JSON.parse(String(init.body)) as { analysis_type: 'COST' | 'CAPACITY' | 'RISK'; analysis_scope: string; request: { analysis_horizon?: { days: number } } } : undefined
@@ -60,7 +60,7 @@ function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; 
       : effectiveUrl.endsWith('/api/strategy-profiles') ? profiles
       : effectiveUrl.endsWith('/api/scenarios/strategy-medium') ? mediumScenario
       : effectiveUrl.endsWith('/cost-analysis') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', travel_model_fingerprint: 'travel', analysis_code_version: '0.5.3', analysis_input_hash: 'cost-input', analysis_horizon: { days, workdays_per_month: 22, currency: 'CNY' }, horizon_total_economic_impact_cents: breakdown.total_economic_impact_cents * days, policy: {}, policy_fingerprint: 'cost', assumptions: [], breakdown }
-      : effectiveUrl.endsWith('/risk-simulation') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', travel_model_fingerprint: 'travel', execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE', emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY', emergency_responder_selection_policy: 'EARLIEST_FEASIBLE_COMPLETION', execution_policy_version: 'V2', simulation_policy_version: 'V4', analysis_code_version: '0.5.7', simulation_input_hash: 'risk', simulation_scenario_set_hash: 'scenario-set', seed: 7, trials: 500, expected_sla_on_time_rate: .875, published_commitment_sla_rate: .875, all_demand_sla_rate: .84, monte_carlo_mean_ci_low: .85, monte_carlo_mean_ci_high: .9, sla_rate_ci_low: .85, sla_rate_ci_high: .9, full_day_total_late_minutes_p50: 10, full_day_total_late_minutes_p90: 28, full_day_total_late_minutes_p95: 35, scope_total_late_minutes_p50: 10, scope_total_late_minutes_p90: 28, scope_total_late_minutes_p95: 35, late_minutes_p50: 10, late_minutes_p90: 28, late_minutes_p95: 35, expected_overtime_minutes: 4.5, additional_disruption_probability: .125, absence_disruption_probability: .05, no_show_disruption_probability: .04, window_failure_probability: .03, overtime_failure_probability: .02, emergency_event_probability: .08, emergency_caused_failure_probability: .06, emergency_failure_given_event_probability: .75, emergency_caused_window_failure_probability: .03, emergency_caused_overtime_probability: .02, emergency_caused_unserved_probability: 0, emergency_caused_sla_degradation_probability: .04, emergency_capacity_disruption_probability: .06, emergency_completion_rate: .9, emergency_on_time_rate: .8, emergency_unserved_probability: .1, baseline_unserved_orders: 0, expected_total_unserved_orders: .25, plan_failure_probability: .125, expected_unserved_orders: .25, assumptions: [] }
+      : effectiveUrl.endsWith('/risk-simulation') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', schedule_signature: 'selected', travel_model_fingerprint: 'travel', execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE', emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY', emergency_responder_selection_policy: 'MYOPIC_EARLIEST_EMERGENCY_FINISH', execution_policy_version: 'V2', simulation_policy_version: 'V5', analysis_code_version: '0.5.8', simulation_input_hash: 'risk', simulation_scenario_set_hash: 'scenario-set', seed: 7, trials: 500, expected_sla_on_time_rate: .875, published_commitment_sla_rate: .875, all_demand_sla_rate: .84, monte_carlo_mean_ci_low: .85, monte_carlo_mean_ci_high: .9, sla_rate_ci_low: .85, sla_rate_ci_high: .9, full_day_total_late_minutes_p50: 10, full_day_total_late_minutes_p90: 28, full_day_total_late_minutes_p95: 35, scope_total_late_minutes_p50: 10, scope_total_late_minutes_p90: 28, scope_total_late_minutes_p95: 35, late_minutes_p50: 10, late_minutes_p90: 28, late_minutes_p95: 35, expected_overtime_minutes: 4.5, additional_disruption_probability: .125, absence_disruption_probability: .05, no_show_disruption_probability: .04, window_failure_probability: .03, overtime_failure_probability: .02, emergency_event_probability: options.noEmergency ? 0 : .08, emergency_event_count: options.noEmergency ? 0 : 40, emergency_caused_failure_probability: .06, emergency_failure_given_event_probability: .75, emergency_caused_window_failure_probability: .03, emergency_caused_overtime_probability: .02, emergency_caused_unserved_probability: 0, emergency_caused_sla_degradation_probability: .04, emergency_capacity_disruption_probability: .06, emergency_completion_rate: options.noEmergency ? null : .9, emergency_on_time_rate: options.noEmergency ? null : .8, emergency_unserved_probability: options.noEmergency ? null : .1, emergency_incremental_late_minutes: options.noEmergency ? null : 4, emergency_incremental_overtime_minutes: options.noEmergency ? null : 2, emergency_incremental_unserved_orders: options.noEmergency ? null : .1, emergency_affected_work_order_count: options.noEmergency ? null : .2, baseline_unserved_orders: 0, expected_total_unserved_orders: .25, plan_failure_probability: .125, expected_unserved_orders: .25, assumptions: [] }
       : effectiveUrl.endsWith('/capacity-analysis') ? { ...context, scenario_id: 'main', plan_version_id: activePlan.id, plan_number: activePlan.number, scenario_snapshot_hash: 'test', analysis_code_version: '0.5.2', analysis_input_hash: 'capacity-input', evaluation_method: 'SELECTED_PLAN_TAIL_APPEND_COUNTERFACTUAL_V3', reference_mode: 'SELECTED_PLAN_DELTA', selected_plan_signature: 'selected', reference_schedule_signature: 'selected', reference_solver_policy_fingerprint: 'policy', reference_travel_model_fingerprint: 'travel', reference_kpis: schedule.kpis, cost_policy_fingerprint: 'cost', capacity_policy: {}, capacity_policy_fingerprint: 'capacity', analysis_horizon: { days, workdays_per_month: 22, currency: 'CNY' }, placement_mode: 'TAIL_APPEND_ONLY', base_schedule_signature: 'selected', base_cost: breakdown, options: [{ option_id: 'add_technician', name: '增加一名候选技师', assumption: '测算假设', option_applicable: true, decision_status: 'INTERNAL_VERIFIED', schedule_feasible: true, feasible: true, violations: [], changed_inputs: { skills: ['electrical'] }, placement_mode: 'TAIL_APPEND_ONLY', completion_rate: 1, sla_on_time_rate: 1, unassigned_count: 0, travel_minutes: 8, overtime_minutes: 0, completion_improvement_percentage_points: 5, sla_improvement_percentage_points: 8, unassigned_delta: -1, travel_delta_minutes: -2, overtime_delta_minutes: 0, fixed_capacity_cost_cents: 60000, fixed_cost_cadence: 'PER_DAY', cost_unit_type: 'PLAN_DAY', cost_units_per_day: 1, affected_entity_ids: ['TECH-01'], one_time_investment_cents: 0, daily_operating_delta_cents: -10000, horizon_total_impact_cents: 50000 * days, economic_impact_offset_days: null, cash_payback_days: null, break_even_days: null, marginal_cost_cents: 50000, projected_total_cost_cents: 173400, schedule_signature: 'capacity', diagnostic_metrics: {}, conditional_upper_bound_kpis: null, diagnostic_schedule: null, verification_report: null, route_diff: [], artifact_id: 'DAA-1' }] }
       : effectiveUrl.endsWith('/analysis-runs') ? options.existingFailed ? [{ id: 'AN-FAILED', scenario_id: 'main', number: 4, plan_version_id: activePlan.id, plan_number: activePlan.number, analysis_type: 'COST', status: 'FAILED', error: { message: '成本引擎中断' }, logical_analysis_id: 'AN-FAILED' }] : []
       : effectiveUrl.endsWith('/plan-versions') ? [activePlan]
@@ -159,6 +159,24 @@ describe('FieldFlow navigation and render safety', () => {
     expect(screen.getByText('09:20，与重排时点相互独立')).toBeInTheDocument()
   })
 
+  it('disables starting an invalidated assignment until replanning', async () => {
+    const validSchedule: Schedule = {
+      ...schedule,
+      assignments: [{ ...schedule.assignments[0], work_order_id: 'WO-1' }],
+    }
+    const invalidPlan: PlanVersion = {
+      ...plan,
+      selected: validSchedule,
+      applicability: { ...plan.applicability, route_executable: false, invalid_assignment_ids: ['WO-1'] },
+    }
+    mockApi(invalidPlan); render(<App />)
+    await screen.findByRole('heading', { name: '今日调度测试' })
+    fireEvent.click(screen.getByRole('button', { name: '全部' }))
+    fireEvent.click(screen.getByText('WO-1'))
+    expect(screen.getByText(/开始服务前必须局部重排/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '分配已失效' })).toBeDisabled()
+  })
+
   it('reads analyses without writing and creates explicit frozen analyses on demand', async () => {
     mockApi(); render(<App />)
     await screen.findByRole('heading', { name: '今日调度测试' })
@@ -198,6 +216,15 @@ describe('FieldFlow navigation and render safety', () => {
     expect(await screen.findByText('正常人工')).toBeInTheDocument()
     expect(screen.getByText('加班基础工资')).toBeInTheDocument()
     expect(screen.getByText('加班溢价')).toBeInTheDocument()
+  })
+
+  it('renders zero emergency observations as not applicable', async () => {
+    mockApi(plan, { noEmergency: true }); render(<App />)
+    await screen.findByRole('heading', { name: '今日调度测试' })
+    fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
+    await screen.findByText(/当前版本还没有经营分析/)
+    fireEvent.click(screen.getByRole('button', { name: '生成成本与风险分析' }))
+    expect(await screen.findByText(/紧急指标不适用：本次模拟未发生紧急事件/)).toBeInTheDocument()
   })
 
   it('offers an explicit retry for a failed analysis record', async () => {

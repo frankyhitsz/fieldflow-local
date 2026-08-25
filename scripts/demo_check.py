@@ -33,6 +33,7 @@ with TestClient(app) as client:
     assert response.status_code == 200
 
     emergency = emergency_order().model_dump(mode="json")
+    emergency.pop("status", None)
     replanned = client.post(
         f"/api/scenarios/{scenario_id}/replan",
         json={

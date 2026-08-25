@@ -10,6 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from .applicability import (
+    applicability_from_legacy_status,
+    coverage_status_from_applicability,
+    reduce_plan_applicability,
+)
 from .fixtures import all_fixtures
 from .hashing import content_hash
 from .models import (
@@ -24,6 +29,7 @@ from .models import (
     DecisionResultManifest,
     ExecutionSourceAssignment,
     ExecutionSourceContext,
+    FieldImpact,
     FrozenBookingIdentity,
     PlanApplicability,
     PlanCoverageStatus,
@@ -43,6 +49,7 @@ from .models import (
     ScheduleRunStatus,
     ScheduleScenario,
     SimulationScenarioSetArtifact,
+    SourceSolverProvenance,
     StrategyExperiment,
     StrategyProfile,
     StrategyProfileCreate,
@@ -60,7 +67,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 _INTEGRITY_RANK = {
     AnalysisIntegrityStatus.failed: 0,
@@ -153,6 +160,13 @@ def _upgrade_technician_costs(payload: object) -> bool:
 class ScenarioRevisionConflict(RuntimeError):
     def __init__(self, expected: int, current: int):
         super().__init__(f"scenario revision changed: expected {expected}, current {current}")
+        self.expected = expected
+        self.current = current
+
+
+class ActivePlanConflict(RuntimeError):
+    def __init__(self, expected: str | None, current: str | None):
+        super().__init__(f"active plan changed: expected {expected}, current {current}")
         self.expected = expected
         self.current = current
 
@@ -425,6 +439,7 @@ class Store:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 UNIQUE(scenario_id, number),
+                UNIQUE(id, scenario_id),
                 FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
             );
             CREATE TABLE strategy_experiments_new (
@@ -559,22 +574,23 @@ class Store:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(scenario_id, number),
+                    UNIQUE(id, scenario_id),
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS plan_applicability (
                     plan_version_id TEXT PRIMARY KEY,
                     scenario_id TEXT NOT NULL,
                     active INTEGER NOT NULL CHECK(active IN (0, 1)),
-                    coverage_status TEXT NOT NULL,
+                    coverage_status TEXT NOT NULL CHECK(coverage_status IN ('CURRENT_AND_COMPLETE', 'PARTIAL_NEW_DEMAND', 'STALE_DATA_CHANGED')),
                     route_executable INTEGER NOT NULL DEFAULT 1 CHECK(route_executable IN (0, 1)),
                     coverage_complete INTEGER NOT NULL DEFAULT 1 CHECK(coverage_complete IN (0, 1)),
                     planning_current INTEGER NOT NULL DEFAULT 1 CHECK(planning_current IN (0, 1)),
                     metrics_current INTEGER NOT NULL DEFAULT 1 CHECK(metrics_current IN (0, 1)),
                     commercial_current INTEGER NOT NULL DEFAULT 1 CHECK(commercial_current IN (0, 1)),
                     reoptimization_opportunity INTEGER NOT NULL DEFAULT 0 CHECK(reoptimization_opportunity IN (0, 1)),
-                    invalid_assignment_ids TEXT NOT NULL DEFAULT '[]',
+                    invalid_assignment_ids TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(invalid_assignment_ids) AND json_type(invalid_assignment_ids)='array'),
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE,
+                    FOREIGN KEY(plan_version_id, scenario_id) REFERENCES plan_versions(id, scenario_id) ON DELETE CASCADE,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS plan_metadata (
@@ -716,12 +732,18 @@ class Store:
                     action TEXT NOT NULL CHECK(action IN ('start', 'complete')),
                     sequence INTEGER NOT NULL,
                     occurred_at INTEGER NOT NULL,
+                    technician_id TEXT NOT NULL DEFAULT '',
+                    plan_version_id TEXT NOT NULL DEFAULT '',
+                    booking_id TEXT NOT NULL DEFAULT '',
+                    source_assignment_hash TEXT NOT NULL DEFAULT '',
+                    event_content_hash TEXT NOT NULL DEFAULT '',
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_schedules_scenario ON schedules(scenario_id, version);
                 CREATE INDEX IF NOT EXISTS idx_plan_versions_scenario ON plan_versions(scenario_id, number);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_versions_id_scenario_unique ON plan_versions(id, scenario_id);
                 CREATE INDEX IF NOT EXISTS idx_revisions_scenario ON scenario_revisions(scenario_id, number);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_plan ON schedule_artifacts(plan_version_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
@@ -734,8 +756,46 @@ class Store:
             if "active_plan_version_id" not in columns:
                 con.execute("ALTER TABLE scenarios ADD COLUMN active_plan_version_id TEXT")
             event_columns = {row[1] for row in con.execute("PRAGMA table_info(work_order_execution_events)")}
+            event_schema_upgraded = "sequence" not in event_columns
             if "sequence" not in event_columns:
                 con.execute("ALTER TABLE work_order_execution_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
+            event_relational_columns = {
+                "technician_id": "TEXT NOT NULL DEFAULT ''",
+                "plan_version_id": "TEXT NOT NULL DEFAULT ''",
+                "booking_id": "TEXT NOT NULL DEFAULT ''",
+                "source_assignment_hash": "TEXT NOT NULL DEFAULT ''",
+                "event_content_hash": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in event_relational_columns.items():
+                if column not in event_columns:
+                    event_schema_upgraded = True
+                    con.execute(f"ALTER TABLE work_order_execution_events ADD COLUMN {column} {definition}")
+            if version < 21 or event_schema_upgraded:
+                for event_row in con.execute("SELECT rowid, payload FROM work_order_execution_events").fetchall():
+                    try:
+                        event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"])
+                    except (TypeError, ValueError):
+                        continue
+                    event.event_content_hash = content_hash(
+                        event.model_dump(exclude={"event_content_hash"}, mode="json")
+                    )
+                    con.execute(
+                        """
+                        UPDATE work_order_execution_events
+                        SET technician_id=?, plan_version_id=?, booking_id=?, source_assignment_hash=?,
+                            event_content_hash=?, payload=?
+                        WHERE rowid=?
+                        """,
+                        (
+                            event.technician_id,
+                            event.plan_version_id,
+                            event.booking_id,
+                            event.source_assignment_hash,
+                            event.event_content_hash,
+                            event.model_dump_json(),
+                            event_row["rowid"],
+                        ),
+                    )
             command_columns = {row[1] for row in con.execute("PRAGMA table_info(command_keys)")}
             if "publication_key" not in command_columns:
                 con.execute("ALTER TABLE command_keys ADD COLUMN publication_key TEXT")
@@ -1047,20 +1107,41 @@ class Store:
                                 (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), row["rowid"]),
                             )
             if version < 12:
-                con.execute(
-                    """
-                    INSERT OR REPLACE INTO plan_applicability(
-                        plan_version_id, scenario_id, active, coverage_status, updated_at
+                applicability_columns = {
+                    str(row["name"]) for row in con.execute("PRAGMA table_info(plan_applicability)").fetchall()
+                }
+                if "route_executable" in applicability_columns:
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO plan_applicability(
+                            plan_version_id, scenario_id, active, coverage_status,
+                            route_executable, coverage_complete, planning_current, metrics_current,
+                            commercial_current, reoptimization_opportunity, invalid_assignment_ids, updated_at
+                        )
+                        SELECT p.id,
+                               p.scenario_id,
+                               CASE WHEN s.active_plan_version_id=p.id THEN 1 ELSE 0 END,
+                               COALESCE(json_extract(p.payload, '$.coverage_status'), 'CURRENT_AND_COMPLETE'),
+                               1, 1, 1, 1, 1, 0, '[]', CURRENT_TIMESTAMP
+                        FROM plan_versions p
+                        JOIN scenarios s ON s.id=p.scenario_id
+                        """
                     )
-                    SELECT p.id,
-                           p.scenario_id,
-                           CASE WHEN s.active_plan_version_id=p.id THEN 1 ELSE 0 END,
-                           COALESCE(json_extract(p.payload, '$.coverage_status'), 'CURRENT_AND_COMPLETE'),
-                           CURRENT_TIMESTAMP
-                    FROM plan_versions p
-                    JOIN scenarios s ON s.id=p.scenario_id
-                    """
-                )
+                else:
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO plan_applicability(
+                            plan_version_id, scenario_id, active, coverage_status, updated_at
+                        )
+                        SELECT p.id,
+                               p.scenario_id,
+                               CASE WHEN s.active_plan_version_id=p.id THEN 1 ELSE 0 END,
+                               COALESCE(json_extract(p.payload, '$.coverage_status'), 'CURRENT_AND_COMPLETE'),
+                               CURRENT_TIMESTAMP
+                        FROM plan_versions p
+                        JOIN scenarios s ON s.id=p.scenario_id
+                        """
+                    )
             if version < 20:
                 existing_columns = {
                     str(row["name"]) for row in con.execute("PRAGMA table_info(plan_applicability)").fetchall()
@@ -1079,6 +1160,107 @@ class Store:
                 for column, definition in applicability_columns.items():
                     if column not in existing_columns:
                         con.execute(f"ALTER TABLE plan_applicability ADD COLUMN {column} {definition}")
+                con.execute(
+                    """
+                    UPDATE plan_applicability
+                    SET route_executable=CASE WHEN coverage_status='STALE_DATA_CHANGED' THEN 0 ELSE 1 END,
+                        coverage_complete=CASE WHEN coverage_status='PARTIAL_NEW_DEMAND' THEN 0 ELSE 1 END,
+                        planning_current=CASE WHEN coverage_status='CURRENT_AND_COMPLETE' THEN 1 ELSE 0 END,
+                        metrics_current=CASE WHEN coverage_status='CURRENT_AND_COMPLETE' THEN 1 ELSE 0 END,
+                        commercial_current=1,
+                        reoptimization_opportunity=0,
+                        invalid_assignment_ids='[]'
+                    """
+                )
+            if version < 21:
+                con.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_versions_id_scenario_unique "
+                    "ON plan_versions(id, scenario_id)"
+                )
+                invalid_rows = con.execute(
+                    """
+                    SELECT a.plan_version_id, a.scenario_id,
+                           json_object('coverage_status', a.coverage_status,
+                                       'invalid_assignment_ids', a.invalid_assignment_ids) AS payload
+                    FROM plan_applicability a
+                    LEFT JOIN plan_versions p ON p.id=a.plan_version_id AND p.scenario_id=a.scenario_id
+                    WHERE p.id IS NULL
+                       OR a.coverage_status NOT IN ('CURRENT_AND_COMPLETE','PARTIAL_NEW_DEMAND','STALE_DATA_CHANGED')
+                       OR CASE WHEN json_valid(a.invalid_assignment_ids)
+                               THEN json_type(a.invalid_assignment_ids)<>'array'
+                               ELSE 1 END
+                    """
+                ).fetchall()
+                for invalid in invalid_rows:
+                    self._record_read_isolation(
+                        con,
+                        "plan_applicability",
+                        str(invalid["plan_version_id"]),
+                        str(invalid["payload"]),
+                        "v21 applicability constraint repair",
+                    )
+                con.commit()
+                con.execute("PRAGMA foreign_keys = OFF")
+                con.executescript(
+                    """
+                    BEGIN;
+                    DROP TRIGGER IF EXISTS sync_active_plan_insert;
+                    DROP TRIGGER IF EXISTS sync_active_plan_update;
+                    DROP TRIGGER IF EXISTS sync_active_plan_delete;
+                    CREATE TABLE plan_applicability_v21 (
+                        plan_version_id TEXT PRIMARY KEY,
+                        scenario_id TEXT NOT NULL,
+                        active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                        coverage_status TEXT NOT NULL CHECK(coverage_status IN ('CURRENT_AND_COMPLETE', 'PARTIAL_NEW_DEMAND', 'STALE_DATA_CHANGED')),
+                        route_executable INTEGER NOT NULL CHECK(route_executable IN (0, 1)),
+                        coverage_complete INTEGER NOT NULL CHECK(coverage_complete IN (0, 1)),
+                        planning_current INTEGER NOT NULL CHECK(planning_current IN (0, 1)),
+                        metrics_current INTEGER NOT NULL CHECK(metrics_current IN (0, 1)),
+                        commercial_current INTEGER NOT NULL CHECK(commercial_current IN (0, 1)),
+                        reoptimization_opportunity INTEGER NOT NULL CHECK(reoptimization_opportunity IN (0, 1)),
+                        invalid_assignment_ids TEXT NOT NULL CHECK(json_valid(invalid_assignment_ids) AND json_type(invalid_assignment_ids)='array'),
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(plan_version_id, scenario_id) REFERENCES plan_versions(id, scenario_id) ON DELETE CASCADE,
+                        FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO plan_applicability_v21
+                    SELECT a.plan_version_id,
+                           p.scenario_id,
+                           a.active,
+                           CASE WHEN CASE WHEN json_valid(a.invalid_assignment_ids)
+                                               THEN json_type(a.invalid_assignment_ids)<>'array'
+                                               ELSE 1 END
+                                THEN 'STALE_DATA_CHANGED'
+                                WHEN a.coverage_complete=0 THEN 'PARTIAL_NEW_DEMAND'
+                                WHEN a.route_executable=0 OR a.planning_current=0 OR a.metrics_current=0 OR a.commercial_current=0
+                                THEN 'STALE_DATA_CHANGED'
+                                ELSE 'CURRENT_AND_COMPLETE' END,
+                           CASE WHEN CASE WHEN json_valid(a.invalid_assignment_ids)
+                                               THEN json_type(a.invalid_assignment_ids)='array'
+                                               ELSE 0 END
+                                     AND a.route_executable IN (0,1)
+                                THEN a.route_executable ELSE 0 END,
+                           CASE WHEN a.coverage_complete IN (0,1) THEN a.coverage_complete ELSE 0 END,
+                           CASE WHEN a.planning_current IN (0,1) THEN a.planning_current ELSE 0 END,
+                           CASE WHEN a.metrics_current IN (0,1) THEN a.metrics_current ELSE 0 END,
+                           CASE WHEN a.commercial_current IN (0,1) THEN a.commercial_current ELSE 0 END,
+                           CASE WHEN a.reoptimization_opportunity IN (0,1) THEN a.reoptimization_opportunity ELSE 0 END,
+                           CASE WHEN json_valid(a.invalid_assignment_ids)
+                                THEN CASE WHEN json_type(a.invalid_assignment_ids)='array'
+                                          THEN a.invalid_assignment_ids ELSE '[]' END
+                                ELSE '[]' END,
+                           a.updated_at
+                    FROM plan_applicability a
+                    JOIN plan_versions p ON p.id=a.plan_version_id AND p.scenario_id=a.scenario_id;
+                    DROP TABLE plan_applicability;
+                    ALTER TABLE plan_applicability_v21 RENAME TO plan_applicability;
+                    COMMIT;
+                    """
+                )
+                con.execute("PRAGMA foreign_keys = ON")
+                violations = con.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(f"foreign key check failed after v21 migration: {violations[:3]}")
             con.execute(
                 """
                 INSERT OR IGNORE INTO plan_metadata(plan_version_id, label, note, tags, updated_at)
@@ -1137,6 +1319,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_execution_events_sequence ON work_order_execution_events(scenario_id, sequence);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_sequence_unique ON work_order_execution_events(scenario_id, sequence);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_action_unique ON work_order_execution_events(scenario_id, work_order_id, action);
                 CREATE TRIGGER IF NOT EXISTS prevent_legacy_plan_insert
                 BEFORE INSERT ON plan_versions
                 WHEN NEW.attestation_requirement='LEGACY_MIGRATED'
@@ -1312,6 +1495,7 @@ class Store:
                     )
         self.seed_fixtures()
         self.seed_profiles()
+        self._scan_execution_status_integrity()
 
     def seed_fixtures(self) -> None:
         with self._lock, self._connect() as con:
@@ -1329,6 +1513,49 @@ class Store:
                     "INSERT INTO strategy_profiles(id, builtin, payload, created_at) VALUES (?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, builtin=1",
                     (profile.id, profile.model_dump_json(), profile.created_at),
                 )
+
+    def _scan_execution_status_integrity(self) -> None:
+        """Record legacy WorkOrder states that cannot be derived from immutable events."""
+        with self._lock, self._connect() as con:
+            for scenario_row in con.execute("SELECT id, payload FROM scenarios").fetchall():
+                try:
+                    scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
+                except (TypeError, ValueError):
+                    continue
+                event_actions = {
+                    (str(row["work_order_id"]), str(row["action"]))
+                    for row in con.execute(
+                        "SELECT work_order_id, action FROM work_order_execution_events WHERE scenario_id=?",
+                        (scenario.id,),
+                    ).fetchall()
+                }
+                for order in scenario.work_orders:
+                    missing: list[str] = []
+                    if (
+                        order.status in {WorkOrderStatus.started, WorkOrderStatus.completed}
+                        and (
+                            order.id,
+                            "start",
+                        )
+                        not in event_actions
+                    ):
+                        missing.append("start")
+                    if order.status is WorkOrderStatus.completed and (order.id, "complete") not in event_actions:
+                        missing.append("complete")
+                    if not missing:
+                        continue
+                    reason = f"execution status {order.status.value} missing events: {','.join(missing)}"
+                    self._record_read_isolation(
+                        con,
+                        "scenario_work_order_status",
+                        f"{scenario.id}:{order.id}",
+                        json.dumps(
+                            {"scenario_id": scenario.id, "work_order_id": order.id, "status": order.status.value},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        reason,
+                    )
 
     @staticmethod
     def _insert_revision(
@@ -1371,24 +1598,33 @@ class Store:
             (plan_version_id,),
         ).fetchone()
         resolved_active = int(active if active is not None else bool(existing and existing["active"]))
-        resolved_coverage = (
-            coverage_status.value
-            if coverage_status is not None
-            else existing["coverage_status"]
-            if existing
-            else PlanCoverageStatus.current_and_complete.value
-        )
         if applicability is None and existing:
-            applicability = PlanApplicability(
-                route_executable=bool(existing["route_executable"]),
-                coverage_complete=bool(existing["coverage_complete"]),
-                planning_current=bool(existing["planning_current"]),
-                metrics_current=bool(existing["metrics_current"]),
-                commercial_current=bool(existing["commercial_current"]),
-                reoptimization_opportunity=bool(existing["reoptimization_opportunity"]),
-                invalid_assignment_ids=json.loads(existing["invalid_assignment_ids"]),
-            )
-        applicability = applicability or PlanApplicability()
+            try:
+                applicability = PlanApplicability(
+                    route_executable=bool(existing["route_executable"]),
+                    coverage_complete=bool(existing["coverage_complete"]),
+                    planning_current=bool(existing["planning_current"]),
+                    metrics_current=bool(existing["metrics_current"]),
+                    commercial_current=bool(existing["commercial_current"]),
+                    reoptimization_opportunity=bool(existing["reoptimization_opportunity"]),
+                    invalid_assignment_ids=json.loads(existing["invalid_assignment_ids"]),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                applicability = applicability_from_legacy_status(PlanCoverageStatus.stale_data_changed)
+        if applicability is None:
+            applicability = applicability_from_legacy_status(coverage_status or PlanCoverageStatus.current_and_complete)
+        elif coverage_status is not None:
+            legacy_projection = applicability_from_legacy_status(coverage_status)
+            if coverage_status is PlanCoverageStatus.partial_new_demand:
+                applicability.coverage_complete = False
+                applicability.planning_current = False
+                applicability.metrics_current = False
+            elif coverage_status is PlanCoverageStatus.stale_data_changed:
+                applicability.planning_current = False
+                applicability.metrics_current = False
+                if not existing:
+                    applicability.route_executable = legacy_projection.route_executable
+        resolved_coverage = coverage_status_from_applicability(applicability).value
         con.execute(
             """
             INSERT INTO plan_applicability(
@@ -1432,17 +1668,28 @@ class Store:
             (plan.id,),
         ).fetchone()
         if row:
-            plan.active = bool(row["active"])
-            plan.coverage_status = PlanCoverageStatus(row["coverage_status"])
-            plan.applicability = PlanApplicability(
-                route_executable=bool(row["route_executable"]),
-                coverage_complete=bool(row["coverage_complete"]),
-                planning_current=bool(row["planning_current"]),
-                metrics_current=bool(row["metrics_current"]),
-                commercial_current=bool(row["commercial_current"]),
-                reoptimization_opportunity=bool(row["reoptimization_opportunity"]),
-                invalid_assignment_ids=json.loads(row["invalid_assignment_ids"]),
-            )
+            try:
+                if str(row["scenario_id"]) != plan.scenario_id:
+                    raise ValueError("applicability scenario mismatch")
+                plan.active = bool(row["active"])
+                plan.coverage_status = PlanCoverageStatus(row["coverage_status"])
+                plan.applicability = PlanApplicability(
+                    route_executable=bool(row["route_executable"]),
+                    coverage_complete=bool(row["coverage_complete"]),
+                    planning_current=bool(row["planning_current"]),
+                    metrics_current=bool(row["metrics_current"]),
+                    commercial_current=bool(row["commercial_current"]),
+                    reoptimization_opportunity=bool(row["reoptimization_opportunity"]),
+                    invalid_assignment_ids=json.loads(row["invalid_assignment_ids"]),
+                )
+                if plan.coverage_status is not coverage_status_from_applicability(plan.applicability):
+                    raise ValueError("coverage projection mismatch")
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DecisionAnalysisIntegrityError(
+                    "方案适用性记录无法解析",
+                    record_id=plan.id,
+                    record_type="PLAN_APPLICABILITY",
+                ) from error
         else:
             active = con.execute(
                 "SELECT active_plan_version_id FROM scenarios WHERE id=?",
@@ -1681,10 +1928,17 @@ class Store:
         mark_plan_stale: bool = True,
         plan_coverage_status: PlanCoverageStatus | None = None,
         plan_applicability: PlanApplicability | None = None,
+        change_impact: FieldImpact | None = None,
+        invalid_assignment_ids: list[str] | None = None,
+        expected_active_plan_id: str | None = None,
+        check_active_plan: bool = False,
     ) -> None:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute("SELECT payload FROM scenarios WHERE id=?", (scenario.id,)).fetchone()
+            row = con.execute(
+                "SELECT payload, active_plan_version_id FROM scenarios WHERE id=?",
+                (scenario.id,),
+            ).fetchone()
             current_revision = ScheduleScenario.model_validate_json(row["payload"]).revision if row else -1
             if expected_revision is None:
                 if row:
@@ -1696,6 +1950,28 @@ class Store:
             else:
                 if not row or current_revision != expected_revision:
                     raise ScenarioRevisionConflict(expected_revision, current_revision)
+                current_active_plan_id = row["active_plan_version_id"]
+                if check_active_plan and current_active_plan_id != expected_active_plan_id:
+                    raise ActivePlanConflict(expected_active_plan_id, current_active_plan_id)
+                if change_impact is not None and current_active_plan_id:
+                    plan_row = con.execute(
+                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                        "FROM plan_versions WHERE id=? AND scenario_id=?",
+                        (current_active_plan_id, scenario.id),
+                    ).fetchone()
+                    if not plan_row:
+                        raise ActivePlanConflict(expected_active_plan_id, current_active_plan_id)
+                    active_plan = self._load_plan_row(con, plan_row)
+                    previous_scenario = ScheduleScenario.model_validate_json(row["payload"])
+                    plan_applicability = reduce_plan_applicability(
+                        active_plan,
+                        previous_scenario,
+                        scenario,
+                        active_plan.applicability,
+                        change_impact,
+                        invalid_assignment_ids,
+                    )
+                    plan_coverage_status = coverage_status_from_applicability(plan_applicability)
                 # A data edit makes the selected plan stale but preserves all
                 # published history. Replanning can still use the latest plan.
                 if preserve_active_plan:
@@ -1769,6 +2045,13 @@ class Store:
         request_fingerprint: str,
     ) -> tuple[ScheduleScenario, bool]:
         """Persist reported demand before any solver work and keep the last plan visible."""
+        if order.status is not WorkOrderStatus.pending:
+            raise PublicationConflict(
+                "新建突发工单只能处于待处理状态",
+                code="WORK_ORDER_STATUS_EVENT_REQUIRED",
+            )
+        if not order.is_emergency or order.reported_at is None:
+            raise PublicationConflict("突发工单必须标记为紧急并包含接报时间")
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             command = con.execute(
@@ -1791,6 +2074,7 @@ class Store:
                 raise PublicationConflict(f"工单 {order.id} 已存在，但内容与本次请求不同")
             created = existing is None
             if created:
+                previous_scenario = scenario.model_copy(deep=True)
                 expected_revision = scenario.revision
                 scenario.work_orders.append(order.model_copy(deep=True))
                 scenario.revision += 1
@@ -1807,12 +2091,27 @@ class Store:
                 self._insert_revision(con, scenario, f"接收突发工单 {order.id}")
                 active_plan_id = scenario_row["active_plan_version_id"]
                 if active_plan_id:
+                    plan_row = con.execute(
+                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                        "FROM plan_versions WHERE id=? AND scenario_id=?",
+                        (active_plan_id, scenario.id),
+                    ).fetchone()
+                    if not plan_row:
+                        raise ActivePlanConflict(active_plan_id, active_plan_id)
+                    active_plan = self._load_plan_row(con, plan_row)
+                    applicability = reduce_plan_applicability(
+                        active_plan,
+                        previous_scenario,
+                        scenario,
+                        active_plan.applicability,
+                        FieldImpact.new_demand,
+                    )
                     self._set_plan_applicability(
                         con,
                         active_plan_id,
                         scenario.id,
                         active=True,
-                        coverage_status=PlanCoverageStatus.partial_new_demand,
+                        applicability=applicability,
                     )
             now = _now()
             payload = json.dumps(
@@ -1987,6 +2286,12 @@ class Store:
                 raise PublicationConflict("当前方案记录不存在，请刷新后重试")
             plan = self._load_plan_row(con, plan_row)
             self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
+            if work_order_id in plan.applicability.invalid_assignment_ids:
+                raise PublicationConflict(
+                    "该工单的发布分配已因业务数据变化失效，请先局部重排",
+                    code="INVALID_ASSIGNMENT_CANNOT_START",
+                    details={"work_order_id": work_order_id, "plan_version_id": plan.id},
+                )
             assignment = next((item for item in plan.selected.assignments if item.work_order_id == work_order_id), None)
             if not assignment:
                 raise PublicationConflict("该工单未在当前方案中分配，不能登记执行状态")
@@ -2060,7 +2365,7 @@ class Store:
                     predecessor_order = scenario_orders[predecessor.work_order_id]
                     completion_row = con.execute(
                         """
-                        SELECT payload FROM work_order_execution_events
+                        SELECT * FROM work_order_execution_events
                         WHERE scenario_id=? AND work_order_id=? AND action='complete'
                         ORDER BY sequence DESC LIMIT 1
                         """,
@@ -2068,7 +2373,7 @@ class Store:
                     ).fetchone()
                     if not completion_row:
                         raise PublicationConflict(f"路线前序工单 {predecessor.work_order_id} 缺少完成事件")
-                    completion = WorkOrderExecutionEvent.model_validate_json(completion_row["payload"])
+                    completion = self._load_execution_event_row(con, completion_row)
                     earliest_start = completion.occurred_at + self.travel_provider.minutes(
                         predecessor_order.location,
                         order.location,
@@ -2095,12 +2400,19 @@ class Store:
                     )
             if action == "complete":
                 start_row = con.execute(
-                    "SELECT payload FROM work_order_execution_events WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY occurred_at DESC LIMIT 1",
+                    "SELECT * FROM work_order_execution_events WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY occurred_at DESC LIMIT 1",
                     (scenario_id, work_order_id),
                 ).fetchone()
                 if not start_row:
                     raise PublicationConflict("找不到该工单的开始服务记录")
-                start_event = WorkOrderExecutionEvent.model_validate_json(start_row["payload"])
+                try:
+                    start_event = self._load_execution_event_row(con, start_row)
+                except DecisionAnalysisIntegrityError as error:
+                    raise PublicationConflict(
+                        "开始服务记录完整性校验失败，不能继续完成工单",
+                        code="EXECUTION_EVENT_INTEGRITY_FAILED",
+                        details={"event_id": str(start_row["id"])},
+                    ) from error
                 if start_event.technician_id != request.technician_id:
                     raise PublicationConflict("完成服务的技师与开始服务记录不一致")
                 if request.occurred_at <= start_event.occurred_at:
@@ -2170,6 +2482,7 @@ class Store:
                 estimated_remaining_minutes=(request.estimated_remaining_minutes if action == "start" else None),
                 note=request.note,
             )
+            event.event_content_hash = content_hash(event.model_dump(exclude={"event_content_hash"}, mode="json"))
             result = WorkOrderExecutionResult(scenario=scenario, event=event)
             con.execute(
                 "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -2179,7 +2492,13 @@ class Store:
                 con, scenario, f"工单 {work_order_id} {'开始服务' if action == 'start' else '完成服务'}"
             )
             con.execute(
-                "INSERT INTO work_order_execution_events(id, scenario_id, work_order_id, action, sequence, occurred_at, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO work_order_execution_events(
+                    id, scenario_id, work_order_id, action, sequence, occurred_at,
+                    technician_id, plan_version_id, booking_id, source_assignment_hash,
+                    event_content_hash, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     event.id,
                     scenario_id,
@@ -2187,6 +2506,11 @@ class Store:
                     action,
                     event.sequence,
                     request.occurred_at,
+                    event.technician_id,
+                    event.plan_version_id,
+                    event.booking_id,
+                    event.source_assignment_hash,
+                    event.event_content_hash,
                     event.model_dump_json(),
                     event.created_at,
                 ),
@@ -2369,13 +2693,26 @@ class Store:
         events: list[WorkOrderExecutionEvent] = []
         with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT id, payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
+                "SELECT * FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
                 (scenario_id,),
             ).fetchall()
             for row in rows:
                 try:
-                    events.append(WorkOrderExecutionEvent.model_validate_json(row["payload"]))
-                except (TypeError, ValueError):
+                    event = self._load_execution_event_row(con, row)
+                    if event.action == "complete":
+                        start = next(
+                            (item for item in events if item.work_order_id == event.work_order_id),
+                            None,
+                        )
+                        if (
+                            not start
+                            or start.action != "start"
+                            or start.booking_id != event.booking_id
+                            or start.source_assignment_hash != event.source_assignment_hash
+                        ):
+                            raise ValueError("complete event is not linked to its start event")
+                    events.append(event)
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError):
                     self._record_read_isolation(
                         con,
                         "work_order_execution_events",
@@ -2392,6 +2729,65 @@ class Store:
         if malformed:
             raise malformed
         return events
+
+    @classmethod
+    def _load_execution_event_row(
+        cls,
+        con: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> WorkOrderExecutionEvent:
+        """Validate an execution event before it can influence another command."""
+        try:
+            event = WorkOrderExecutionEvent.model_validate_json(row["payload"])
+            expected_hash = content_hash(event.model_dump(exclude={"event_content_hash"}, mode="json"))
+            relation_valid = (
+                event.id == row["id"]
+                and event.scenario_id == row["scenario_id"]
+                and event.work_order_id == row["work_order_id"]
+                and event.action == row["action"]
+                and event.sequence == row["sequence"]
+                and event.occurred_at == row["occurred_at"]
+                and event.technician_id == row["technician_id"]
+                and event.plan_version_id == row["plan_version_id"]
+                and event.booking_id == row["booking_id"]
+                and event.source_assignment_hash == row["source_assignment_hash"]
+                and event.event_content_hash == row["event_content_hash"] == expected_hash
+            )
+            if not relation_valid:
+                raise ValueError("execution event identity mismatch")
+            plan_row = con.execute(
+                """
+                SELECT id, scenario_id, number, created_at, payload, attestation_requirement
+                FROM plan_versions WHERE id=? AND scenario_id=?
+                """,
+                (event.plan_version_id, event.scenario_id),
+            ).fetchone()
+            if not plan_row:
+                raise ValueError("execution event source plan missing")
+            source_plan = cls._load_plan_row(con, plan_row)
+            if source_plan.effective_integrity is not AnalysisIntegrityStatus.verified:
+                raise ValueError("execution event source plan integrity mismatch")
+            source_assignment = next(
+                (
+                    item
+                    for item in source_plan.selected.assignments
+                    if item.work_order_id == event.work_order_id and item.technician_id == event.technician_id
+                ),
+                None,
+            )
+            if not source_assignment or event.source_assignment_hash != (
+                source_assignment.source_assignment_hash or assignment_source_fingerprint(source_assignment)
+            ):
+                raise ValueError("execution event source assignment mismatch")
+            return event
+        except DecisionAnalysisIntegrityError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "执行事件记录完整性校验失败",
+                record_id=str(row["id"]),
+                record_type="WORK_ORDER_EXECUTION_EVENT",
+            ) from error
 
     def clone_scenario_idempotently(
         self,
@@ -2853,7 +3249,21 @@ class Store:
                 self_integrity=AnalysisIntegrityStatus.verified,
                 effective_integrity=AnalysisIntegrityStatus.verified,
                 schedule_integrity=AnalysisIntegrityStatus.verified,
-                source_solver_provenance=(publication_source.selected.solver_name if publication_source else None),
+                source_solver_provenance=(
+                    SourceSolverProvenance(
+                        claimed_solver_name=publication_source.selected.solver_name,
+                        claimed_solver_version=publication_source.selected.solver_version,
+                        claimed_policy_snapshot=publication_source.selected.solver_policy,
+                        integrity=(
+                            AnalysisIntegrityStatus.legacy_unattested
+                            if action == "reattest"
+                            or publication_source.effective_integrity is AnalysisIntegrityStatus.legacy_unattested
+                            else AnalysisIntegrityStatus.verified
+                        ),
+                    )
+                    if publication_source
+                    else None
+                ),
                 inherited_source_solver_policy=(
                     publication_source.selected.solver_policy.model_copy(deep=True)
                     if publication_source and publication_source.selected.solver_policy

@@ -28,6 +28,7 @@ def test_full_demo_flow(monkeypatch, tmp_path):
         vip = next(a for a in optimized["assignments"] if a["work_order_id"] in vip_ids)
         lock = client.post(
             "/api/scenarios/main/lock",
+            headers={"If-Match": "D0"},
             json={
                 "work_order_id": vip["work_order_id"],
                 "technician_id": vip["technician_id"],
@@ -57,6 +58,7 @@ def test_full_demo_flow(monkeypatch, tmp_path):
 
         edited = client.put(
             "/api/scenarios/main/work-orders/WO-1021",
+            headers={"If-Match": "D1"},
             json={
                 "title": "人工修改后的线路检修",
                 "is_emergency": True,
@@ -91,7 +93,9 @@ def test_full_demo_flow(monkeypatch, tmp_path):
         assert latest_comparison.json()["after"]["id"] == revised_plan.json()["id"]
 
         updated_tech = client.put(
-            "/api/scenarios/main/technicians/TECH-01", json={"name": "林乔（早班）", "overtime_limit": 75}
+            "/api/scenarios/main/technicians/TECH-01",
+            headers={"If-Match": "D2"},
+            json={"name": "林乔（早班）", "overtime_limit": 75},
         )
         assert updated_tech.status_code == 200
         assert updated_tech.json()["revision"] == 3
@@ -108,19 +112,23 @@ def test_full_demo_flow(monkeypatch, tmp_path):
             "sla_deadline": 690,
             "priority": "urgent",
             "drop_penalty": 10000,
-            "status": "pending",
             "vip": True,
             "is_emergency": True,
             "reported_at": 620,
             "note": "",
         }
-        created = client.post("/api/scenarios/main/work-orders", json=new_emergency)
+        created = client.post(
+            "/api/scenarios/main/work-orders",
+            headers={"If-Match": "D3"},
+            json=new_emergency,
+        )
         assert created.status_code == 200
         assert created.json()["revision"] == 4
         assert any(item["id"] == "WO-EMG-TEST" and item["is_emergency"] for item in created.json()["work_orders"])
 
         incompatible_lock = client.post(
             "/api/scenarios/main/lock",
+            headers={"If-Match": "D4"},
             json={
                 "work_order_id": "WO-1021",
                 "technician_id": "TECH-03",
@@ -129,7 +137,7 @@ def test_full_demo_flow(monkeypatch, tmp_path):
         )
         assert incompatible_lock.status_code == 422
 
-        reset = client.post("/api/scenarios/main/reset")
+        reset = client.post("/api/scenarios/main/reset", headers={"If-Match": "D4"})
         assert reset.status_code == 200
         assert reset.json()["revision"] == 5
         assert len(reset.json()["work_orders"]) == 24

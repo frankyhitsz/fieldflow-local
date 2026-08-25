@@ -4,41 +4,49 @@
 
 ## 本轮目标
 
-复核更新后的 `pro-plan.md`，完成 v0.5.7 稳定化。P0 和可在当前单机架构内闭合的 M0/P1 直接修复；审查稿自己列入 v0.6 以后的 Job Queue、Outbox、独立求解进程、修订拆分和新业务域保留清晰边界，不用占位接口冒充交付。
+按再次变更的 `pro-plan.md` 完成 v0.5.8 Correctness Freeze。四项 P0 和当前架构内能够闭合的正确性问题直接修复；任务书已明确排到 v0.6 以后且需要新运行时或新业务实体的项目，逐项记录理由，不增加占位接口。
 
-## 第一轮：根因修复
+## 第一轮：确认缺陷与修复核心不变量
 
-- [x] P0-01：删除风险模拟中按发布时间猜测状态的第二条路径，改为每个 trial/技师一份权威路线状态。
-- [x] 固化 `BETWEEN_VISITS_ONLY` 和 `EARLIEST_FEASIBLE_COMPLETION`；场景集、结果和 Artifact 共同保存政策。
-- [x] trial 证据增加响应技师、派出时间、完成时间和派出位置；延迟行程检查点回归已通过。
-- [x] P0-02：新普通工单保留路线并标记部分覆盖；新增技师标记再优化机会；删除未分配工单保留路线。
-- [x] Schema v20 增加多维 PlanApplicability；前端按路线、覆盖、指标和再优化状态分别提示。
-- [x] 受影响定向回归：P0 时间线和三类数据变更 4 项通过。
+- [x] P0-01：响应者选择不再复制候选并模拟整条未来路线。新增 `EmergencyDecisionInformationSet`，政策改为 `MYOPIC_EARLIEST_EMERGENCY_FINISH`；选择后只对选中响应者模拟一次未来。
+- [x] P0-02：紧急接单复用 PlanApplicability reducer，在同一事务中保留路线、标记覆盖不完整及规划/指标过期。
+- [x] P0-03：新增 `WorkOrderCreate` / `EmergencyWorkOrderCreate`，公共创建和更新均不接受执行状态；服务端只创建 pending。
+- [x] P0-04：容量成本加入来源规则和 `CostLedger`，删除 `FIXED_ONLY` 事后减法；剩余范围、付费班次和未使用候选均保持非负并对账。
+- [x] 新增未来服务波动、未来 no-show、未来返程延误不改变响应者，以及已观察行程延误可以改变响应者的回归测试。
+- [x] 新增无紧急事件 null 语义、决策证据、服务/行程检查点和成本组合回归。
 
-## 第二轮：证明与边界修复
+## 第二轮：迁移、并发、统计与完整性
 
-- [x] RiskComparison 增加不可降级触发器；依赖失效时 `result`、配对值和 delta 全部置空。
-- [x] 风险比较补齐全需求 SLA、紧急完成和紧急准时配对指标；迟到页面改为当前分析范围。
-- [x] Capacity Artifact 自包含正式结果可用性、结构校验、商业验证、条件假设和条件上界。
-- [x] 重新认证拆分路线完整性、原求解来源和 replay 政策；增加规划等价模式及 Legacy replan 前置错误。
-- [x] A 完成事务重新加载父 Plan；竞态时保存 `PARENT_PLAN_CHANGED_DURING_ANALYSIS`，不保存结果和 Artifact。
-- [x] WorkOrder、Technician、Lock、Reset 支持 `If-Match: Dnnn`；网页客户端统一携带。
-- [x] 场景、执行事件、ScheduleRun、Candidate 和 Experiment 的关键读取增加 quarantine 与结构化错误。
-- [x] 第二轮 6 项高风险定向回归通过，Ruff 通过。
+- [x] 新建 `PlanDependencyIndex` 和原子 reducer；覆盖差集每次重算，失效 assignment 累积，未分配需求和未使用技师不会误伤路线。
+- [x] 数据编辑事务同时 CAS 数据 D 和活动 V；并发发布新 V 时拒绝旧适用性投影。
+- [x] Schema v21 回填 v19/v20 旧覆盖语义，PlanApplicability 增加复合外键、状态 CHECK 和 JSON array CHECK；旧 `coverage_status` 改为派生投影。
+- [x] `/api/v2` 的 WorkOrder、Technician、Lock、Reset 写操作强制 `If-Match`，缺失返回 428；v1 路径标记 deprecated。
+- [x] 风险条件指标增加事件计数，零样本返回 null；配对紧急指标按事件 trial 计算并保留无条件影响，摘要携带 conditioning event、有效样本和配对 bootstrap 区间；事件样本少于 20 时明确返回 `INSUFFICIENT_EVENT_TRIALS`，不输出伪精确区间。
+- [x] 风险比较在创建子 A 前预检 scope、as-of 与 ScenarioSet identity；增加紧急事件增量迟到、加班、未服务和受影响工单。
+- [x] 重新认证使用 Plan 引用范围指纹，允许新增未参与路线的技师；历史求解来源改为结构化、可区分 `LEGACY_UNATTESTED`。
+- [x] DecisionRuntimeManifest 与 ReleaseManifest 分离；前端锁文件和完整发布 SHA 不再阻止后端决策精确 retry。
+- [x] 执行事件保存关系型身份、来源 assignment 和内容哈希；列表、完成命令和前序事件消费共用完整性门禁。孤立 STARTED/COMPLETED 状态进入完整性问题清单。
+- [x] 修复状态机测试自身的 ID 重用缺陷，并重新运行受影响回归。
 
-## 第三轮：完整验证与交付
+## 第三轮：前端契约与模型化测试
 
-- [x] 更新 OpenAPI 快照、版本号和前端锁文件。
-- [x] 后端 222 项通过，覆盖率 89.68%。
-- [x] React 组件 10 项、ESLint、TypeScript、生产构建通过。
-- [x] Demo、Benchmark、pip-audit、npm production audit 通过；Playwright API lifecycle 通过。
-- [x] 独立缺陷审计后修复严格 trial 类型、前端范围指标 mock、inactive 适用性投影和兼容锁定语义；`make verify` 除本机 Chromium 启动 SIGTRAP 外均通过，4 个页面用例未进入测试代码，交由 Linux CI 复核。
-- [x] 提交 `530754e` 并推送 `main`；GitHub Actions #40 的 Python 3.11 和完整 fieldflow 作业均通过，Linux Playwright 5/5 通过。
+- [x] 前端区分普通新增需求与紧急未覆盖需求；失效 assignment 显示原因并禁用“开始服务”；零紧急样本显示“不适用”。
+- [x] OpenAPI 生成 TypeScript component types，核心 WorkOrder、Technician、ExecutionEvent 直接引用生成类型；lint 检查生成文件漂移。
+- [x] 增加 PlanApplicability `RuleBasedStateMachine`。
+- [x] 增加定向 mutation smoke；覆盖差集、失效集合累积、零事件语义和固定成本工资四个 mutant 均被测试杀死。
+- [x] Python 依赖改为 `pyproject.toml` 单一来源，安装与审计不再读取第二份清单。
+- [x] 独立审计修复事件后仍读取服务中未来时长、v20 坏 JSON 迁移、编辑请求携带只读字段、Demo 突发单旧 payload、新增容量误标陈旧、执行事件消费门禁和依赖审计范围。
+- [x] 完整后端 243 项通过，覆盖率 89.75%；React 13 项、构建、Demo、Benchmark、静态检查、OpenAPI/生成类型、依赖审计和 4/4 mutation smoke 通过。
+- [ ] Playwright 页面流程与最终 `make verify`：本机 macOS 浏览器进程在进入页面测试前被环境以 SIGTRAP/SIGABRT 终止；API lifecycle 已通过，待 GitHub Linux CI 完成页面断言。
+- [x] 完成 v0.5.8 对 P0/P1/P2 的逐项裁决文档；未把新领域模型、持久任务或仓库治理写成已完成。
+- [x] 三轮独立审计记录已写入本地 `review-stage`；该目录按项目约定不提交。
+- [ ] 提交、推送并确认 GitHub Actions 全绿。
 
-## 裁决边界
+## 明确边界
 
-- v0.5.7 已处理 P0-01/02 和 P1-01～15 的当前架构可落地部分。`If-Match` 暂保留旧客户端兼容路径；低风险配置表的统一坏行 loader 随模块拆分收尾。
-- P1-16～25 对应审查稿的 v0.6 运行时：迁移 CLI、Job Queue/Outbox、独立求解进程、依赖注入、修订拆分、Location/时变行程、内容寻址和保留策略。本轮不改变安装及恢复契约。
-- P2-01～05 是工程演进；P2-06 LICENSE 和 P2-07 GitHub 治理需要仓库所有者明确选择；P2-08～10 是 v0.7 新业务域。
+- Job Queue、Outbox、求解子进程硬取消、迁移维护 CLI、Artifact retention 属于任务书 M1/v0.6；当前没有持久 worker，不能用空路由冒充。
+- 正式 Booking、工单收件箱、技师端、缺件/失败/再次上门、资产和库存属于 M2/v0.7。
+- 时变旅行、真实多日需求预测、风险历史校准和组合容量属于 M3/v0.8。
+- LICENSE 需要仓库所有者选择 MIT 或 Apache-2.0；GitHub 分支保护属于额外仓库治理操作，本轮不擅自变更。
 
-逐项证据与理由见 `docs/pro-plan-v0.5.7-assessment.md`。
+逐项证据与理由见 `docs/pro-plan-v0.5.8-assessment.md`。

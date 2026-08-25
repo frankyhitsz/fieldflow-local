@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .hashing import content_hash
-from .models import ScheduleAssignment, ScheduleScenario, Technician, WorkOrder
+from .models import PlanVersion, ScheduleAssignment, ScheduleScenario, Technician, WorkOrder
 from .travel import TravelTimeProvider
 
 
@@ -80,6 +80,39 @@ def scenario_assignment_feasibility_payload(
             item.model_dump(mode="json")
             for item in sorted(scenario.locked_assignments, key=lambda item: (item.work_order_id, item.technician_id))
         ],
+        "travel_model_fingerprint": provider.fingerprint,
+    }
+
+
+def plan_scoped_assignment_feasibility_payload(
+    scenario: ScheduleScenario,
+    plan: PlanVersion,
+    provider: TravelTimeProvider,
+) -> dict:
+    """Only dependencies referenced by a published route, not harmless aggregate additions."""
+    orders = {item.id: item for item in scenario.work_orders}
+    technicians = {item.id: item for item in scenario.technicians}
+    assigned_order_ids = sorted({item.work_order_id for item in plan.selected.assignments})
+    route_technician_ids = sorted({item.technician_id for item in plan.selected.assignments})
+    locks = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
+    return {
+        "planning_date": scenario.planning_date,
+        "assigned_work_orders": [
+            {
+                **work_order_assignment_feasibility_payload(orders[order_id]),
+                "status": orders[order_id].status.value,
+            }
+            if order_id in orders
+            else {"id": order_id, "missing": True}
+            for order_id in assigned_order_ids
+        ],
+        "route_technicians": [
+            technician_planning_payload(technicians[technician_id])
+            if technician_id in technicians
+            else {"id": technician_id, "missing": True}
+            for technician_id in route_technician_ids
+        ],
+        "assigned_locks": {order_id: locks.get(order_id) for order_id in assigned_order_ids},
         "travel_model_fingerprint": provider.fingerprint,
     }
 

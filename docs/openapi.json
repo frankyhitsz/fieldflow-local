@@ -812,6 +812,16 @@
             "title": "Cost Units Per Day",
             "type": "integer"
           },
+          "counterfactual_cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanCostBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "counterfactual_kpis": {
             "anyOf": [
               {
@@ -1521,6 +1531,46 @@
         "title": "CostCadence",
         "type": "string"
       },
+      "CostComponent": {
+        "properties": {
+          "amount_cents": {
+            "minimum": 0.0,
+            "title": "Amount Cents",
+            "type": "integer"
+          },
+          "component": {
+            "$ref": "#/components/schemas/CostComponentKind"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/DecisionAnalysisScope"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "component",
+          "source_id",
+          "amount_cents",
+          "scope"
+        ],
+        "title": "CostComponent",
+        "type": "object"
+      },
+      "CostComponentKind": {
+        "enum": [
+          "REGULAR_LABOR",
+          "OVERTIME_BASE",
+          "OVERTIME_PREMIUM",
+          "TRAVEL",
+          "OUTSOURCING",
+          "SLA_PENALTY",
+          "UNSERVED_REVENUE"
+        ],
+        "title": "CostComponentKind",
+        "type": "string"
+      },
       "CostDecisionAnalysisRunRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1547,6 +1597,24 @@
           "analysis_type"
         ],
         "title": "CostDecisionAnalysisRunRequest",
+        "type": "object"
+      },
+      "CostLedger": {
+        "properties": {
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/CostComponent"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_COST_LEDGER_V1",
+            "title": "Policy Version",
+            "type": "string"
+          }
+        },
+        "title": "CostLedger",
         "type": "object"
       },
       "CostUnitType": {
@@ -1808,6 +1876,16 @@
             "title": "Policy Version",
             "type": "string"
           },
+          "release_manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReleaseManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "request_snapshot": {
             "additionalProperties": true,
             "title": "Request Snapshot",
@@ -1875,7 +1953,7 @@
           "runtime_manifest": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/RuntimeManifest"
+                "$ref": "#/components/schemas/DecisionRuntimeManifest"
               },
               {
                 "type": "null"
@@ -2121,6 +2199,162 @@
         "title": "DecisionResultManifest",
         "type": "object"
       },
+      "DecisionRuntimeManifest": {
+        "properties": {
+          "architecture": {
+            "title": "Architecture",
+            "type": "string"
+          },
+          "build_sha": {
+            "title": "Build Sha",
+            "type": "string"
+          },
+          "dependency_lock_hash": {
+            "title": "Dependency Lock Hash",
+            "type": "string"
+          },
+          "hash_schema_version": {
+            "title": "Hash Schema Version",
+            "type": "string"
+          },
+          "operating_system": {
+            "title": "Operating System",
+            "type": "string"
+          },
+          "ortools_version": {
+            "title": "Ortools Version",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_DECISION_RUNTIME_MANIFEST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "pydantic_version": {
+            "title": "Pydantic Version",
+            "type": "string"
+          },
+          "python_version": {
+            "title": "Python Version",
+            "type": "string"
+          },
+          "sqlite_version": {
+            "title": "Sqlite Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hash_schema_version",
+          "python_version",
+          "ortools_version",
+          "sqlite_version",
+          "pydantic_version",
+          "operating_system",
+          "architecture",
+          "build_sha",
+          "dependency_lock_hash"
+        ],
+        "title": "DecisionRuntimeManifest",
+        "type": "object"
+      },
+      "EmergencyDecisionInformationSet": {
+        "description": "Evidence available when the emergency responder decision is made.",
+        "properties": {
+          "candidate_technician_ids": {
+            "items": {
+              "maxLength": 80,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Candidate Technician Ids",
+            "type": "array"
+          },
+          "decision_time": {
+            "maximum": 2760.0,
+            "minimum": 0.0,
+            "title": "Decision Time",
+            "type": "integer"
+          },
+          "deterministic_dispatch_by_technician": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Deterministic Dispatch By Technician",
+            "type": "object"
+          },
+          "deterministic_finish_by_technician": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Deterministic Finish By Technician",
+            "type": "object"
+          },
+          "dispatch_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Point"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dispatch_time": {
+            "anyOf": [
+              {
+                "maximum": 2760.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispatch Time"
+          },
+          "event_time": {
+            "maximum": 2280.0,
+            "minimum": 0.0,
+            "title": "Event Time",
+            "type": "integer"
+          },
+          "excluded_candidate_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Excluded Candidate Reasons",
+            "type": "object"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_EMERGENCY_INFORMATION_SET_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "selected_technician_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Technician Id"
+          },
+          "selection_policy": {
+            "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
+            "default": "MYOPIC_EARLIEST_EMERGENCY_FINISH"
+          }
+        },
+        "required": [
+          "event_time",
+          "decision_time"
+        ],
+        "title": "EmergencyDecisionInformationSet",
+        "type": "object"
+      },
       "EmergencyDispatchPolicy": {
         "description": "When a technician may leave the published route for an emergency.",
         "enum": [
@@ -2131,10 +2365,120 @@
       },
       "EmergencyResponderSelectionPolicy": {
         "enum": [
-          "EARLIEST_FEASIBLE_COMPLETION"
+          "MYOPIC_EARLIEST_EMERGENCY_FINISH"
         ],
         "title": "EmergencyResponderSelectionPolicy",
         "type": "string"
+      },
+      "EmergencyWorkOrderCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "customer_name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Customer Name",
+            "type": "string"
+          },
+          "drop_penalty": {
+            "default": 1200,
+            "exclusiveMinimum": 0.0,
+            "title": "Drop Penalty",
+            "type": "integer"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "is_emergency": {
+            "const": true,
+            "default": true,
+            "title": "Is Emergency",
+            "type": "boolean"
+          },
+          "location": {
+            "$ref": "#/components/schemas/Point"
+          },
+          "note": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Note",
+            "type": "string"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority",
+            "default": "normal"
+          },
+          "reported_at": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported At"
+          },
+          "required_skills": {
+            "items": {
+              "$ref": "#/components/schemas/Skill"
+            },
+            "title": "Required Skills",
+            "type": "array"
+          },
+          "service_duration": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 480.0,
+            "title": "Service Duration",
+            "type": "integer"
+          },
+          "sla_deadline": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Sla Deadline",
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "vip": {
+            "default": false,
+            "title": "Vip",
+            "type": "boolean"
+          },
+          "window_end": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Window End",
+            "type": "integer"
+          },
+          "window_start": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Window Start",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "customer_name",
+          "title",
+          "required_skills",
+          "location",
+          "service_duration",
+          "window_start",
+          "window_end",
+          "sla_deadline"
+        ],
+        "title": "EmergencyWorkOrderCreate",
+        "type": "object"
       },
       "ExecutionSourceAssignment": {
         "properties": {
@@ -2753,12 +3097,57 @@
       "PairedMetricSummary": {
         "properties": {
           "ci_high": {
-            "title": "Ci High",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ci High"
           },
           "ci_low": {
-            "title": "Ci Low",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ci Low"
+          },
+          "conditioning_event": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conditioning Event"
+          },
+          "effective_sample_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Effective Sample Count",
+            "type": "integer"
+          },
+          "interpretation_status": {
+            "default": "ESTIMATED",
+            "enum": [
+              "ESTIMATED",
+              "INSUFFICIENT_EVENT_TRIALS"
+            ],
+            "title": "Interpretation Status",
+            "type": "string"
+          },
+          "interval_method": {
+            "default": "PAIRED_BOOTSTRAP_V1",
+            "title": "Interval Method",
+            "type": "string"
           },
           "loss_count": {
             "minimum": 0.0,
@@ -2766,8 +3155,15 @@
             "type": "integer"
           },
           "mean_delta": {
-            "title": "Mean Delta",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Delta"
           },
           "tie_count": {
             "minimum": 0.0,
@@ -2781,9 +3177,6 @@
           }
         },
         "required": [
-          "mean_delta",
-          "ci_low",
-          "ci_high",
           "win_count",
           "tie_count",
           "loss_count"
@@ -2852,6 +3245,16 @@
             "minimum": 0.0,
             "title": "Labor Cost Cents",
             "type": "integer"
+          },
+          "ledger": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CostLedger"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "outsourcing_cost_cents": {
             "minimum": 0.0,
@@ -3185,13 +3588,12 @@
           "source_solver_provenance": {
             "anyOf": [
               {
-                "type": "string"
+                "$ref": "#/components/schemas/SourceSolverProvenance"
               },
               {
                 "type": "null"
               }
-            ],
-            "title": "Source Solver Provenance"
+            ]
           },
           "source_version_id": {
             "anyOf": [
@@ -3505,6 +3907,29 @@
         "title": "ReattestationMode",
         "type": "string"
       },
+      "ReleaseManifest": {
+        "properties": {
+          "frontend_dependency_lock_hash": {
+            "title": "Frontend Dependency Lock Hash",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_RELEASE_MANIFEST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "release_build_sha": {
+            "title": "Release Build Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "release_build_sha",
+          "frontend_dependency_lock_hash"
+        ],
+        "title": "ReleaseManifest",
+        "type": "object"
+      },
       "ReplanRequest": {
         "properties": {
           "current_time": {
@@ -3523,7 +3948,7 @@
           "emergency_order": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/WorkOrder"
+                "$ref": "#/components/schemas/EmergencyWorkOrderCreate"
               },
               {
                 "type": "null"
@@ -3673,15 +4098,32 @@
             "$ref": "#/components/schemas/PairedMetricSummary"
           },
           "paired_emergency_completion_delta": {
-            "$ref": "#/components/schemas/PairedMetricSummary"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "paired_emergency_on_time_delta": {
-            "$ref": "#/components/schemas/PairedMetricSummary"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "paired_overtime_delta": {
             "$ref": "#/components/schemas/PairedMetricSummary"
           },
           "paired_published_sla_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_unconditional_emergency_completion_impact": {
             "$ref": "#/components/schemas/PairedMetricSummary"
           },
           "paired_unserved_delta": {
@@ -3693,6 +4135,7 @@
           "paired_all_demand_sla_delta",
           "paired_emergency_completion_delta",
           "paired_emergency_on_time_delta",
+          "paired_unconditional_emergency_completion_impact",
           "paired_overtime_delta",
           "paired_unserved_delta",
           "paired_disruption_delta"
@@ -3987,7 +4430,7 @@
           },
           "emergency_responder_selection_policy": {
             "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
-            "default": "EARLIEST_FEASIBLE_COMPLETION"
+            "default": "MYOPIC_EARLIEST_EMERGENCY_FINISH"
           },
           "execution_policy": {
             "$ref": "#/components/schemas/RiskExecutionPolicy",
@@ -4069,7 +4512,7 @@
           },
           "emergency_responder_selection_policy": {
             "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
-            "default": "EARLIEST_FEASIBLE_COMPLETION"
+            "default": "MYOPIC_EARLIEST_EMERGENCY_FINISH"
           },
           "execution_policy": {
             "$ref": "#/components/schemas/RiskExecutionPolicy",
@@ -4222,6 +4665,18 @@
             "title": "Current Execution Watermark",
             "type": "integer"
           },
+          "emergency_affected_work_order_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Affected Work Order Count"
+          },
           "emergency_capacity_disruption_probability": {
             "default": 0,
             "maximum": 1.0,
@@ -4265,15 +4720,27 @@
             "type": "number"
           },
           "emergency_completion_rate": {
-            "default": 1,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Emergency Completion Rate",
-            "type": "number"
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Completion Rate"
           },
           "emergency_dispatch_policy": {
             "$ref": "#/components/schemas/EmergencyDispatchPolicy",
             "default": "BETWEEN_VISITS_ONLY"
+          },
+          "emergency_event_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Event Count",
+            "type": "integer"
           },
           "emergency_event_probability": {
             "default": 0,
@@ -4289,23 +4756,71 @@
             "title": "Emergency Failure Given Event Probability",
             "type": "number"
           },
+          "emergency_incremental_late_minutes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Incremental Late Minutes"
+          },
+          "emergency_incremental_overtime_minutes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Incremental Overtime Minutes"
+          },
+          "emergency_incremental_unserved_orders": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Incremental Unserved Orders"
+          },
           "emergency_on_time_rate": {
-            "default": 1,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Emergency On Time Rate",
-            "type": "number"
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency On Time Rate"
           },
           "emergency_responder_selection_policy": {
             "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
-            "default": "EARLIEST_FEASIBLE_COMPLETION"
+            "default": "MYOPIC_EARLIEST_EMERGENCY_FINISH"
           },
           "emergency_unserved_probability": {
-            "default": 0,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Emergency Unserved Probability",
-            "type": "number"
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Unserved Probability"
           },
           "execution_context_hash": {
             "anyOf": [
@@ -4479,7 +4994,7 @@
             "type": "string"
           },
           "simulation_policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_V4",
+            "default": "FIELD_SERVICE_SIMULATION_V5",
             "title": "Simulation Policy Version",
             "type": "string"
           },
@@ -4575,10 +5090,26 @@
             "title": "Disrupted",
             "type": "boolean"
           },
+          "emergency_affected_work_order_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Affected Work Order Count",
+            "type": "integer"
+          },
           "emergency_completed": {
             "default": false,
             "title": "Emergency Completed",
             "type": "boolean"
+          },
+          "emergency_decision_information_set": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmergencyDecisionInformationSet"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "emergency_dispatch_location": {
             "anyOf": [
@@ -4603,6 +5134,11 @@
             ],
             "title": "Emergency Dispatch Time"
           },
+          "emergency_event": {
+            "default": false,
+            "title": "Emergency Event",
+            "type": "boolean"
+          },
           "emergency_finish_time": {
             "anyOf": [
               {
@@ -4615,6 +5151,24 @@
               }
             ],
             "title": "Emergency Finish Time"
+          },
+          "emergency_incremental_late_minutes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Incremental Late Minutes",
+            "type": "integer"
+          },
+          "emergency_incremental_overtime_minutes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Incremental Overtime Minutes",
+            "type": "integer"
+          },
+          "emergency_incremental_unserved_orders": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Emergency Incremental Unserved Orders",
+            "type": "integer"
           },
           "emergency_on_time": {
             "default": false,
@@ -4931,64 +5485,6 @@
           "return_location"
         ],
         "title": "RouteEntryContext",
-        "type": "object"
-      },
-      "RuntimeManifest": {
-        "properties": {
-          "architecture": {
-            "title": "Architecture",
-            "type": "string"
-          },
-          "build_sha": {
-            "title": "Build Sha",
-            "type": "string"
-          },
-          "dependency_lock_hash": {
-            "title": "Dependency Lock Hash",
-            "type": "string"
-          },
-          "hash_schema_version": {
-            "title": "Hash Schema Version",
-            "type": "string"
-          },
-          "operating_system": {
-            "title": "Operating System",
-            "type": "string"
-          },
-          "ortools_version": {
-            "title": "Ortools Version",
-            "type": "string"
-          },
-          "policy_version": {
-            "default": "FIELD_SERVICE_RUNTIME_MANIFEST_V1",
-            "title": "Policy Version",
-            "type": "string"
-          },
-          "pydantic_version": {
-            "title": "Pydantic Version",
-            "type": "string"
-          },
-          "python_version": {
-            "title": "Python Version",
-            "type": "string"
-          },
-          "sqlite_version": {
-            "title": "Sqlite Version",
-            "type": "string"
-          }
-        },
-        "required": [
-          "hash_schema_version",
-          "python_version",
-          "ortools_version",
-          "sqlite_version",
-          "pydantic_version",
-          "operating_system",
-          "architecture",
-          "build_sha",
-          "dependency_lock_hash"
-        ],
-        "title": "RuntimeManifest",
         "type": "object"
       },
       "ScenarioCreate": {
@@ -6093,7 +6589,7 @@
           },
           "emergency_responder_selection_policy": {
             "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
-            "default": "EARLIEST_FEASIBLE_COMPLETION"
+            "default": "MYOPIC_EARLIEST_EMERGENCY_FINISH"
           },
           "exogenous_parameters": {
             "additionalProperties": {
@@ -6120,7 +6616,7 @@
             "default": "LEGACY_UNATTESTED"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V4",
+            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V5",
             "title": "Policy Version",
             "type": "string"
           },
@@ -6383,6 +6879,48 @@
         ],
         "title": "SolverStatus",
         "type": "string"
+      },
+      "SourceSolverProvenance": {
+        "properties": {
+          "claimed_policy_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SolverPolicySnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "claimed_solver_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed Solver Name"
+          },
+          "claimed_solver_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed Solver Version"
+          },
+          "integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          }
+        },
+        "title": "SourceSolverProvenance",
+        "type": "object"
       },
       "StrategyCandidate": {
         "properties": {
@@ -7440,6 +7978,116 @@
         "title": "WorkOrder",
         "type": "object"
       },
+      "WorkOrderCreate": {
+        "additionalProperties": false,
+        "description": "Public create command; execution state is intentionally not client-controlled.",
+        "properties": {
+          "customer_name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Customer Name",
+            "type": "string"
+          },
+          "drop_penalty": {
+            "default": 1200,
+            "exclusiveMinimum": 0.0,
+            "title": "Drop Penalty",
+            "type": "integer"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "is_emergency": {
+            "default": false,
+            "title": "Is Emergency",
+            "type": "boolean"
+          },
+          "location": {
+            "$ref": "#/components/schemas/Point"
+          },
+          "note": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Note",
+            "type": "string"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority",
+            "default": "normal"
+          },
+          "reported_at": {
+            "anyOf": [
+              {
+                "maximum": 1800.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported At"
+          },
+          "required_skills": {
+            "items": {
+              "$ref": "#/components/schemas/Skill"
+            },
+            "title": "Required Skills",
+            "type": "array"
+          },
+          "service_duration": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 480.0,
+            "title": "Service Duration",
+            "type": "integer"
+          },
+          "sla_deadline": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Sla Deadline",
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "vip": {
+            "default": false,
+            "title": "Vip",
+            "type": "boolean"
+          },
+          "window_end": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Window End",
+            "type": "integer"
+          },
+          "window_start": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Window Start",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "customer_name",
+          "title",
+          "required_skills",
+          "location",
+          "service_duration",
+          "window_start",
+          "window_end",
+          "sla_deadline"
+        ],
+        "title": "WorkOrderCreate",
+        "type": "object"
+      },
       "WorkOrderDisposition": {
         "properties": {
           "disposition": {
@@ -7558,6 +8206,11 @@
               }
             ],
             "title": "Estimated Remaining Minutes"
+          },
+          "event_content_hash": {
+            "default": "",
+            "title": "Event Content Hash",
+            "type": "string"
           },
           "id": {
             "title": "Id",
@@ -7758,6 +8411,7 @@
         "type": "string"
       },
       "WorkOrderUpdate": {
+        "additionalProperties": false,
         "properties": {
           "customer_name": {
             "anyOf": [
@@ -7881,16 +8535,6 @@
             ],
             "title": "Sla Deadline"
           },
-          "status": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/WorkOrderStatus"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "title": {
             "anyOf": [
               {
@@ -7950,7 +8594,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.7"
+    "version": "0.5.8"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -8562,6 +9206,7 @@
     },
     "/api/scenarios/{scenario_id}/lock": {
       "post": {
+        "deprecated": true,
         "operationId": "lock_assignment_api_scenarios__scenario_id__lock_post",
         "parameters": [
           {
@@ -9648,6 +10293,7 @@
     },
     "/api/scenarios/{scenario_id}/reset": {
       "post": {
+        "deprecated": true,
         "operationId": "reset_scenario_api_scenarios__scenario_id__reset_post",
         "parameters": [
           {
@@ -10213,6 +10859,7 @@
     },
     "/api/scenarios/{scenario_id}/technicians": {
       "post": {
+        "deprecated": true,
         "operationId": "create_technician_api_scenarios__scenario_id__technicians_post",
         "parameters": [
           {
@@ -10278,6 +10925,7 @@
     },
     "/api/scenarios/{scenario_id}/technicians/{technician_id}": {
       "put": {
+        "deprecated": true,
         "operationId": "update_technician_api_scenarios__scenario_id__technicians__technician_id__put",
         "parameters": [
           {
@@ -10352,6 +11000,7 @@
     },
     "/api/scenarios/{scenario_id}/work-orders": {
       "post": {
+        "deprecated": true,
         "operationId": "create_work_order_api_scenarios__scenario_id__work_orders_post",
         "parameters": [
           {
@@ -10384,7 +11033,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/WorkOrder"
+                "$ref": "#/components/schemas/WorkOrderCreate"
               }
             }
           },
@@ -10417,6 +11066,7 @@
     },
     "/api/scenarios/{scenario_id}/work-orders/{work_order_id}": {
       "delete": {
+        "deprecated": true,
         "operationId": "delete_work_order_api_scenarios__scenario_id__work_orders__work_order_id__delete",
         "parameters": [
           {
@@ -10479,6 +11129,7 @@
         "summary": "Delete Work Order"
       },
       "put": {
+        "deprecated": true,
         "operationId": "update_work_order_api_scenarios__scenario_id__work_orders__work_order_id__put",
         "parameters": [
           {
@@ -10862,6 +11513,466 @@
           }
         },
         "summary": "Get Technicians"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/lock": {
+      "post": {
+        "operationId": "lock_assignment_api_v2_scenarios__scenario_id__lock_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LockRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Lock Assignment"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/reset": {
+      "post": {
+        "operationId": "reset_scenario_api_v2_scenarios__scenario_id__reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Scenario"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/technicians": {
+      "post": {
+        "operationId": "create_technician_api_v2_scenarios__scenario_id__technicians_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Technician"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Technician"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/technicians/{technician_id}": {
+      "put": {
+        "operationId": "update_technician_api_v2_scenarios__scenario_id__technicians__technician_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "technician_id",
+            "required": true,
+            "schema": {
+              "title": "Technician Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TechnicianUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Technician"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/work-orders": {
+      "post": {
+        "operationId": "create_work_order_api_v2_scenarios__scenario_id__work_orders_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Work Order"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/work-orders/{work_order_id}": {
+      "delete": {
+        "operationId": "delete_work_order_api_v2_scenarios__scenario_id__work_orders__work_order_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "work_order_id",
+            "required": true,
+            "schema": {
+              "title": "Work Order Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Work Order"
+      },
+      "put": {
+        "operationId": "update_work_order_api_v2_scenarios__scenario_id__work_orders__work_order_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "work_order_id",
+            "required": true,
+            "schema": {
+              "title": "Work Order Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleScenario"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Work Order"
       }
     },
     "/api/work-orders": {

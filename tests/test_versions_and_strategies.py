@@ -95,7 +95,11 @@ def test_restore_is_non_destructive_and_experiment_candidates_do_not_consume_ver
         assert internal_baseline["solver_config_hash"] == expected_solver_hash
         assert internal_baseline["scenario_snapshot_hash"] == optimized["scenario_snapshot_hash"]
 
-        edited = client.put("/api/scenarios/main/work-orders/WO-1021", json={"title": "临时修改"}).json()
+        edited = client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            headers={"If-Match": "D0"},
+            json={"title": "临时修改"},
+        ).json()
         assert edited["revision"] == 1
 
         plans = client.get("/api/scenarios/main/plan-versions").json()
@@ -358,7 +362,11 @@ def test_custom_profile_crud_and_stale_experiment_guard(monkeypatch, tmp_path):
         experiment = _wait_for_experiment(client, "main", response.json()["id"])
         _wait_for_experiment(client, "main", changed_profile_experiment.json()["id"])
         assert experiment["status"] == "COMPLETED"
-        edited = client.put("/api/scenarios/main/work-orders/WO-1021", json={"note": "实验后更新"})
+        edited = client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            headers={"If-Match": "D0"},
+            json={"note": "实验后更新"},
+        )
         assert edited.status_code == 200
         rejected = client.post(
             f"/api/scenarios/main/strategy-experiments/{experiment['id']}/publish",
@@ -378,6 +386,7 @@ def test_comparison_marks_different_business_snapshots_as_non_comparable(monkeyp
         assert (
             client.put(
                 "/api/scenarios/main/work-orders/WO-1021",
+                headers={"If-Match": "D0"},
                 json={"note": "客户改约后重新计算"},
             ).status_code
             == 200
@@ -427,7 +436,14 @@ def test_plan_commands_are_idempotent_in_scenario_and_action_namespaces(monkeypa
         assert optimized.json()["id"] == optimized_retry.json()["id"]
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
 
-        assert client.put("/api/scenarios/main/work-orders/WO-1021", json={"note": "新修订"}).status_code == 200
+        assert (
+            client.put(
+                "/api/scenarios/main/work-orders/WO-1021",
+                headers={"If-Match": "D0"},
+                json={"note": "新修订"},
+            ).status_code
+            == 200
+        )
         conflict = client.post("/api/scenarios/main/baseline", headers=headers)
         assert conflict.status_code == 409
 
@@ -486,7 +502,14 @@ def test_historical_activation_and_clone_do_not_modify_current_business_data(mon
         assert clone.json()["revision"] == 0
         assert client.get("/api/scenarios/main").json()["revision"] == 0
 
-        assert client.put("/api/scenarios/main/work-orders/WO-1021", json={"note": "实时变更"}).status_code == 200
+        assert (
+            client.put(
+                "/api/scenarios/main/work-orders/WO-1021",
+                headers={"If-Match": "D0"},
+                json={"note": "实时变更"},
+            ).status_code
+            == 200
+        )
         rejected = client.post(
             f"/api/scenarios/main/plan-versions/{source['id']}/activate",
             json={"expected_revision": 1, "idempotency_key": "activate-history-002"},
@@ -584,6 +607,7 @@ def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
         assert (
             client.put(
                 "/api/scenarios/main/work-orders/WO-1021",
+                headers={"If-Match": "D0"},
                 json={"note": source_note},
             ).status_code
             == 200
@@ -602,10 +626,11 @@ def test_cloned_scenario_resets_to_its_cloned_snapshot(monkeypatch, tmp_path):
 
         edited = client.put(
             f"/api/scenarios/{clone_id}/work-orders/WO-1021",
+            headers={"If-Match": "D0"},
             json={"note": "副本中的临时修改"},
         )
         assert edited.status_code == 200
-        reset = client.post(f"/api/scenarios/{clone_id}/reset")
+        reset = client.post(f"/api/scenarios/{clone_id}/reset", headers={"If-Match": "D1"})
         assert reset.status_code == 200
         assert reset.json()["revision"] == 2
         assert next(item for item in reset.json()["work_orders"] if item["id"] == "WO-1021")["note"] == source_note
@@ -659,8 +684,16 @@ def test_business_rollback_blocks_reopening_completed_and_deleting_new_orders(mo
 
         current = client.get("/api/scenarios/main").json()
         extra = dict(current["work_orders"][0])
-        extra.update({"id": "WO-NEW-AFTER-PLAN", "status": "pending", "is_emergency": False, "reported_at": None})
-        assert client.post("/api/scenarios/main/work-orders", json=extra).status_code == 200
+        extra.update({"id": "WO-NEW-AFTER-PLAN", "is_emergency": False, "reported_at": None})
+        extra.pop("status", None)
+        assert (
+            client.post(
+                "/api/scenarios/main/work-orders",
+                headers={"If-Match": "D2"},
+                json=extra,
+            ).status_code
+            == 200
+        )
         preview = client.get(f"/api/scenarios/main/plan-versions/{source['id']}/rollback-preview").json()
         assert preview["removed_work_orders"] == ["WO-NEW-AFTER-PLAN"]
         blocked = client.post(
@@ -842,7 +875,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 21
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -857,7 +890,7 @@ def test_schema_versions_1_through_15_converge_to_current_schema(tmp_path, legac
     migrated = Store(database)
     assert migrated.get_scenario("main") is not None
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert "publication_key" in {row[1] for row in connection.execute("PRAGMA table_info(command_keys)").fetchall()}
@@ -912,7 +945,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"

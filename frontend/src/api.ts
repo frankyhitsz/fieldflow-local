@@ -56,7 +56,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   scenarios: () => request<Scenario[]>('/api/scenarios'),
   scenario: (id: string) => request<Scenario>(`/api/scenarios/${id}`),
-  resetScenario: (id: string, expectedRevision: number) => request<Scenario>(`/api/scenarios/${id}/reset`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` } }),
+  resetScenario: (id: string, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${id}/reset`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` } }),
   schedules: (id: string) => request<Schedule[]>(`/api/scenarios/${id}/schedules`),
   planVersions: (id: string) => request<PlanVersion[]>(`/api/scenarios/${id}/plan-versions`),
   planVersion: (id: string, versionId: string) => request<PlanVersion>(`/api/scenarios/${id}/plan-versions/${versionId}`),
@@ -68,9 +68,12 @@ export const api = {
   clonePlanScenario: (id: string, versionId: string, name: string, idempotencyKey: string) => request<Scenario>(`/api/scenarios/${id}/plan-versions/${versionId}/clone-scenario`, { method: 'POST', body: JSON.stringify({ name, idempotency_key: idempotencyKey }) }),
   baseline: (id: string, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/baseline`, { method: 'POST', headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined }),
   optimize: (id: string, strategy: Strategy = 'balanced', profileId?: string, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/optimize`, { method: 'POST', headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined, body: JSON.stringify({ strategy, profile_id: profileId }) }),
-  replan: (id: string, currentTime = 600, strategy: Strategy | 'stable' = 'stable', emergencyOrder?: WorkOrder, idempotencyKey?: string) => request<Schedule>(`/api/scenarios/${id}/replan`, { method: 'POST', body: JSON.stringify({ current_time: currentTime, planning_time: currentTime, strategy, emergency_order: emergencyOrder, idempotency_key: idempotencyKey }) }),
+  replan: (id: string, currentTime = 600, strategy: Strategy | 'stable' = 'stable', emergencyOrder?: WorkOrder, idempotencyKey?: string) => {
+    const emergencyPayload = emergencyOrder ? Object.fromEntries(Object.entries(emergencyOrder).filter(([key]) => key !== 'status')) : undefined
+    return request<Schedule>(`/api/scenarios/${id}/replan`, { method: 'POST', body: JSON.stringify({ current_time: currentTime, planning_time: currentTime, strategy, emergency_order: emergencyPayload, idempotency_key: idempotencyKey }) })
+  },
   lock: (scenarioId: string, orderId: string, technicianId: string, locked: boolean, expectedRevision: number) =>
-    request<Scenario>(`/api/scenarios/${scenarioId}/lock`, {
+    request<Scenario>(`/api/v2/scenarios/${scenarioId}/lock`, {
       method: 'POST', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify({ work_order_id: orderId, technician_id: technicianId, locked }),
     }),
   manualReassignment: (scenarioId: string, orderId: string, technicianId: string, planningTime: number, expectedRevision: number, idempotencyKey: string) =>
@@ -91,9 +94,12 @@ export const api = {
   experiment: (id: string, experimentId: string, signal?: AbortSignal) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments/${experimentId}`, { signal }),
   cancelExperiment: (id: string, experimentId: string) => request<StrategyExperiment>(`/api/scenarios/${id}/strategy-experiments/${experimentId}/cancel`, { method: 'POST' }),
   publishExperiment: (id: string, experimentId: string, candidateId: string, expectedRevision: number) => request<PlanVersion>(`/api/scenarios/${id}/strategy-experiments/${experimentId}/publish`, { method: 'POST', body: JSON.stringify({ candidate_id: candidateId, expected_revision: expectedRevision }) }),
-  createWorkOrder: (scenarioId: string, order: WorkOrder, expectedRevision: number) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(order) }),
-  updateWorkOrder: (scenarioId: string, orderId: string, order: Partial<WorkOrder>, expectedRevision: number) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(order) }),
-  deleteWorkOrder: (scenarioId: string, orderId: string, expectedRevision: number) => request<Scenario>(`/api/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'DELETE', headers: { 'If-Match': `D${expectedRevision}` } }),
+  createWorkOrder: (scenarioId: string, order: WorkOrder, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${scenarioId}/work-orders`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(Object.fromEntries(Object.entries(order).filter(([key]) => key !== 'status'))) }),
+  updateWorkOrder: (scenarioId: string, orderId: string, order: Partial<WorkOrder>, expectedRevision: number) => {
+    const payload = Object.fromEntries(Object.entries(order).filter(([key]) => key !== 'id' && key !== 'status'))
+    return request<Scenario>(`/api/v2/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(payload) })
+  },
+  deleteWorkOrder: (scenarioId: string, orderId: string, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'DELETE', headers: { 'If-Match': `D${expectedRevision}` } }),
   executeWorkOrder: (scenarioId: string, orderId: string, action: 'start' | 'complete', technicianId: string, occurredAt: number, expectedRevision: number, idempotencyKey: string, options?: { earlyStartOverrideReason?: string; estimatedRemainingMinutes?: number; note?: string }) => request<ExecutionResult>(`/api/scenarios/${scenarioId}/work-orders/${orderId}/${action}`, { method: 'POST', body: JSON.stringify({ technician_id: technicianId, occurred_at: occurredAt, expected_revision: expectedRevision, idempotency_key: idempotencyKey, early_start_override_reason: options?.earlyStartOverrideReason || null, estimated_remaining_minutes: action === 'start' ? options?.estimatedRemainingMinutes ?? null : null, note: options?.note || '' }) }),
   executionEvents: (scenarioId: string) => request<ExecutionEvent[]>(`/api/scenarios/${scenarioId}/execution-events`),
   analysisRuns: (scenarioId: string, versionId: string) => request<DecisionAnalysisRun[]>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`),
@@ -111,6 +117,6 @@ export const api = {
   rerunDecisionAnalysisCurrent: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string, idempotencyKey = `analysis-rerun-${crypto.randomUUID()}`) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/rerun-current`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } }),
   decisionAnalysisArtifacts: (scenarioId: string, analysisId: string) => request<DecisionAnalysisArtifact[]>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts`),
   decisionAnalysisArtifact: (scenarioId: string, analysisId: string, artifactId: string) => request<DecisionAnalysisArtifact>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts/${artifactId}`),
-  createTechnician: (scenarioId: string, technician: Technician, expectedRevision: number) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(technician) }),
-  updateTechnician: (scenarioId: string, technicianId: string, technician: Partial<Technician>, expectedRevision: number) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians/${technicianId}`, { method: 'PUT', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(technician) }),
+  createTechnician: (scenarioId: string, technician: Technician, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${scenarioId}/technicians`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(technician) }),
+  updateTechnician: (scenarioId: string, technicianId: string, technician: Partial<Technician>, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${scenarioId}/technicians/${technicianId}`, { method: 'PUT', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(technician) }),
 }
