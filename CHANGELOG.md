@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.6 — 2026-08-25
+
+- Added Plan Manifest V2 and transitive effective trust across Plan, decision analysis, artifacts and paired risk comparisons.
+- Closed Plan-use bypasses in execution, replay, clone, restore, comparison, reports and schedules; legacy plans now require publication as a new re-attested version.
+- Moved analysis state into relational columns with reservation evidence and an irreversible terminal-state trigger.
+- Corrected remaining-plan paid-shift and single-day cost semantics and reused them for capacity analysis.
+- Made unconfirmed outsourcing conditional, with formal feasibility, KPI and economic recommendations withheld until supplier capacity is evidenced.
+- Split published-commitment and all-demand SLA, included emergency demand and randomized travel, and reported emergency completion, on-time and unserved rates.
+- Added dependency-bound, idempotent risk comparisons with preflight conflict detection and read-time revalidation.
+- Split assignment feasibility from objective/metadata changes and isolated malformed Plan/A rows from history lists.
+
 ## 0.5.5 — 2026-08-25
 
 - Made required Plan, A and Artifact attestations fail closed across every read, replay and retry path; legacy status now comes from an immutable schema column.

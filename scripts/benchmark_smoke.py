@@ -13,15 +13,18 @@ from backend.decision import (
 from backend.fixtures import get_fixture
 from backend.hashing import content_hash
 from backend.models import (
+    AnalysisIntegrityStatus,
     CapacityAnalysisRequest,
     CapacityReferenceMode,
     DecisionAnalysisContext,
     DecisionAnalysisScope,
     PlanVersion,
+    PublicationVerificationArtifact,
     RiskExecutionPolicy,
     RiskSimulationRequest,
     Skill,
 )
+from backend.provenance import build_plan_manifest_payload
 from backend.scheduler import baseline_schedule, calculate_kpis
 from backend.travel import EuclideanTravelTimeProvider
 from backend.verification import verify_schedule
@@ -32,7 +35,19 @@ def plan_for(scenario_id: str):
     schedule = baseline_schedule(scenario, 1)
     report = verify_schedule(scenario, schedule)
     assert report.publishable, [item.code for item in report.errors]
-    return scenario, PlanVersion(
+    report_payload = report.model_dump(mode="json")
+    verification_payload = {
+        "policy_version": "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+        "candidate_snapshot": {},
+        "planning_context_snapshot": None,
+        "transaction_verification_report": report_payload,
+        "verified_schedule_hash": content_hash(schedule),
+    }
+    verification = PublicationVerificationArtifact(
+        **verification_payload,
+        artifact_hash=content_hash(verification_payload),
+    )
+    plan = PlanVersion(
         id=f"BENCH-{scenario.id}",
         scenario_id=scenario.id,
         number=1,
@@ -43,7 +58,28 @@ def plan_for(scenario_id: str):
         scenario_snapshot=scenario,
         selected=schedule,
         scenario_snapshot_hash=content_hash(scenario),
+        published_schedule_hash=content_hash(schedule),
+        publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+        publication_verification_report_hash=content_hash(report_payload),
+        publication_verification_artifact=verification,
+        publication_manifest_version="FIELD_SERVICE_PUBLICATION_MANIFEST_V2",
+        publication_manifest_hash="pending",
+        integrity_status=AnalysisIntegrityStatus.verified,
+        self_integrity=AnalysisIntegrityStatus.verified,
+        effective_integrity=AnalysisIntegrityStatus.verified,
     )
+    plan.publication_manifest_hash = content_hash(build_plan_manifest_payload(plan))
+    return scenario, plan
+
+
+def refresh_plan_attestation(plan: PlanVersion) -> None:
+    assert plan.publication_verification_artifact is not None
+    plan.published_schedule_hash = content_hash(plan.selected)
+    plan.publication_verification_artifact.verified_schedule_hash = plan.published_schedule_hash
+    plan.publication_verification_artifact.artifact_hash = content_hash(
+        plan.publication_verification_artifact.model_dump(exclude={"artifact_hash"}, mode="json")
+    )
+    plan.publication_manifest_hash = content_hash(build_plan_manifest_payload(plan))
 
 
 rows: list[dict[str, object]] = []
@@ -150,6 +186,7 @@ delayed_plan.selected.kpis = calculate_kpis(
     delayed_plan.selected.assignments,
     delayed_plan.selected.unassigned,
 )
+refresh_plan_attestation(delayed_plan)
 zero_noise = {
     "seed": 7,
     "trials": 50,

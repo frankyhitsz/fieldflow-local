@@ -51,6 +51,7 @@ from .models import (
     DecisionAnalysisScope,
     ExecutionSourceContext,
     ExperimentPublishRequest,
+    FieldImpact,
     FreezeReason,
     FrozenAssignment,
     LockedAssignment,
@@ -60,9 +61,11 @@ from .models import (
     OptimizeRequest,
     PairedMetricSummary,
     PlanningContext,
+    PlanUseCase,
     PlanVersion,
     PlanVersionPatch,
     PublicationPlanningContext,
+    ReattestPlanRequest,
     ReplanRequest,
     RestoreRequest,
     RiskComparisonRun,
@@ -160,6 +163,17 @@ def require_scenario(scenario_id: str) -> ScheduleScenario:
     return scenario
 
 
+def require_plan_for_use(scenario_id: str, version_id: str, use_case: PlanUseCase) -> PlanVersion:
+    try:
+        return require_store().require_plan_for_use(scenario_id, version_id, use_case)
+    except PublicationConflict as error:
+        status_code = 404 if error.code == "PLAN_NOT_FOUND" else 409
+        raise HTTPException(
+            status_code,
+            detail={"code": error.code, "message": str(error), **error.details},
+        ) from error
+
+
 def require_profile(profile_id: str) -> StrategyProfile:
     profile = require_store().get_profile(profile_id)
     if not profile:
@@ -188,7 +202,11 @@ def validate_result(
 
 
 def save_scenario_change(
-    scenario: ScheduleScenario, reason: str, *, preserve_active_plan: bool = False
+    scenario: ScheduleScenario,
+    reason: str,
+    *,
+    preserve_active_plan: bool = False,
+    impact: FieldImpact = FieldImpact.assignment_feasibility,
 ) -> ScheduleScenario:
     try:
         scenario = ScheduleScenario.model_validate(scenario.model_dump())
@@ -199,12 +217,23 @@ def save_scenario_change(
         return current
     expected_revision = scenario.revision
     scenario.revision += 1
-    preserve_active_plan = preserve_active_plan or any(
-        order.status is not WorkOrderStatus.pending for order in scenario.work_orders
+    preserve_active_plan = (
+        preserve_active_plan
+        or impact
+        in {
+            FieldImpact.metadata_only,
+            FieldImpact.commercial_only,
+            FieldImpact.planning_objective,
+        }
+        or any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders)
     )
     try:
         require_store().save_scenario(
-            scenario, reason, expected_revision=expected_revision, preserve_active_plan=preserve_active_plan
+            scenario,
+            reason,
+            expected_revision=expected_revision,
+            preserve_active_plan=preserve_active_plan,
+            mark_plan_stale=impact is not FieldImpact.metadata_only,
         )
     except ScenarioRevisionConflict as error:
         raise HTTPException(
@@ -328,7 +357,10 @@ def publication_retry(
     try:
         existing = require_store().published_for_key(namespaced_key, fingerprint)
     except PublicationConflict as error:
-        raise HTTPException(409, str(error)) from error
+        raise HTTPException(
+            409,
+            detail={"code": error.code, "message": str(error), **error.details},
+        ) from error
     return namespaced_key, fingerprint, existing
 
 
@@ -498,7 +530,7 @@ def prepare_replan_run(
 
 def start_schedule_run(
     scenario: ScheduleScenario,
-    action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment"],
+    action: Literal["baseline", "optimize", "replan", "activate", "restore", "reattest", "experiment"],
     *,
     source: PlanVersion | None = None,
     requested_time_limit_seconds: float = 0,
@@ -644,7 +676,7 @@ def rebind_publication_planning_context(
 def publish_selected(
     scenario: ScheduleScenario,
     result: ScheduleResult,
-    action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish"],
+    action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish", "reattest"],
     *,
     artifacts: list[ScheduleArtifact],
     source: PlanVersion | None = None,
@@ -656,6 +688,7 @@ def publish_selected(
         "reactivated_from",
         "restored_from",
         "published_from_experiment",
+        "reattested_from",
         "fresh_after_data_change",
     ] = "new",
     label: str | None = None,
@@ -736,7 +769,7 @@ def publish_selected(
                 )
                 if source
                 and result.kind == "replan"
-                and action in {"activate", "restore"}
+                and action in {"activate", "restore", "reattest"}
                 and source.publication_planning_context
                 else None
             ),
@@ -761,8 +794,17 @@ def health() -> dict[str, str]:
 
 
 @router.get("/api/scenarios", response_model=list[ScheduleScenario])
-def list_scenarios() -> list[ScheduleScenario]:
-    return require_store().list_scenarios()
+def list_scenarios(response: Response) -> list[ScheduleScenario]:
+    scenarios, warnings = require_store().list_scenarios_with_warnings()
+    if warnings:
+        response.headers["X-FieldFlow-Skipped-Records"] = str(len(warnings))
+    return scenarios
+
+
+@router.get("/api/integrity-issues", response_model=list[dict[str, str]])
+def list_integrity_issues() -> list[dict[str, str]]:
+    """Return the quarantine ledger without exposing the copied payloads."""
+    return require_store().list_integrity_issues()
 
 
 @router.get("/api/scenarios/{scenario_id}", response_model=ScheduleScenario)
@@ -885,7 +927,25 @@ def update_work_order(scenario_id: str, work_order_id: str, request: WorkOrderUp
         scenario.work_orders[index] = normalize_order(WorkOrder.model_validate(payload))
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
-    return save_scenario_change(scenario, f"更新工单 {work_order_id}")
+    changed_fields = {key for key, value in updates.items() if value != original.model_dump().get(key)}
+    feasibility_fields = {
+        "required_skills",
+        "location",
+        "service_duration",
+        "window_start",
+        "window_end",
+        "reported_at",
+        "is_emergency",
+    }
+    objective_fields = {"sla_deadline", "priority", "drop_penalty", "vip"}
+    impact = (
+        FieldImpact.assignment_feasibility
+        if changed_fields & feasibility_fields
+        else FieldImpact.planning_objective
+        if changed_fields & objective_fields
+        else FieldImpact.metadata_only
+    )
+    return save_scenario_change(scenario, f"更新工单 {work_order_id}", impact=impact)
 
 
 def execute_work_order_transition(
@@ -978,13 +1038,23 @@ def update_technician(scenario_id: str, technician_id: str, request: TechnicianU
     index = next((i for i, item in enumerate(scenario.technicians) if item.id == technician_id), None)
     if index is None:
         raise HTTPException(404, f"技师 {technician_id} 不存在")
-    payload = scenario.technicians[index].model_dump()
+    original = scenario.technicians[index]
+    payload = original.model_dump()
     payload.update(request.model_dump(exclude_unset=True))
     try:
         scenario.technicians[index] = Technician.model_validate(payload)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
-    return save_scenario_change(scenario, f"更新技师 {technician_id}")
+    updates = request.model_dump(exclude_unset=True)
+    changed_fields = {key for key, value in updates.items() if value != original.model_dump().get(key)}
+    impact = (
+        FieldImpact.assignment_feasibility
+        if changed_fields & {"skills", "shift_start", "shift_end", "start_location", "overtime_limit"}
+        else FieldImpact.commercial_only
+        if "cost_per_minute_cents" in changed_fields
+        else FieldImpact.metadata_only
+    )
+    return save_scenario_change(scenario, f"更新技师 {technician_id}", impact=impact)
 
 
 def _lock_assignment(
@@ -1446,6 +1516,8 @@ def run_optimize(
     effective = scenario_for_profile(scenario, profile)
     strategy_key = profile.id if profile.builtin else "custom"
     source = require_store().active_plan_version(scenario_id) or require_store().latest_plan_version(scenario_id)
+    if source is not None:
+        source = require_plan_for_use(scenario_id, source.id, PlanUseCase.replay)
     run: ScheduleRun | None = None
     try:
         run = start_schedule_run(
@@ -1580,9 +1652,12 @@ def _run_replan(
         except PublicationConflict as error:
             raise HTTPException(409, str(error)) from error
         if existing_command and existing_command["status"] == "COMPLETED":
-            plan = require_store().get_plan_version(scenario_id, existing_command["resource_id"] or "")
-            if plan:
-                return plan.selected
+            plan = require_plan_for_use(
+                scenario_id,
+                existing_command["resource_id"] or "",
+                PlanUseCase.replay,
+            )
+            return plan.selected
         if existing_command and existing_command["status"] == "FAILED":
             payload = existing_command["payload"]
             raise HTTPException(int(payload.get("http_status", 422)), detail=payload.get("detail", payload))
@@ -1615,9 +1690,12 @@ def _run_replan(
             if not command_created:
                 command = require_store().get_command_record(command_namespace, idempotency_key, request_fingerprint)
                 if command and command["status"] == "COMPLETED":
-                    plan = require_store().get_plan_version(scenario_id, command["resource_id"] or "")
-                    if plan:
-                        return plan.selected
+                    plan = require_plan_for_use(
+                        scenario_id,
+                        command["resource_id"] or "",
+                        PlanUseCase.replay,
+                    )
+                    return plan.selected
                 if command and command["status"] == "FAILED":
                     payload = command["payload"]
                     raise HTTPException(
@@ -1639,6 +1717,8 @@ def _run_replan(
     elif solve_publication_key and request_fingerprint:
         reserve_solve_command(solve_publication_key, request_fingerprint)
     source = require_store().active_plan_version(scenario_id) or require_store().latest_plan_version(scenario_id)
+    if source is not None:
+        source = require_plan_for_use(scenario_id, source.id, PlanUseCase.replay)
     try:
         (
             previous,
@@ -1847,9 +1927,12 @@ def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
 
 
 @router.get("/api/scenarios/{scenario_id}/plan-versions", response_model=list[PlanVersion])
-def list_plan_versions(scenario_id: str) -> list[PlanVersion]:
+def list_plan_versions(scenario_id: str, response: Response) -> list[PlanVersion]:
     require_scenario(scenario_id)
-    return require_store().list_plan_versions(scenario_id)
+    plans, warnings = require_store().list_plan_versions_with_warnings(scenario_id)
+    if warnings:
+        response.headers["X-FieldFlow-Skipped-Records"] = str(len(warnings))
+    return plans
 
 
 @router.get("/api/scenarios/{scenario_id}/plan-versions/{version_id}", response_model=PlanVersion)
@@ -2044,6 +2127,7 @@ def execute_decision_analysis_run(
     supersedes_analysis_id: str | None = None,
     on_reserved: Callable[[DecisionAnalysisRun], None] | None = None,
 ) -> DecisionAnalysisRun:
+    plan = require_plan_for_use(scenario_id, plan.id, PlanUseCase.analyze)
     context = context_override or resolve_decision_analysis_context(scenario_id, plan, request.analysis_scope)
     provider = require_store().travel_provider
     if request.analysis_type == "COST":
@@ -2187,7 +2271,14 @@ def execute_decision_analysis_run(
                 )
                 artifact.artifact_hash = content_hash(
                     artifact.model_dump(
-                        exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
+                        exclude={
+                            "artifact_hash",
+                            "integrity_status",
+                            "self_integrity",
+                            "parent_analysis_integrity",
+                            "effective_integrity",
+                            "attestation_requirement",
+                        },
                         mode="json",
                     )
                 )
@@ -2252,7 +2343,14 @@ def execute_decision_analysis_run(
             )
             scenario_set_artifact.artifact_hash = content_hash(
                 scenario_set_artifact.model_dump(
-                    exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
+                    exclude={
+                        "artifact_hash",
+                        "integrity_status",
+                        "self_integrity",
+                        "parent_analysis_integrity",
+                        "effective_integrity",
+                        "attestation_requirement",
+                    },
                     mode="json",
                 )
             )
@@ -2269,7 +2367,14 @@ def execute_decision_analysis_run(
             )
             trial_outcome_artifact.artifact_hash = content_hash(
                 trial_outcome_artifact.model_dump(
-                    exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
+                    exclude={
+                        "artifact_hash",
+                        "integrity_status",
+                        "self_integrity",
+                        "parent_analysis_integrity",
+                        "effective_integrity",
+                        "attestation_requirement",
+                    },
                     mode="json",
                 )
             )
@@ -2662,11 +2767,28 @@ def compare_plan_risk_paired(
     request: RiskSimulationRequest,
     before: str = Query(...),
     after: str = Query(...),
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")] = "",
 ) -> RiskComparisonRun:
-    before_plan = require_store().get_plan_version(scenario_id, before)
-    after_plan = require_store().get_plan_version(scenario_id, after)
-    if not before_plan or not after_plan:
-        raise HTTPException(404, "比较方案不存在")
+    if not 8 <= len(idempotency_key) <= 120:
+        raise HTTPException(422, detail={"code": "INVALID_IDEMPOTENCY_KEY", "message": "幂等键长度须为 8–120"})
+    before_plan = require_plan_for_use(scenario_id, before, PlanUseCase.compare)
+    after_plan = require_plan_for_use(scenario_id, after, PlanUseCase.compare)
+    request_fingerprint = content_hash(
+        {"scenario_id": scenario_id, "before": before_plan.id, "after": after_plan.id, "request": request}
+    )
+    try:
+        existing = require_store().risk_comparison_for_idempotency(
+            scenario_id,
+            idempotency_key,
+            request_fingerprint,
+        )
+    except PublicationConflict as error:
+        raise HTTPException(
+            409,
+            detail={"code": error.code, "message": str(error), **error.details},
+        ) from error
+    if existing is not None:
+        return existing
     if before_plan.scenario_snapshot_hash != after_plan.scenario_snapshot_hash:
         raise HTTPException(
             409,
@@ -2684,6 +2806,8 @@ def compare_plan_risk_paired(
     if (
         before_run.status != "COMPLETED"
         or after_run.status != "COMPLETED"
+        or before_run.effective_integrity is not AnalysisIntegrityStatus.verified
+        or after_run.effective_integrity is not AnalysisIntegrityStatus.verified
         or not isinstance(before_run.result, RiskSimulationResult)
         or not isinstance(after_run.result, RiskSimulationResult)
     ):
@@ -2722,8 +2846,8 @@ def compare_plan_risk_paired(
     if (
         not isinstance(before_artifact, RiskTrialOutcomeArtifact)
         or not isinstance(after_artifact, RiskTrialOutcomeArtifact)
-        or before_artifact.integrity_status is not AnalysisIntegrityStatus.verified
-        or after_artifact.integrity_status is not AnalysisIntegrityStatus.verified
+        or before_artifact.effective_integrity is not AnalysisIntegrityStatus.verified
+        or after_artifact.effective_integrity is not AnalysisIntegrityStatus.verified
         or before_artifact.scenario_set_hash != after_artifact.scenario_set_hash
     ):
         raise HTTPException(
@@ -2731,6 +2855,39 @@ def compare_plan_risk_paired(
             detail={
                 "code": "PAIRED_TRIAL_EVIDENCE_INVALID",
                 "message": "配对风险比较缺少完整且使用同一场景集的 trial 证据",
+            },
+        )
+    before_scenario_artifact = (
+        require_store().get_decision_analysis_artifact(
+            scenario_id,
+            before_run.id,
+            before_run.result.scenario_set_artifact_id,
+        )
+        if before_run.result.scenario_set_artifact_id
+        else None
+    )
+    after_scenario_artifact = (
+        require_store().get_decision_analysis_artifact(
+            scenario_id,
+            after_run.id,
+            after_run.result.scenario_set_artifact_id,
+        )
+        if after_run.result.scenario_set_artifact_id
+        else None
+    )
+    if (
+        not isinstance(before_scenario_artifact, SimulationScenarioSetArtifact)
+        or not isinstance(after_scenario_artifact, SimulationScenarioSetArtifact)
+        or before_scenario_artifact.effective_integrity is not AnalysisIntegrityStatus.verified
+        or after_scenario_artifact.effective_integrity is not AnalysisIntegrityStatus.verified
+        or before_scenario_artifact.scenario_set_hash != before_artifact.scenario_set_hash
+        or after_scenario_artifact.scenario_set_hash != after_artifact.scenario_set_hash
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PAIRED_SCENARIO_EVIDENCE_INVALID",
+                "message": "配对风险比较缺少完整的共同场景集证据",
             },
         )
     before_metrics = sorted(before_artifact.metrics, key=lambda item: item.trial)
@@ -2758,6 +2915,24 @@ def compare_plan_risk_paired(
             2,
         ),
     }
+    comparison_input_payload = {
+        "policy_version": "FIELD_SERVICE_RISK_COMPARISON_INPUT_V1",
+        "scenario_id": scenario_id,
+        "before_analysis_id": before_run.id,
+        "after_analysis_id": after_run.id,
+        "before_analysis_manifest_hash": before_run.analysis_manifest_hash,
+        "after_analysis_manifest_hash": after_run.analysis_manifest_hash,
+        "before_trial_artifact_id": before_artifact.id,
+        "after_trial_artifact_id": after_artifact.id,
+        "before_trial_artifact_hash": before_artifact.artifact_hash,
+        "after_trial_artifact_hash": after_artifact.artifact_hash,
+        "before_scenario_artifact_id": before_scenario_artifact.id,
+        "after_scenario_artifact_id": after_scenario_artifact.id,
+        "before_scenario_artifact_hash": before_scenario_artifact.artifact_hash,
+        "after_scenario_artifact_hash": after_scenario_artifact.artifact_hash,
+        "scenario_set_hash": before_artifact.scenario_set_hash,
+        "trials": len(before_metrics),
+    }
     comparison = RiskComparisonRun(
         id="pending",
         scenario_id=scenario_id,
@@ -2767,6 +2942,17 @@ def compare_plan_risk_paired(
         before_plan_version_id=before_plan.id,
         after_plan_version_id=after_plan.id,
         scenario_set_hash=before_artifact.scenario_set_hash,
+        comparison_input_hash=content_hash(comparison_input_payload),
+        before_analysis_manifest_hash=before_run.analysis_manifest_hash or "",
+        after_analysis_manifest_hash=after_run.analysis_manifest_hash or "",
+        before_trial_artifact_id=before_artifact.id,
+        after_trial_artifact_id=after_artifact.id,
+        before_trial_artifact_hash=before_artifact.artifact_hash,
+        after_trial_artifact_hash=after_artifact.artifact_hash,
+        before_scenario_artifact_id=before_scenario_artifact.id,
+        after_scenario_artifact_id=after_scenario_artifact.id,
+        before_scenario_artifact_hash=before_scenario_artifact.artifact_hash,
+        after_scenario_artifact_hash=after_scenario_artifact.artifact_hash,
         trials=len(before_metrics),
         paired_sla_delta=paired_metric_summary(
             [item.sla_on_time_rate for item in before_metrics],
@@ -2792,7 +2978,17 @@ def compare_plan_risk_paired(
         comparison_hash="pending",
         created_at=_now(),
     )
-    return require_store().save_risk_comparison(comparison)
+    try:
+        return require_store().save_risk_comparison(
+            comparison,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+        )
+    except PublicationConflict as error:
+        raise HTTPException(
+            409,
+            detail={"code": error.code, "message": str(error), **error.details},
+        ) from error
 
 
 @router.get(
@@ -2949,9 +3145,9 @@ def activate_plan_version(
                 "current_revision": current.revision,
             },
         )
-    source = require_store().get_plan_version(scenario_id, version_id)
-    if not source or not source.scenario_snapshot:
-        raise HTTPException(404, "方案版本或业务快照不存在")
+    source = require_plan_for_use(scenario_id, version_id, PlanUseCase.restore)
+    if not source.scenario_snapshot:
+        raise HTTPException(404, "方案业务快照不存在")
     require_frozen_plan_integrity(source)
     current_fingerprint = content_hash(current.model_dump(exclude={"revision"}))
     source_fingerprint = content_hash(source.scenario_snapshot.model_dump(exclude={"revision"}))
@@ -2982,7 +3178,7 @@ def activate_plan_version(
     if selected.kind == "replan":
         baseline_version_id = source.stability_baseline_version_id or source.source_version_id
         if baseline_version_id:
-            stability_baseline = require_store().get_plan_version(scenario_id, baseline_version_id)
+            stability_baseline = require_plan_for_use(scenario_id, baseline_version_id, PlanUseCase.replay)
     if selected.kind != "replan":
         selected = normalize_schedule(
             current,
@@ -3017,6 +3213,92 @@ def activate_plan_version(
 
 
 @router.post(
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/reattest",
+    response_model=PlanVersion,
+)
+def reattest_plan_version(
+    scenario_id: str,
+    version_id: str,
+    request: ReattestPlanRequest,
+) -> PlanVersion:
+    """Create a new, fully attested V from a view-only legacy plan."""
+    current = require_scenario(scenario_id)
+    if current.revision != request.expected_revision:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
+                "message": "业务数据已变化，请刷新后重试",
+                "expected_revision": request.expected_revision,
+                "current_revision": current.revision,
+            },
+        )
+    source = require_store().get_plan_version(scenario_id, version_id)
+    if not source or not source.scenario_snapshot:
+        raise HTTPException(404, "方案版本或业务快照不存在")
+    if source.effective_integrity is AnalysisIntegrityStatus.failed:
+        raise HTTPException(
+            409,
+            detail={"code": "PLAN_INTEGRITY_FAILED", "message": "损坏的方案不能重新验证"},
+        )
+    if source.effective_integrity is AnalysisIntegrityStatus.verified:
+        raise HTTPException(
+            409,
+            detail={"code": "PLAN_ALREADY_ATTESTED", "message": "该方案已经通过当前发布证明"},
+        )
+    current_fingerprint = content_hash(current.model_dump(exclude={"revision"}))
+    source_fingerprint = content_hash(source.scenario_snapshot.model_dump(exclude={"revision"}))
+    if current_fingerprint != source_fingerprint:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REATTESTATION_SNAPSHOT_MISMATCH",
+                "message": "当前业务数据与历史冻结快照不同，不能把该历史计划重新发布为当前方案",
+            },
+        )
+    publication_key, fingerprint, existing = publication_retry(
+        "reattest",
+        current,
+        request.idempotency_key,
+        {"source_version_id": source.id, "expected_revision": request.expected_revision},
+    )
+    if existing:
+        return existing
+    selected = source.selected.model_copy(deep=True)
+    selected.id = f"SCH-{scenario_id}-reattest-{uuid.uuid4().hex[:8]}"
+    selected.created_at = _now()
+    selected.source_schedule_id = source.selected.id
+    selected.scenario_revision = current.revision
+    selected.solution_found = True
+    selected = bind_replayed_solver_policy(selected, current, "plan-reattestation")
+    if selected.kind != "replan":
+        selected = normalize_schedule(current, selected, provider=require_store().travel_provider)
+    run = start_schedule_run(
+        current,
+        "reattest",
+        source=source,
+        solver_name="plan-reattestation",
+        solver_config_hash=selected.solver_config_hash,
+    )
+    published = publish_selected(
+        current,
+        selected,
+        "reattest",
+        artifacts=[artifact("selected", selected, selected.strategy)],
+        source=source,
+        relation="reattested_from",
+        label=f"重新验证自 V{source.number:03d} · {source.label}"[:60].strip(),
+        run=run,
+        idempotency_key=publication_key,
+        request_fingerprint=fingerprint,
+    )
+    plan = require_store().active_plan_version(scenario_id)
+    if not plan or plan.selected.id != published.id:
+        raise HTTPException(500, "方案已发布但无法读取重新验证版本")
+    return plan
+
+
+@router.post(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/clone-scenario",
     response_model=ScheduleScenario,
     status_code=201,
@@ -3027,9 +3309,9 @@ def clone_plan_scenario(
     request: CloneScenarioRequest,
 ) -> ScheduleScenario:
     require_scenario(scenario_id)
-    source = require_store().get_plan_version(scenario_id, version_id)
-    if not source or not source.scenario_snapshot:
-        raise HTTPException(404, "方案版本或业务快照不存在")
+    source = require_plan_for_use(scenario_id, version_id, PlanUseCase.clone)
+    if not source.scenario_snapshot:
+        raise HTTPException(404, "方案业务快照不存在")
     clone = source.scenario_snapshot.model_copy(deep=True)
     clone.id = f"clone-{scenario_id}-{uuid.uuid4().hex[:8]}"
     clone.name = request.name
@@ -3056,9 +3338,9 @@ def clone_plan_scenario(
 def rollback_plan_preview(scenario_id: str, version_id: str) -> RollbackPreview:
     current = require_scenario(scenario_id)
     store = require_store()
-    source = store.get_plan_version(scenario_id, version_id)
-    if not source or not source.scenario_snapshot:
-        raise HTTPException(404, "方案版本或业务快照不存在")
+    source = require_plan_for_use(scenario_id, version_id, PlanUseCase.restore)
+    if not source.scenario_snapshot:
+        raise HTTPException(404, "方案业务快照不存在")
     current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
     return build_rollback_preview(
         current,
@@ -3079,9 +3361,9 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
                 "message": "存在服务中的工单，不能回滚业务快照",
             },
         )
-    source = require_store().get_plan_version(scenario_id, version_id)
-    if not source or not source.scenario_snapshot:
-        raise HTTPException(404, "方案版本或业务快照不存在")
+    source = require_plan_for_use(scenario_id, version_id, PlanUseCase.restore)
+    if not source.scenario_snapshot:
+        raise HTTPException(404, "方案业务快照不存在")
     publication_key = f"{scenario_id}:rollback:{request.idempotency_key}"
     fingerprint = content_hash(
         {
@@ -3324,12 +3606,8 @@ def comparison(scenario_id: str, before: str | None = None, after: str | None = 
     if before and not after:
         raise HTTPException(422, "指定比较起点时也必须指定终点")
     if after:
-        after_plan = store.get_plan_version(scenario_id, after)
-        before_plan = store.get_plan_version(scenario_id, before) if before else None
-        if before and not before_plan:
-            raise HTTPException(404, "用于比较的起点方案版本不存在")
-        if not after_plan:
-            raise HTTPException(404, "用于比较的终点方案版本不存在")
+        after_plan = require_plan_for_use(scenario_id, after, PlanUseCase.compare)
+        before_plan = require_plan_for_use(scenario_id, before, PlanUseCase.compare) if before else None
         if before_plan:
             return build_comparison(
                 scenario_id,
@@ -3362,13 +3640,18 @@ def comparison(scenario_id: str, before: str | None = None, after: str | None = 
             after_plan.scenario_snapshot,
             after_plan.scenario_snapshot,
         )
-    plans = store.list_plan_versions(scenario_id, include_snapshots=True)
+    plans = [
+        item
+        for item in store.list_plan_versions(scenario_id, include_snapshots=True)
+        if item.effective_integrity is AnalysisIntegrityStatus.verified
+    ]
     if not plans:
         raise HTTPException(409, "请先生成至少一个方案")
     after_plan = store.active_plan_version(scenario_id) or next(
         (item for item in reversed(plans) if item.action != "baseline"),
         plans[-1],
     )
+    after_plan = require_plan_for_use(scenario_id, after_plan.id, PlanUseCase.compare)
     internal_baseline = next((item.schedule for item in after_plan.artifacts if item.role == "baseline"), None)
     before_result = internal_baseline or next(
         (item.selected for item in reversed(plans) if item.action == "baseline" and item.number < after_plan.number),
@@ -3805,6 +4088,8 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
     if not schedule_candidate:
         raise HTTPException(409, "候选方案缺少可追溯的求解记录，请重新运行实验")
     source = require_store().active_plan_version(scenario_id)
+    if source is not None:
+        source = require_plan_for_use(scenario_id, source.id, PlanUseCase.replay)
     try:
         published = require_store().publish_plan(
             scenario,
@@ -3837,8 +4122,8 @@ def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: Ex
 
 @router.get("/api/scenarios/{scenario_id}/plan-versions/{version_id}/report", response_class=HTMLResponse)
 def version_report(scenario_id: str, version_id: str) -> HTMLResponse:
-    plan = require_store().get_plan_version(scenario_id, version_id)
-    if not plan or not plan.scenario_snapshot:
+    plan = require_plan_for_use(scenario_id, version_id, PlanUseCase.report)
+    if not plan.scenario_snapshot:
         raise HTTPException(404, "方案报告不存在")
     require_frozen_plan_integrity(plan)
     safe_scenario_id = safe_filename_component(scenario_id)
@@ -3852,7 +4137,6 @@ def version_report(scenario_id: str, version_id: str) -> HTMLResponse:
 def report(scenario_id: str, schedule_id: str | None = None) -> HTMLResponse:
     scenario = require_scenario(scenario_id)
     if schedule_id:
-        result = require_store().get_schedule(schedule_id)
         plan = next(
             (
                 item
@@ -3861,8 +4145,20 @@ def report(scenario_id: str, schedule_id: str | None = None) -> HTMLResponse:
             ),
             None,
         )
+        if plan is None:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "UNATTESTED_SCHEDULE",
+                    "message": "该排程没有可验证的正式方案，不能生成业务报告",
+                },
+            )
+        plan = require_plan_for_use(scenario_id, plan.id, PlanUseCase.report)
+        result = plan.selected
     else:
         plan = require_store().active_plan_version(scenario_id)
+        if plan:
+            plan = require_plan_for_use(scenario_id, plan.id, PlanUseCase.report)
         result = plan.selected if plan else None
     if not result or result.scenario_id != scenario_id:
         raise HTTPException(404, "当前没有可导出的方案")

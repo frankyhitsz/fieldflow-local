@@ -108,6 +108,44 @@
         "title": "AnalysisIntegrityStatus",
         "type": "string"
       },
+      "AnalysisReservationManifest": {
+        "properties": {
+          "analysis_id": {
+            "title": "Analysis Id",
+            "type": "string"
+          },
+          "input_hash": {
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "plan_manifest_hash": {
+            "title": "Plan Manifest Hash",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_ANALYSIS_RESERVATION_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "reservation_hash": {
+            "title": "Reservation Hash",
+            "type": "string"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "analysis_id",
+          "input_hash",
+          "plan_manifest_hash",
+          "started_at",
+          "reservation_hash"
+        ],
+        "title": "AnalysisReservationManifest",
+        "type": "object"
+      },
       "AttestationRequirement": {
         "enum": [
           "REQUIRED",
@@ -452,6 +490,10 @@
             "title": "Created At",
             "type": "string"
           },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "external_assignments": {
             "items": {
               "$ref": "#/components/schemas/ExternalAssignment"
@@ -479,6 +521,10 @@
             "title": "Option Id",
             "type": "string"
           },
+          "parent_analysis_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "route_diff": {
             "items": {
               "additionalProperties": true,
@@ -493,6 +539,10 @@
           },
           "schedule": {
             "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
           },
           "verification_report": {
             "$ref": "#/components/schemas/CapacityVerificationReport"
@@ -603,6 +653,17 @@
         "title": "CapacityDecisionAnalysisRunRequest",
         "type": "object"
       },
+      "CapacityDecisionStatus": {
+        "enum": [
+          "INTERNAL_VERIFIED",
+          "EXTERNAL_CONDITIONAL",
+          "EXTERNAL_CONFIRMED",
+          "INFEASIBLE",
+          "NOT_APPLICABLE"
+        ],
+        "title": "CapacityDecisionStatus",
+        "type": "string"
+      },
       "CapacityOptionResult": {
         "properties": {
           "affected_entity_ids": {
@@ -691,6 +752,16 @@
             ],
             "title": "Completion Rate"
           },
+          "conditional_upper_bound_kpis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapacityCounterfactualKPI"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cost_unit_type": {
             "$ref": "#/components/schemas/CostUnitType",
             "default": "PLAN_DAY"
@@ -721,6 +792,10 @@
               }
             ],
             "title": "Daily Operating Delta Cents"
+          },
+          "decision_status": {
+            "$ref": "#/components/schemas/CapacityDecisionStatus",
+            "default": "INTERNAL_VERIFIED"
           },
           "diagnostic_metrics": {
             "additionalProperties": {
@@ -1591,6 +1666,10 @@
             "title": "Current Execution Watermark",
             "type": "integer"
           },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "error": {
             "anyOf": [
               {
@@ -1667,6 +1746,10 @@
             "title": "Number",
             "type": "integer"
           },
+          "parent_plan_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "plan_number": {
             "minimum": 1.0,
             "title": "Plan Number",
@@ -1689,6 +1772,16 @@
             "additionalProperties": true,
             "title": "Request Snapshot",
             "type": "object"
+          },
+          "reservation_manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AnalysisReservationManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "result": {
             "anyOf": [
@@ -1760,6 +1853,10 @@
           "schedule_hash": {
             "title": "Schedule Hash",
             "type": "string"
+          },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
           },
           "status": {
             "default": "RUNNING",
@@ -2646,6 +2743,12 @@
             "title": "Cash Operating Cost Cents",
             "type": "integer"
           },
+          "full_day_committed_labor_cost_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Full Day Committed Labor Cost Cents",
+            "type": "integer"
+          },
           "labor_cost_cents": {
             "minimum": 0.0,
             "title": "Labor Cost Cents",
@@ -2677,6 +2780,12 @@
             "default": 0,
             "minimum": 0.0,
             "title": "Regular Labor Cost Cents",
+            "type": "integer"
+          },
+          "remaining_incremental_labor_cost_cents": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Remaining Incremental Labor Cost Cents",
             "type": "integer"
           },
           "service_failure_loss_cents": {
@@ -2750,7 +2859,8 @@
               "replan",
               "activate",
               "restore",
-              "experiment_publish"
+              "experiment_publish",
+              "reattest"
             ],
             "title": "Action",
             "type": "string"
@@ -2794,6 +2904,10 @@
             "title": "Data Revision",
             "type": "integer"
           },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -2826,6 +2940,11 @@
           "publication_manifest_hash": {
             "default": "",
             "title": "Publication Manifest Hash",
+            "type": "string"
+          },
+          "publication_manifest_version": {
+            "default": "FIELD_SERVICE_PUBLICATION_MANIFEST_V1",
+            "title": "Publication Manifest Version",
             "type": "string"
           },
           "publication_planning_context": {
@@ -2883,6 +3002,7 @@
               "reactivated_from",
               "restored_from",
               "published_from_experiment",
+              "reattested_from",
               "fresh_after_data_change"
             ],
             "title": "Relation",
@@ -2909,6 +3029,10 @@
           },
           "selected": {
             "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
           },
           "source_plan_snapshot_hash": {
             "anyOf": [
@@ -3200,6 +3324,27 @@
         "title": "PublicationVerificationArtifact",
         "type": "object"
       },
+      "ReattestPlanRequest": {
+        "properties": {
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "idempotency_key"
+        ],
+        "title": "ReattestPlanRequest",
+        "type": "object"
+      },
       "ReplanRequest": {
         "properties": {
           "current_time": {
@@ -3358,20 +3503,84 @@
             "title": "After Analysis Id",
             "type": "string"
           },
+          "after_analysis_manifest_hash": {
+            "default": "",
+            "title": "After Analysis Manifest Hash",
+            "type": "string"
+          },
           "after_plan_version_id": {
             "title": "After Plan Version Id",
             "type": "string"
           },
+          "after_scenario_artifact_hash": {
+            "default": "",
+            "title": "After Scenario Artifact Hash",
+            "type": "string"
+          },
+          "after_scenario_artifact_id": {
+            "default": "",
+            "title": "After Scenario Artifact Id",
+            "type": "string"
+          },
+          "after_trial_artifact_hash": {
+            "default": "",
+            "title": "After Trial Artifact Hash",
+            "type": "string"
+          },
+          "after_trial_artifact_id": {
+            "default": "",
+            "title": "After Trial Artifact Id",
+            "type": "string"
+          },
+          "attestation_requirement": {
+            "$ref": "#/components/schemas/AttestationRequirement",
+            "default": "REQUIRED"
+          },
           "before_analysis_id": {
             "title": "Before Analysis Id",
+            "type": "string"
+          },
+          "before_analysis_manifest_hash": {
+            "default": "",
+            "title": "Before Analysis Manifest Hash",
             "type": "string"
           },
           "before_plan_version_id": {
             "title": "Before Plan Version Id",
             "type": "string"
           },
+          "before_scenario_artifact_hash": {
+            "default": "",
+            "title": "Before Scenario Artifact Hash",
+            "type": "string"
+          },
+          "before_scenario_artifact_id": {
+            "default": "",
+            "title": "Before Scenario Artifact Id",
+            "type": "string"
+          },
+          "before_trial_artifact_hash": {
+            "default": "",
+            "title": "Before Trial Artifact Hash",
+            "type": "string"
+          },
+          "before_trial_artifact_id": {
+            "default": "",
+            "title": "Before Trial Artifact Id",
+            "type": "string"
+          },
+          "business_result_available": {
+            "default": true,
+            "title": "Business Result Available",
+            "type": "boolean"
+          },
           "comparison_hash": {
             "title": "Comparison Hash",
+            "type": "string"
+          },
+          "comparison_input_hash": {
+            "default": "",
+            "title": "Comparison Input Hash",
             "type": "string"
           },
           "created_at": {
@@ -3384,6 +3593,10 @@
             },
             "title": "Delta",
             "type": "object"
+          },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "VERIFIED"
           },
           "id": {
             "title": "Id",
@@ -3417,6 +3630,10 @@
           "scenario_set_hash": {
             "title": "Scenario Set Hash",
             "type": "string"
+          },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "VERIFIED"
           },
           "trials": {
             "minimum": 1.0,
@@ -3671,6 +3888,13 @@
             "title": "Algorithm Version",
             "type": "string"
           },
+          "all_demand_sla_rate": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "All Demand Sla Rate",
+            "type": "number"
+          },
           "analysis_as_of_time": {
             "anyOf": [
               {
@@ -3757,6 +3981,13 @@
             "title": "Emergency Caused Window Failure Probability",
             "type": "number"
           },
+          "emergency_completion_rate": {
+            "default": 1,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Emergency Completion Rate",
+            "type": "number"
+          },
           "emergency_event_probability": {
             "default": 0,
             "maximum": 1.0,
@@ -3769,6 +4000,20 @@
             "maximum": 1.0,
             "minimum": 0.0,
             "title": "Emergency Failure Given Event Probability",
+            "type": "number"
+          },
+          "emergency_on_time_rate": {
+            "default": 1,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Emergency On Time Rate",
+            "type": "number"
+          },
+          "emergency_unserved_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Emergency Unserved Probability",
             "type": "number"
           },
           "execution_context_hash": {
@@ -3885,6 +4130,13 @@
           "plan_version_id": {
             "title": "Plan Version Id",
             "type": "string"
+          },
+          "published_commitment_sla_rate": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Published Commitment Sla Rate",
+            "type": "number"
           },
           "scenario_id": {
             "title": "Scenario Id",
@@ -4003,9 +4255,33 @@
       },
       "RiskTrialMetric": {
         "properties": {
+          "all_demand_sla_rate": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "All Demand Sla Rate",
+            "type": "number"
+          },
           "disrupted": {
             "title": "Disrupted",
             "type": "boolean"
+          },
+          "emergency_completed": {
+            "default": false,
+            "title": "Emergency Completed",
+            "type": "boolean"
+          },
+          "emergency_on_time": {
+            "default": false,
+            "title": "Emergency On Time",
+            "type": "boolean"
+          },
+          "published_commitment_sla_rate": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Published Commitment Sla Rate",
+            "type": "number"
           },
           "sla_on_time_rate": {
             "maximum": 1.0,
@@ -4064,6 +4340,10 @@
             "title": "Created At",
             "type": "string"
           },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -4079,6 +4359,10 @@
             "title": "Metrics",
             "type": "array"
           },
+          "parent_analysis_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "scenario_id": {
             "title": "Scenario Id",
             "type": "string"
@@ -4086,6 +4370,10 @@
           "scenario_set_hash": {
             "title": "Scenario Set Hash",
             "type": "string"
+          },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
           }
         },
         "required": [
@@ -5040,6 +5328,7 @@
               "replan",
               "activate",
               "restore",
+              "reattest",
               "experiment"
             ],
             "title": "Action",
@@ -5429,6 +5718,10 @@
             "title": "Created At",
             "type": "string"
           },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "emergency_events": {
             "items": {
               "$ref": "#/components/schemas/SimulationEmergencyEvent"
@@ -5456,6 +5749,10 @@
             "title": "Keyed Random Version",
             "type": "string"
           },
+          "parent_analysis_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "policy_version": {
             "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V3",
             "title": "Policy Version",
@@ -5476,6 +5773,10 @@
           "seed": {
             "title": "Seed",
             "type": "integer"
+          },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
           },
           "technician_ids": {
             "items": {
@@ -7283,7 +7584,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.5"
+    "version": "0.5.6"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -7307,6 +7608,32 @@
           }
         },
         "summary": "Health"
+      }
+    },
+    "/api/integrity-issues": {
+      "get": {
+        "description": "Return the quarantine ledger without exposing the copied payloads.",
+        "operationId": "list_integrity_issues_api_integrity_issues_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "title": "Response List Integrity Issues Api Integrity Issues Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Integrity Issues"
       }
     },
     "/api/scenarios": {
@@ -8561,6 +8888,65 @@
         "summary": "Get Cost Analysis"
       }
     },
+    "/api/scenarios/{scenario_id}/plan-versions/{version_id}/reattest": {
+      "post": {
+        "description": "Create a new, fully attested V from a view-only legacy plan.",
+        "operationId": "reattest_plan_version_api_scenarios__scenario_id__plan_versions__version_id__reattest_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "title": "Version Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReattestPlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanVersion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reattest Plan Version"
+      }
+    },
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/report": {
       "get": {
         "operationId": "version_report_api_scenarios__scenario_id__plan_versions__version_id__report_get",
@@ -8945,6 +9331,16 @@
             "required": true,
             "schema": {
               "title": "After",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }

@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -347,6 +348,28 @@ def test_invalid_sequence_candidate_does_not_consume_version(monkeypatch, tmp_pa
         _, response = _invalid_sequence_replan(client, main_module)
         assert response.status_code == 422
         assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1]
+
+
+def test_malformed_plan_is_quarantined_without_blocking_history_list(monkeypatch, tmp_path):
+    database = tmp_path / "malformed-plan-isolation.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        plan = client.get("/api/scenarios/main/plan-versions").json()[0]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("UPDATE plan_versions SET payload='{' WHERE id=?", (plan["id"],))
+        listed = client.get("/api/scenarios/main/plan-versions")
+        assert listed.status_code == 200
+        assert listed.json() == []
+        assert listed.headers["X-FieldFlow-Skipped-Records"] == "1"
+        issues = client.get("/api/integrity-issues").json()
+        assert any(item["source_table"] == "plan_versions" and item["source_id"] == plan["id"] for item in issues)
+        detail = client.get(f"/api/scenarios/main/plan-versions/{plan['id']}")
+        assert detail.status_code == 409
+        assert detail.json()["detail"]["code"] == "MALFORMED_ATTESTED_RECORD"
 
 
 def test_execution_cannot_start_before_customer_window(monkeypatch, tmp_path):
@@ -1278,7 +1301,7 @@ def test_manual_reassignment_context_change_becomes_replayable_terminal_failure(
         assert client.post("/api/scenarios/main/manual-reassignment", json=new_payload).status_code == 200
 
 
-def test_plan_payload_is_not_rewritten_when_applicability_changes(monkeypatch, tmp_path):
+def test_metadata_only_edit_preserves_active_plan_without_rewriting_payload(monkeypatch, tmp_path):
     database = tmp_path / "plan-applicability.db"
     monkeypatch.setenv("FIELDFLOW_DB", str(database))
     import backend.main as main_module
@@ -1300,8 +1323,8 @@ def test_plan_payload_is_not_rewritten_when_applicability_changes(monkeypatch, t
         )
         assert edited.status_code == 200
         projected = client.get("/api/scenarios/main/plan-versions").json()[0]
-        assert projected["active"] is False
-        assert projected["coverage_status"] == "STALE_DATA_CHANGED"
+        assert projected["active"] is True
+        assert projected["coverage_status"] == "CURRENT_AND_COMPLETE"
         with closing(sqlite3.connect(database)) as connection:
             assert (
                 connection.execute("SELECT payload FROM plan_versions WHERE id=?", (version["id"],)).fetchone()[0]
@@ -1311,7 +1334,7 @@ def test_plan_payload_is_not_rewritten_when_applicability_changes(monkeypatch, t
                 "SELECT active, coverage_status FROM plan_applicability WHERE plan_version_id=?",
                 (version["id"],),
             ).fetchone()
-        assert applicability == (0, "STALE_DATA_CHANGED")
+        assert applicability == (1, "CURRENT_AND_COMPLETE")
 
 
 def test_execution_sequence_has_database_unique_constraint(monkeypatch, tmp_path):
@@ -1399,7 +1422,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -2066,6 +2089,37 @@ def test_execution_history_blocks_reset_and_metadata_edit_keeps_completion_sourc
         assert reset.json()["detail"]["code"] == "EXECUTION_HISTORY_PRESENT"
 
 
+def test_objective_only_priority_edit_preserves_assignment_for_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "objective-field-impact.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = baseline["assignments"][0]
+        current = client.get("/api/scenarios/main").json()
+        order = next(item for item in current["work_orders"] if item["id"] == assignment["work_order_id"])
+        new_priority = "urgent" if order["priority"] != "urgent" else "high"
+        edited = client.put(
+            f"/api/scenarios/main/work-orders/{order['id']}",
+            json={"priority": new_priority},
+        )
+        assert edited.status_code == 200
+        plans = client.get("/api/scenarios/main/plan-versions").json()
+        assert plans[0]["active"] is True
+        assert plans[0]["coverage_status"] == "STALE_DATA_CHANGED"
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{order['id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": edited.json()["revision"],
+                "idempotency_key": "objective-edit-start-001",
+            },
+        )
+        assert started.status_code == 200, started.text
+
+
 def test_app_and_publication_use_the_store_travel_provider(tmp_path):
     import backend.main as main_module
 
@@ -2285,7 +2339,8 @@ def test_patch_contract_distinguishes_omitted_null_and_clearable_fields(monkeypa
 
 
 def test_compound_emergency_replan_is_idempotent(monkeypatch, tmp_path):
-    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "emergency.db"))
+    database = tmp_path / "emergency.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
     import backend.main as main_module
 
     main_module = importlib.reload(main_module)
@@ -2323,7 +2378,20 @@ def test_compound_emergency_replan_is_idempotent(monkeypatch, tmp_path):
         assert first.json()["id"] == second.json()["id"]
         scenario = client.get("/api/scenarios/main").json()
         assert sum(item["id"] == emergency["id"] for item in scenario["work_orders"]) == 1
-        assert [item["number"] for item in client.get("/api/scenarios/main/plan-versions").json()] == [1, 2]
+        plans = client.get("/api/scenarios/main/plan-versions").json()
+        assert [item["number"] for item in plans] == [1, 2]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            payload = json.loads(
+                connection.execute("SELECT payload FROM plan_versions WHERE id=?", (plans[-1]["id"],)).fetchone()[0]
+            )
+            payload["selected"]["objective"] += 1
+            connection.execute(
+                "UPDATE plan_versions SET payload=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), plans[-1]["id"]),
+            )
+        failed_replay = client.post("/api/scenarios/main/replan", json=request)
+        assert failed_replay.status_code == 409
+        assert failed_replay.json()["detail"]["code"] == "PLAN_INTEGRITY_FAILED"
 
 
 def test_replan_persists_explicit_frozen_context_and_only_warns_on_planned_departure(monkeypatch, tmp_path):

@@ -514,7 +514,7 @@ export default function App() {
   return <div className="app-shell">
     <Sidebar scenarios={scenarios} current={scenario} active={view} busy={!!working || !!loadingScenarioId} onSelect={loadScenario} onNavigate={nextView => { setView(nextView); if (nextView === 'lab' && !scenario.id.startsWith('strategy-')) void loadScenario('strategy-medium') }} />
     <main className="main-content">
-      <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务时段 {serviceWindow}</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}`, '_blank')}><FileText size={16} />导出报告</button></div></header>
+      <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务时段 {serviceWindow}</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule || plans.find(item => item.selected.id === schedule.id)?.effective_integrity !== 'VERIFIED'} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}`, '_blank')}><FileText size={16} />导出报告</button></div></header>
       {view === 'dispatch' && dispatch}
       {view === 'versions' && <VersionsView scenario={scenario} plans={plans} onOpen={async item => { setWorking('正在读取版本快照'); try { const detail = await api.planVersion(scenario.id, item.id); setSchedule(detail.selected); setHistoricalScenario(detail.active && detail.data_revision === scenario.revision ? undefined : detail.scenario_snapshot || undefined); setBaseline(detail.artifacts.find(artifactItem => artifactItem.role === 'baseline')?.schedule); setView('dispatch'); setToast(`已打开历史方案 V${String(item.number).padStart(3, '0')}`) } catch (error) { setToast(error instanceof Error ? error.message : '版本读取失败') } finally { setWorking(undefined) } }} onActivate={async item => {
         setWorking('正在核对并激活历史计划')
@@ -525,6 +525,16 @@ export default function App() {
           if (activeScenarioId.current !== scenario.id) return
           setPlans(planItems); setSchedule(activated.selected); setHistoricalScenario(undefined); setView('dispatch'); setToast(`已激活为 V${String(activated.number).padStart(3, '0')}`)
         } catch (error) { setToast(error instanceof Error ? error.message : '历史计划无法激活') }
+        finally { setWorking(undefined) }
+      }} onReattest={async item => {
+        setWorking('正在重新验证历史计划')
+        try {
+          const attested = await api.reattestPlanVersion(scenario.id, item.id, scenario.revision, commandKey('reattest'))
+          if (activeScenarioId.current !== scenario.id) return
+          const planItems = await api.planVersions(scenario.id)
+          if (activeScenarioId.current !== scenario.id) return
+          setPlans(planItems); setSchedule(attested.selected); setHistoricalScenario(undefined); setView('dispatch'); setToast(`已重新验证为 V${String(attested.number).padStart(3, '0')}`)
+        } catch (error) { setToast(error instanceof Error ? error.message : '历史计划重新验证失败') }
         finally { setWorking(undefined) }
       }} onClone={async item => {
         const name = window.prompt('新场景名称', `${scenario.name} · V${String(item.number).padStart(3, '0')} 副本`)?.trim()

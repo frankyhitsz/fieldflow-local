@@ -126,6 +126,33 @@ class AnalysisIntegrityStatus(str, Enum):
     legacy_unattested = "LEGACY_UNATTESTED"
 
 
+class PlanUseCase(str, Enum):
+    audit_view = "AUDIT_VIEW"
+    execute = "EXECUTE"
+    analyze = "ANALYZE"
+    replay = "REPLAY"
+    clone = "CLONE"
+    restore = "RESTORE"
+    compare = "COMPARE"
+    report = "REPORT"
+
+
+class CapacityDecisionStatus(str, Enum):
+    internal_verified = "INTERNAL_VERIFIED"
+    external_conditional = "EXTERNAL_CONDITIONAL"
+    external_confirmed = "EXTERNAL_CONFIRMED"
+    infeasible = "INFEASIBLE"
+    not_applicable = "NOT_APPLICABLE"
+
+
+class FieldImpact(str, Enum):
+    metadata_only = "METADATA_ONLY"
+    commercial_only = "COMMERCIAL_ONLY"
+    planning_objective = "PLANNING_OBJECTIVE"
+    assignment_feasibility = "ASSIGNMENT_FEASIBILITY"
+    execution = "EXECUTION"
+
+
 class AttestationRequirement(str, Enum):
     required = "REQUIRED"
     legacy_migrated = "LEGACY_MIGRATED"
@@ -663,7 +690,7 @@ class PlanVersion(BaseModel):
     id: str
     scenario_id: str
     number: int
-    action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish"]
+    action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish", "reattest"]
     label: ShortLabel
     data_revision: int
     source_version_id: str | None = None
@@ -676,6 +703,7 @@ class PlanVersion(BaseModel):
         "reactivated_from",
         "restored_from",
         "published_from_experiment",
+        "reattested_from",
         "fresh_after_data_change",
     ] = "new"
     active: bool = False
@@ -692,10 +720,24 @@ class PlanVersion(BaseModel):
     publication_planning_context: PublicationPlanningContext | None = None
     publication_planning_context_hash: str | None = None
     publication_manifest_hash: str = ""
+    publication_manifest_version: str = "FIELD_SERVICE_PUBLICATION_MANIFEST_V1"
     source_plan_snapshot_hash: str | None = None
     coverage_status: PlanCoverageStatus = PlanCoverageStatus.current_and_complete
     attestation_requirement: AttestationRequirement = AttestationRequirement.required
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_integrity_projection(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        status = migrated.get("integrity_status", AnalysisIntegrityStatus.legacy_unattested.value)
+        migrated.setdefault("self_integrity", status)
+        migrated.setdefault("effective_integrity", status)
+        return migrated
 
 
 class PlanVersionPatch(BaseModel):
@@ -709,6 +751,11 @@ class ActivatePlanRequest(BaseModel):
 
 class CloneScenarioRequest(BaseModel):
     name: DisplayName
+    idempotency_key: IdempotencyKey
+
+
+class ReattestPlanRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
     idempotency_key: IdempotencyKey
 
 
@@ -945,6 +992,8 @@ class PlanCostBreakdown(BaseModel):
     # Kept for clients created before the cost terminology was corrected.
     total_cost_cents: int = Field(ge=0)
     technician_cost_cents: dict[str, int] = Field(default_factory=dict)
+    full_day_committed_labor_cost_cents: int = Field(default=0, ge=0)
+    remaining_incremental_labor_cost_cents: int = Field(default=0, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -1113,6 +1162,7 @@ class CapacityOptionResult(BaseModel):
     # Compatibility alias: true only when the option applies and the full
     # counterfactual schedule passes verification.
     feasible: bool
+    decision_status: CapacityDecisionStatus = CapacityDecisionStatus.internal_verified
     completion_rate: float | None = Field(default=None, ge=0, le=1)
     sla_on_time_rate: float | None = Field(default=None, ge=0, le=1)
     unassigned_count: int | None = Field(default=None, ge=0)
@@ -1148,6 +1198,7 @@ class CapacityOptionResult(BaseModel):
     external_assignments: list[ExternalAssignment] = Field(default_factory=list)
     work_order_dispositions: list[WorkOrderDisposition] = Field(default_factory=list)
     counterfactual_kpis: CapacityCounterfactualKPI | None = None
+    conditional_upper_bound_kpis: CapacityCounterfactualKPI | None = None
 
 
 class CapacityAnalysis(BaseModel):
@@ -1222,6 +1273,11 @@ class RiskSimulationResult(BaseModel):
     seed: int
     trials: int
     expected_sla_on_time_rate: float = Field(ge=0, le=1)
+    published_commitment_sla_rate: float = Field(default=0, ge=0, le=1)
+    all_demand_sla_rate: float = Field(default=0, ge=0, le=1)
+    emergency_completion_rate: float = Field(default=1, ge=0, le=1)
+    emergency_on_time_rate: float = Field(default=1, ge=0, le=1)
+    emergency_unserved_probability: float = Field(default=0, ge=0, le=1)
     monte_carlo_mean_ci_low: float = Field(default=0, ge=0, le=1)
     monte_carlo_mean_ci_high: float = Field(default=0, ge=0, le=1)
     sla_rate_ci_low: float = Field(ge=0, le=1)
@@ -1351,6 +1407,15 @@ class AnalysisFailureManifest(BaseModel):
     finished_at: str
 
 
+class AnalysisReservationManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_ANALYSIS_RESERVATION_V1"
+    analysis_id: str
+    input_hash: str
+    plan_manifest_hash: str
+    started_at: str
+    reservation_hash: str
+
+
 class DecisionAnalysisRun(BaseModel):
     id: str
     scenario_id: str
@@ -1381,6 +1446,7 @@ class DecisionAnalysisRun(BaseModel):
     attempt_number: int = Field(default=1, ge=1)
     supersedes_analysis_id: str | None = None
     status: Literal["RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"] = "RUNNING"
+    reservation_manifest: AnalysisReservationManifest | None = None
     result: CostAnalysis | CapacityAnalysis | RiskSimulationResult | None = None
     result_hash: str | None = None
     result_manifest: DecisionResultManifest | None = None
@@ -1388,6 +1454,9 @@ class DecisionAnalysisRun(BaseModel):
     artifact_manifest: list[dict[str, str]] = Field(default_factory=list)
     analysis_manifest_hash: str | None = None
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    parent_plan_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     attestation_requirement: AttestationRequirement = AttestationRequirement.required
     error: dict[str, Any] | None = None
     created_at: str
@@ -1404,6 +1473,10 @@ class DecisionAnalysisRun(BaseModel):
         migrated.setdefault("request_snapshot", {})
         migrated.setdefault("logical_analysis_id", migrated.get("id", ""))
         migrated.setdefault("attempt_number", 1)
+        status = migrated.get("integrity_status", AnalysisIntegrityStatus.legacy_unattested.value)
+        migrated.setdefault("self_integrity", status)
+        migrated.setdefault("effective_integrity", status)
+        migrated.setdefault("parent_plan_integrity", AnalysisIntegrityStatus.legacy_unattested.value)
         return migrated
 
 
@@ -1422,6 +1495,9 @@ class CapacityCounterfactualArtifact(BaseModel):
     counterfactual_kpis: CapacityCounterfactualKPI | None = None
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    parent_analysis_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     attestation_requirement: AttestationRequirement = AttestationRequirement.required
     created_at: str
 
@@ -1443,6 +1519,10 @@ class RiskTrialMetric(BaseModel):
     total_overtime_minutes: int = Field(ge=0)
     total_unserved_orders: int = Field(ge=0)
     disrupted: bool
+    published_commitment_sla_rate: float = Field(default=0, ge=0, le=1)
+    all_demand_sla_rate: float = Field(default=0, ge=0, le=1)
+    emergency_completed: bool = False
+    emergency_on_time: bool = False
 
 
 class RiskTrialOutcomeArtifact(BaseModel):
@@ -1454,6 +1534,9 @@ class RiskTrialOutcomeArtifact(BaseModel):
     metrics: list[RiskTrialMetric]
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    parent_analysis_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     attestation_requirement: AttestationRequirement = AttestationRequirement.required
     created_at: str
 
@@ -1475,6 +1558,9 @@ class SimulationScenarioSetArtifact(BaseModel):
     scenario_set_hash: str
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    parent_analysis_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     attestation_requirement: AttestationRequirement = AttestationRequirement.required
     created_at: str
 
@@ -1500,6 +1586,17 @@ class RiskComparisonRun(BaseModel):
     before_plan_version_id: str
     after_plan_version_id: str
     scenario_set_hash: str
+    comparison_input_hash: str = ""
+    before_analysis_manifest_hash: str = ""
+    after_analysis_manifest_hash: str = ""
+    before_trial_artifact_id: str = ""
+    after_trial_artifact_id: str = ""
+    before_trial_artifact_hash: str = ""
+    after_trial_artifact_hash: str = ""
+    before_scenario_artifact_id: str = ""
+    after_scenario_artifact_id: str = ""
+    before_scenario_artifact_hash: str = ""
+    after_scenario_artifact_hash: str = ""
     trials: int = Field(ge=1)
     paired_sla_delta: PairedMetricSummary
     paired_overtime_delta: PairedMetricSummary
@@ -1508,6 +1605,10 @@ class RiskComparisonRun(BaseModel):
     delta: dict[str, float] = Field(default_factory=dict)
     comparison_hash: str
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    business_result_available: bool = True
+    attestation_requirement: AttestationRequirement = AttestationRequirement.required
     created_at: str
 
 
@@ -1599,7 +1700,7 @@ class ScheduleVerificationReport(BaseModel):
 class ScheduleRun(BaseModel):
     id: str
     scenario_id: str
-    action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment"]
+    action: Literal["baseline", "optimize", "replan", "activate", "restore", "reattest", "experiment"]
     scenario_revision: int
     scenario_snapshot_hash: str
     source_plan_version_id: str | None = None

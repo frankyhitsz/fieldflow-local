@@ -15,6 +15,7 @@ from .hashing import content_hash
 from .models import (
     AnalysisFailureManifest,
     AnalysisIntegrityStatus,
+    AnalysisReservationManifest,
     AttestationRequirement,
     CapacityCounterfactualArtifact,
     DecisionAnalysisArtifact,
@@ -25,6 +26,7 @@ from .models import (
     ExecutionSourceContext,
     FrozenBookingIdentity,
     PlanCoverageStatus,
+    PlanUseCase,
     PlanVersion,
     PublicationPlanningContext,
     PublicationVerificationArtifact,
@@ -51,12 +53,75 @@ from .models import (
     WorkOrderStatus,
 )
 from .planning import assignment_planning_fingerprint, assignment_source_fingerprint
-from .provenance import build_decision_input_manifest
+from .provenance import build_decision_input_manifest, build_plan_manifest_payload
 from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
+
+_INTEGRITY_RANK = {
+    AnalysisIntegrityStatus.failed: 0,
+    AnalysisIntegrityStatus.legacy_unattested: 1,
+    AnalysisIntegrityStatus.verified: 2,
+}
+
+
+def _effective_integrity(*statuses: AnalysisIntegrityStatus) -> AnalysisIntegrityStatus:
+    return min(statuses, key=_INTEGRITY_RANK.__getitem__)
+
+
+def _artifact_hash_payload(artifact: DecisionAnalysisArtifact) -> dict:
+    return artifact.model_dump(
+        exclude={
+            "artifact_hash",
+            "integrity_status",
+            "self_integrity",
+            "parent_analysis_integrity",
+            "effective_integrity",
+            "business_result_available",
+            "attestation_requirement",
+        },
+        mode="json",
+    )
+
+
+def _risk_comparison_hash_payload(comparison: RiskComparisonRun) -> dict:
+    return comparison.model_dump(
+        exclude={
+            "id",
+            "number",
+            "created_at",
+            "comparison_hash",
+            "integrity_status",
+            "self_integrity",
+            "effective_integrity",
+            "business_result_available",
+            "attestation_requirement",
+        },
+        mode="json",
+    )
+
+
+def _risk_comparison_input_payload(comparison: RiskComparisonRun) -> dict[str, object]:
+    return {
+        "policy_version": "FIELD_SERVICE_RISK_COMPARISON_INPUT_V1",
+        "scenario_id": comparison.scenario_id,
+        "before_analysis_id": comparison.before_analysis_id,
+        "after_analysis_id": comparison.after_analysis_id,
+        "before_analysis_manifest_hash": comparison.before_analysis_manifest_hash,
+        "after_analysis_manifest_hash": comparison.after_analysis_manifest_hash,
+        "before_trial_artifact_id": comparison.before_trial_artifact_id,
+        "after_trial_artifact_id": comparison.after_trial_artifact_id,
+        "before_trial_artifact_hash": comparison.before_trial_artifact_hash,
+        "after_trial_artifact_hash": comparison.after_trial_artifact_hash,
+        "before_scenario_artifact_id": comparison.before_scenario_artifact_id,
+        "after_scenario_artifact_id": comparison.after_scenario_artifact_id,
+        "before_scenario_artifact_hash": comparison.before_scenario_artifact_hash,
+        "after_scenario_artifact_hash": comparison.after_scenario_artifact_hash,
+        "scenario_set_hash": comparison.scenario_set_hash,
+        "trials": comparison.trials,
+    }
 
 
 def _upgrade_technician_costs(payload: object) -> bool:
@@ -136,6 +201,7 @@ def _analysis_manifest_payload(run: DecisionAnalysisRun) -> dict[str, object]:
         "analysis_id": run.id,
         "input_hash": run.input_hash,
         "input_manifest": run.input_manifest,
+        "reservation_manifest": run.reservation_manifest,
         "result_manifest": run.result_manifest,
         "failure_manifest": run.failure_manifest,
         "artifact_manifest": run.artifact_manifest,
@@ -150,6 +216,8 @@ def _analysis_manifest_payload(run: DecisionAnalysisRun) -> dict[str, object]:
 def _failed_integrity_copy(run: DecisionAnalysisRun, reason: str) -> DecisionAnalysisRun:
     checked = run.model_copy(deep=True)
     checked.integrity_status = AnalysisIntegrityStatus.failed
+    checked.self_integrity = AnalysisIntegrityStatus.failed
+    checked.effective_integrity = AnalysisIntegrityStatus.failed
     checked.result = None
     checked.error = {
         "code": "ANALYSIS_INTEGRITY_FAILED",
@@ -515,6 +583,12 @@ class Store:
                     plan_version_id TEXT NOT NULL,
                     analysis_type TEXT NOT NULL,
                     input_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'RUNNING' CHECK(status IN ('RUNNING', 'COMPLETED', 'FAILED', 'INTERRUPTED')),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    analysis_manifest_hash TEXT,
                     attestation_requirement TEXT NOT NULL DEFAULT 'REQUIRED' CHECK(attestation_requirement IN ('REQUIRED', 'LEGACY_MIGRATED')),
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -546,6 +620,10 @@ class Store:
                     scenario_id TEXT NOT NULL,
                     number INTEGER NOT NULL,
                     comparison_hash TEXT NOT NULL,
+                    comparison_input_hash TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    request_fingerprint TEXT,
+                    attestation_requirement TEXT NOT NULL DEFAULT 'REQUIRED' CHECK(attestation_requirement IN ('REQUIRED', 'LEGACY_MIGRATED')),
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(scenario_id, number),
@@ -755,6 +833,84 @@ class Store:
                                 f"UPDATE {table} SET payload=? WHERE rowid=?",
                                 (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), item["rowid"]),
                             )
+            if version < 19:
+                for trigger in (
+                    "prevent_legacy_plan_insert",
+                    "prevent_plan_attestation_change",
+                    "prevent_legacy_analysis_insert",
+                    "prevent_analysis_attestation_change",
+                    "prevent_legacy_artifact_insert",
+                    "prevent_artifact_attestation_change",
+                    "prevent_analysis_terminal_transition",
+                ):
+                    con.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                run_columns = {row[1] for row in con.execute("PRAGMA table_info(decision_analysis_runs)")}
+                run_additions = {
+                    "status": "TEXT NOT NULL DEFAULT 'RUNNING'",
+                    "started_at": "TEXT NOT NULL DEFAULT ''",
+                    "finished_at": "TEXT",
+                    "lease_owner": "TEXT",
+                    "lease_expires_at": "TEXT",
+                    "analysis_manifest_hash": "TEXT",
+                }
+                for column, definition in run_additions.items():
+                    if column not in run_columns:
+                        con.execute(f"ALTER TABLE decision_analysis_runs ADD COLUMN {column} {definition}")
+                con.execute(
+                    """
+                    UPDATE decision_analysis_runs
+                    SET status=CASE
+                            WHEN json_valid(payload) AND json_extract(payload, '$.status') IN ('RUNNING','COMPLETED','FAILED','INTERRUPTED')
+                            THEN json_extract(payload, '$.status') ELSE 'INTERRUPTED' END,
+                        started_at=COALESCE(NULLIF(started_at, ''), created_at),
+                        finished_at=CASE WHEN json_valid(payload) THEN json_extract(payload, '$.finished_at') ELSE finished_at END,
+                        analysis_manifest_hash=CASE WHEN json_valid(payload) THEN json_extract(payload, '$.analysis_manifest_hash') ELSE NULL END
+                    """
+                )
+                comparison_columns = {row[1] for row in con.execute("PRAGMA table_info(risk_comparison_runs)")}
+                comparison_additions = {
+                    "comparison_input_hash": "TEXT NOT NULL DEFAULT ''",
+                    "idempotency_key": "TEXT",
+                    "request_fingerprint": "TEXT",
+                    "attestation_requirement": "TEXT NOT NULL DEFAULT 'LEGACY_MIGRATED'",
+                }
+                for column, definition in comparison_additions.items():
+                    if column not in comparison_columns:
+                        con.execute(f"ALTER TABLE risk_comparison_runs ADD COLUMN {column} {definition}")
+                # V1 publication manifests did not bind identity, lineage, or Plan artifacts.
+                # They remain viewable, but are explicitly non-actionable after this migration.
+                for table in ("plan_versions", "decision_analysis_runs", "decision_analysis_artifacts"):
+                    con.execute(f"UPDATE {table} SET attestation_requirement='LEGACY_MIGRATED'")
+                    rows = con.execute(f"SELECT rowid, payload FROM {table}").fetchall()
+                    for item in rows:
+                        try:
+                            payload = json.loads(item["payload"])
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if isinstance(payload, dict):
+                            payload["attestation_requirement"] = AttestationRequirement.legacy_migrated.value
+                            payload["integrity_status"] = AnalysisIntegrityStatus.legacy_unattested.value
+                            payload["self_integrity"] = AnalysisIntegrityStatus.legacy_unattested.value
+                            payload["effective_integrity"] = AnalysisIntegrityStatus.legacy_unattested.value
+                            con.execute(
+                                f"UPDATE {table} SET payload=? WHERE rowid=?",
+                                (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), item["rowid"]),
+                            )
+                con.execute("UPDATE risk_comparison_runs SET attestation_requirement='LEGACY_MIGRATED'")
+                for item in con.execute("SELECT rowid, payload FROM risk_comparison_runs").fetchall():
+                    try:
+                        payload = json.loads(item["payload"])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict):
+                        payload["attestation_requirement"] = AttestationRequirement.legacy_migrated.value
+                        payload["integrity_status"] = AnalysisIntegrityStatus.legacy_unattested.value
+                        payload["self_integrity"] = AnalysisIntegrityStatus.legacy_unattested.value
+                        payload["effective_integrity"] = AnalysisIntegrityStatus.legacy_unattested.value
+                        con.execute(
+                            "UPDATE risk_comparison_runs SET payload=? WHERE rowid=?",
+                            (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), item["rowid"]),
+                        )
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS decision_analysis_attempts (
@@ -792,7 +948,26 @@ class Store:
                             (sequence, event.model_dump_json(), event.id),
                         )
             if version < 2:
-                # Legacy schedules lack a restorable business snapshot. The user chose a clean restart.
+                # Legacy schedules lack a restorable business snapshot. Preserve
+                # every raw row before applying the user-selected clean restart.
+                for source_table, id_column in (
+                    ("schedules", "id"),
+                    ("plan_versions", "id"),
+                    ("schedule_artifacts", "id"),
+                    ("strategy_experiments", "id"),
+                    ("publication_keys", "key"),
+                ):
+                    for legacy_row in con.execute(f"SELECT {id_column} AS source_id, * FROM {source_table}").fetchall():
+                        con.execute(
+                            "INSERT INTO migration_orphans(source_table, source_id, payload, reason, migrated_at) VALUES (?, ?, ?, ?, ?)",
+                            (
+                                source_table,
+                                str(legacy_row["source_id"]),
+                                json.dumps(dict(legacy_row), ensure_ascii=False, sort_keys=True),
+                                "v1 history archived before confirmed clean restart",
+                                _now(),
+                            ),
+                        )
                 con.execute("DELETE FROM schedules")
                 con.execute("DELETE FROM plan_versions")
                 con.execute("DELETE FROM schedule_artifacts")
@@ -926,6 +1101,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_decision_analysis_plan ON decision_analysis_runs(plan_version_id, number);
                 CREATE INDEX IF NOT EXISTS idx_decision_analysis_artifacts_run ON decision_analysis_artifacts(analysis_run_id, option_id);
                 CREATE INDEX IF NOT EXISTS idx_risk_comparisons_scenario ON risk_comparison_runs(scenario_id, number);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_comparisons_idempotency ON risk_comparison_runs(scenario_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_revisions_scenario ON scenario_revisions(scenario_id, number);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_plan ON schedule_artifacts(plan_version_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
@@ -950,6 +1126,10 @@ class Store:
                 BEFORE UPDATE OF attestation_requirement ON decision_analysis_runs
                 WHEN OLD.attestation_requirement<>NEW.attestation_requirement
                 BEGIN SELECT RAISE(ABORT, 'attestation requirement is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_analysis_terminal_transition
+                BEFORE UPDATE OF status ON decision_analysis_runs
+                WHEN OLD.status IN ('COMPLETED', 'FAILED', 'INTERRUPTED') AND OLD.status<>NEW.status
+                BEGIN SELECT RAISE(ABORT, 'terminal analysis status is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_legacy_artifact_insert
                 BEFORE INSERT ON decision_analysis_artifacts
                 WHEN NEW.attestation_requirement='LEGACY_MIGRATED'
@@ -1041,8 +1221,13 @@ class Store:
                     analysis.analysis_manifest_hash = content_hash(_analysis_manifest_payload(analysis))
                     analysis.integrity_status = AnalysisIntegrityStatus.verified
                 con.execute(
-                    "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
-                    (analysis.model_dump_json(), analysis.id),
+                    "UPDATE decision_analysis_runs SET status='INTERRUPTED', finished_at=?, analysis_manifest_hash=?, payload=? WHERE id=? AND status='RUNNING'",
+                    (
+                        analysis.finished_at,
+                        analysis.analysis_manifest_hash,
+                        analysis.model_dump_json(),
+                        analysis.id,
+                    ),
                 )
             abandoned_commands = con.execute(
                 """
@@ -1194,6 +1379,8 @@ class Store:
         plan.attestation_requirement = AttestationRequirement(requirement)
         if plan.attestation_requirement is AttestationRequirement.legacy_migrated:
             plan.integrity_status = AnalysisIntegrityStatus.legacy_unattested
+            plan.self_integrity = AnalysisIntegrityStatus.legacy_unattested
+            plan.effective_integrity = AnalysisIntegrityStatus.legacy_unattested
             return plan
         artifact = plan.publication_verification_artifact
         required = (
@@ -1206,6 +1393,8 @@ class Store:
         )
         if not all(required):
             plan.integrity_status = AnalysisIntegrityStatus.failed
+            plan.self_integrity = AnalysisIntegrityStatus.failed
+            plan.effective_integrity = AnalysisIntegrityStatus.failed
             return plan
         assert plan.scenario_snapshot is not None and artifact is not None
         context_hash = None
@@ -1218,20 +1407,15 @@ class Store:
                 or context_hash != plan.publication_planning_context_hash
             ):
                 plan.integrity_status = AnalysisIntegrityStatus.failed
+                plan.self_integrity = AnalysisIntegrityStatus.failed
+                plan.effective_integrity = AnalysisIntegrityStatus.failed
                 return plan
         artifact_hash = content_hash(artifact.model_dump(exclude={"artifact_hash"}, mode="json"))
-        expected_manifest = content_hash(
-            {
-                "policy_version": "FIELD_SERVICE_PUBLICATION_MANIFEST_V1",
-                "scenario_snapshot_hash": plan.scenario_snapshot_hash,
-                "published_schedule_hash": plan.published_schedule_hash,
-                "publication_planning_context_hash": context_hash,
-                "publication_verification_artifact_hash": artifact.artifact_hash,
-            }
-        )
+        expected_manifest = content_hash(build_plan_manifest_payload(plan))
         plan.integrity_status = (
             AnalysisIntegrityStatus.verified
-            if plan.scenario_snapshot_hash == content_hash(plan.scenario_snapshot)
+            if plan.publication_manifest_version == "FIELD_SERVICE_PUBLICATION_MANIFEST_V2"
+            and plan.scenario_snapshot_hash == content_hash(plan.scenario_snapshot)
             and plan.published_schedule_hash == content_hash(plan.selected)
             and artifact_hash == artifact.artifact_hash
             and artifact.verified_schedule_hash == plan.published_schedule_hash
@@ -1239,6 +1423,8 @@ class Store:
             and expected_manifest == plan.publication_manifest_hash
             else AnalysisIntegrityStatus.failed
         )
+        plan.self_integrity = plan.integrity_status
+        plan.effective_integrity = plan.integrity_status
         return plan
 
     @classmethod
@@ -1251,6 +1437,18 @@ class Store:
                 record_id=str(row["id"]),
                 record_type="PLAN_VERSION",
             ) from error
+        row_keys = set(row.keys())
+        relational_mismatch = (
+            plan.id != str(row["id"])
+            or ("scenario_id" in row_keys and plan.scenario_id != str(row["scenario_id"]))
+            or ("number" in row_keys and plan.number != int(row["number"]))
+            or ("created_at" in row_keys and plan.created_at != str(row["created_at"]))
+        )
+        if relational_mismatch:
+            plan.integrity_status = AnalysisIntegrityStatus.failed
+            plan.self_integrity = AnalysisIntegrityStatus.failed
+            plan.effective_integrity = AnalysisIntegrityStatus.failed
+            return plan
         plan = cls._overlay_plan_attestation(plan, row["attestation_requirement"])
         metadata = con.execute(
             "SELECT label FROM plan_metadata WHERE plan_version_id=?",
@@ -1260,10 +1458,92 @@ class Store:
             plan.label = metadata["label"]
         return cls._overlay_plan_applicability(con, plan)
 
+    @staticmethod
+    def _require_loaded_plan_for_use(plan: PlanVersion, use_case: PlanUseCase) -> PlanVersion:
+        if use_case is PlanUseCase.audit_view:
+            return plan
+        if plan.effective_integrity is AnalysisIntegrityStatus.legacy_unattested:
+            raise PublicationConflict(
+                "该历史方案未达到当前发布证明标准，请先重新验证为新版本",
+                code="PLAN_REATTESTATION_REQUIRED",
+                details={"plan_version_id": plan.id, "use_case": use_case.value},
+            )
+        if plan.effective_integrity is not AnalysisIntegrityStatus.verified:
+            raise PublicationConflict(
+                "方案发布证明校验失败，不能用于该业务操作",
+                code="PLAN_INTEGRITY_FAILED",
+                details={"plan_version_id": plan.id, "use_case": use_case.value},
+            )
+        return plan
+
     def list_scenarios(self) -> list[ScheduleScenario]:
+        scenarios, _warnings = self.list_scenarios_with_warnings()
+        return scenarios
+
+    @staticmethod
+    def _record_read_isolation(
+        con: sqlite3.Connection,
+        source_table: str,
+        source_id: str,
+        payload: str,
+        reason: str,
+    ) -> None:
+        """Copy an unreadable row to the quarantine ledger without deleting evidence."""
+        recorded = con.execute(
+            "SELECT 1 FROM migration_orphans WHERE source_table=? AND source_id=? AND reason=?",
+            (source_table, source_id, reason),
+        ).fetchone()
+        if not recorded:
+            con.execute(
+                """
+                INSERT INTO migration_orphans(source_table, source_id, payload, reason, migrated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (source_table, source_id, payload, reason, _now()),
+            )
+
+    def list_scenarios_with_warnings(self) -> tuple[list[ScheduleScenario], list[dict[str, str]]]:
+        scenarios: list[ScheduleScenario] = []
+        warnings: list[dict[str, str]] = []
+        with self._lock, self._connect() as con:
+            rows = con.execute("SELECT id, payload FROM scenarios ORDER BY id").fetchall()
+            for row in rows:
+                try:
+                    scenarios.append(ScheduleScenario.model_validate_json(row["payload"]))
+                except (TypeError, ValueError) as error:
+                    warning = {
+                        "record_type": "SCENARIO",
+                        "record_id": str(row["id"]),
+                        "message": "场景记录无法解析，已从列表隔离",
+                    }
+                    warnings.append(warning)
+                    self._record_read_isolation(
+                        con,
+                        "scenarios",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        f"read isolation: {type(error).__name__}",
+                    )
+        return scenarios, warnings
+
+    def list_integrity_issues(self) -> list[dict[str, str]]:
         with self._connect() as con:
-            rows = con.execute("SELECT payload FROM scenarios ORDER BY id").fetchall()
-        return [ScheduleScenario.model_validate_json(row["payload"]) for row in rows]
+            rows = con.execute(
+                """
+                SELECT source_table, source_id, reason, migrated_at
+                FROM migration_orphans
+                ORDER BY migrated_at DESC, id DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "source_table": str(row["source_table"]),
+                "source_id": str(row["source_id"]),
+                "reason": str(row["reason"]),
+                "recorded_at": str(row["migrated_at"]),
+            }
+            for row in rows
+        ]
 
     def get_scenario(self, scenario_id: str) -> ScheduleScenario | None:
         with self._connect() as con:
@@ -1298,6 +1578,7 @@ class Store:
         *,
         expected_revision: int | None = None,
         preserve_active_plan: bool = False,
+        mark_plan_stale: bool = True,
     ) -> None:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -1320,7 +1601,7 @@ class Store:
                         "SELECT active_plan_version_id FROM scenarios WHERE id=?",
                         (scenario.id,),
                     ).fetchone()
-                    if active and active["active_plan_version_id"]:
+                    if mark_plan_stale and active and active["active_plan_version_id"]:
                         self._set_plan_applicability(
                             con,
                             active["active_plan_version_id"],
@@ -1591,14 +1872,13 @@ class Store:
             if not plan_id:
                 raise PublicationConflict("当前没有可执行方案，请先生成并发布方案")
             plan_row = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=?",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=?",
                 (plan_id,),
             ).fetchone()
             if not plan_row:
                 raise PublicationConflict("当前方案记录不存在，请刷新后重试")
             plan = self._load_plan_row(con, plan_row)
-            if plan.integrity_status is AnalysisIntegrityStatus.failed:
-                raise PublicationConflict("当前方案发布证明校验失败，不能登记执行状态")
+            self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
             assignment = next((item for item in plan.selected.assignments if item.work_order_id == work_order_id), None)
             if not assignment:
                 raise PublicationConflict("该工单未在当前方案中分配，不能登记执行状态")
@@ -1836,12 +2116,12 @@ class Store:
         plan: PlanVersion | None = None
         if active_plan_version_id:
             plan_row = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
                 (active_plan_version_id, scenario.id),
             ).fetchone()
             if plan_row:
                 plan = cls._load_plan_row(con, plan_row)
-                if plan.integrity_status is AnalysisIntegrityStatus.failed:
+                if plan.effective_integrity is not AnalysisIntegrityStatus.verified:
                     plan = None
         assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
         started_sources: list[ExecutionSourceAssignment] = []
@@ -1866,12 +2146,12 @@ class Store:
             source_plan: PlanVersion | None = None
             if start_event.plan_version_id:
                 source_plan_row = con.execute(
-                    "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
                     (start_event.plan_version_id, scenario.id),
                 ).fetchone()
                 if source_plan_row:
                     source_plan = cls._load_plan_row(con, source_plan_row)
-                    if source_plan.integrity_status is AnalysisIntegrityStatus.failed:
+                    if source_plan.effective_integrity is not AnalysisIntegrityStatus.verified:
                         source_plan = None
             historical_assignment = (
                 next(
@@ -2062,7 +2342,11 @@ class Store:
             "stable": "稳定重排",
             "custom": "自定义策略",
         }
-        return f"历史恢复 V{number:03d}" if action == "restore" else names.get(strategy, action)
+        if action == "restore":
+            return f"历史恢复 V{number:03d}"
+        if action == "reattest":
+            return f"重新验证 V{number:03d}"
+        return names.get(strategy, action)
 
     @staticmethod
     def _build_publication_planning_context(
@@ -2161,7 +2445,7 @@ class Store:
         self,
         scenario: ScheduleScenario,
         selected: ScheduleResult,
-        action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish"],
+        action: Literal["baseline", "optimize", "replan", "activate", "restore", "experiment_publish", "reattest"],
         *,
         artifacts: list[ScheduleArtifact] | None = None,
         source_version_id: str | None = None,
@@ -2172,6 +2456,7 @@ class Store:
             "reactivated_from",
             "restored_from",
             "published_from_experiment",
+            "reattested_from",
             "fresh_after_data_change",
         ] = "new",
         label: str | None = None,
@@ -2194,14 +2479,13 @@ class Store:
                     if publication["request_fingerprint"] != (request_fingerprint or ""):
                         raise PublicationConflict("同一实验已经发布了另一个候选方案")
                     existing = con.execute(
-                        "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=?",
+                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=?",
                         (publication["plan_version_id"],),
                     ).fetchone()
                     if not existing:
                         raise PublicationConflict("幂等发布记录引用的方案不存在")
                     plan = self._load_plan_row(con, existing)
-                    if plan.integrity_status is AnalysisIntegrityStatus.failed:
-                        raise PublicationConflict("幂等发布记录的方案证明校验失败")
+                    self._require_loaded_plan_for_use(plan, PlanUseCase.replay)
                     if experiment_id and experiment_candidate_id:
                         experiment_row = con.execute(
                             "SELECT payload FROM strategy_experiments WHERE id=?",
@@ -2296,14 +2580,14 @@ class Store:
             publication_source: PlanVersion | None = None
             if source_version_id:
                 source_row = con.execute(
-                    "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=?",
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=?",
                     (source_version_id,),
                 ).fetchone()
                 if not source_row:
                     raise PublicationConflict("来源方案不存在")
                 publication_source = self._load_plan_row(con, source_row)
-                if publication_source.integrity_status is AnalysisIntegrityStatus.failed:
-                    raise PublicationConflict("来源方案发布证明校验失败")
+                source_use_case = PlanUseCase.audit_view if action == "reattest" else PlanUseCase.replay
+                self._require_loaded_plan_for_use(publication_source, source_use_case)
                 if publication_source.scenario_id != scenario.id:
                     raise PublicationConflict("来源方案不属于当前场景")
                 if candidate.source_plan_version_id and candidate.source_plan_version_id != publication_source.id:
@@ -2311,20 +2595,19 @@ class Store:
             elif candidate.source_plan_version_id:
                 raise PublicationConflict("候选方案声明了来源版本，但发布请求未携带来源")
             verification_source = publication_source
-            if selected.kind == "replan" and action in {"activate", "restore"} and publication_source:
+            if selected.kind == "replan" and action in {"activate", "restore", "reattest"} and publication_source:
                 stability_baseline_id = (
                     publication_source.stability_baseline_version_id or publication_source.source_version_id
                 )
                 if stability_baseline_id:
                     stability_row = con.execute(
-                        "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
+                        "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
                         (stability_baseline_id, scenario.id),
                     ).fetchone()
                     if not stability_row:
                         raise PublicationConflict("稳定性基准方案不存在")
                     verification_source = self._load_plan_row(con, stability_row)
-                    if verification_source.integrity_status is AnalysisIntegrityStatus.failed:
-                        raise PublicationConflict("稳定性基准方案发布证明校验失败")
+                    self._require_loaded_plan_for_use(verification_source, PlanUseCase.replay)
             transaction_verification = verify_schedule(
                 scenario,
                 selected,
@@ -2402,15 +2685,6 @@ class Store:
                 **verification_artifact_payload,
                 artifact_hash=content_hash(verification_artifact_payload),
             )
-            publication_manifest_hash = content_hash(
-                {
-                    "policy_version": "FIELD_SERVICE_PUBLICATION_MANIFEST_V1",
-                    "scenario_snapshot_hash": content_hash(scenario),
-                    "published_schedule_hash": content_hash(chosen),
-                    "publication_planning_context_hash": publication_context_hash,
-                    "publication_verification_artifact_hash": verification_artifact.artifact_hash,
-                }
-            )
             plan = PlanVersion(
                 id=plan_id,
                 scenario_id=scenario.id,
@@ -2422,7 +2696,7 @@ class Store:
                 lineage_source_version_id=source_version_id,
                 stability_baseline_version_id=(
                     (publication_source.stability_baseline_version_id or publication_source.source_version_id)
-                    if chosen.kind == "replan" and action in {"activate", "restore"} and publication_source
+                    if chosen.kind == "replan" and action in {"activate", "restore", "reattest"} and publication_source
                     else source_version_id
                     if chosen.kind == "replan"
                     else None
@@ -2441,11 +2715,15 @@ class Store:
                 publication_verification_artifact=verification_artifact,
                 publication_planning_context=publication_context,
                 publication_planning_context_hash=publication_context_hash,
-                publication_manifest_hash=publication_manifest_hash,
+                publication_manifest_hash="pending",
+                publication_manifest_version="FIELD_SERVICE_PUBLICATION_MANIFEST_V2",
                 source_plan_snapshot_hash=source_hash,
                 attestation_requirement=AttestationRequirement.required,
                 integrity_status=AnalysisIntegrityStatus.verified,
+                self_integrity=AnalysisIntegrityStatus.verified,
+                effective_integrity=AnalysisIntegrityStatus.verified,
             )
+            plan.publication_manifest_hash = content_hash(build_plan_manifest_payload(plan))
             con.execute(
                 "UPDATE plan_applicability SET active=0, updated_at=? WHERE scenario_id=? AND active=1",
                 (_now(), scenario.id),
@@ -2669,36 +2947,23 @@ class Store:
             if not force_new:
                 existing = con.execute(
                     """
-                    SELECT payload, attestation_requirement, input_hash FROM decision_analysis_runs
+                    SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                           input_hash, status, started_at, finished_at, analysis_manifest_hash
+                    FROM decision_analysis_runs
                     WHERE plan_version_id=? AND analysis_type=? AND input_hash=?
                     ORDER BY number DESC LIMIT 1
                     """,
                     (run.plan_version_id, run.analysis_type, run.input_hash),
                 ).fetchone()
                 if existing:
-                    try:
-                        stored = DecisionAnalysisRun.model_validate_json(existing["payload"])
-                    except (TypeError, ValueError) as error:
-                        raise DecisionAnalysisIntegrityError(
-                            "经营分析记录无法解析",
-                            record_id="unknown",
-                            record_type="DECISION_ANALYSIS_RUN",
-                        ) from error
-                    return (
-                        self._validate_decision_analysis_integrity(
-                            con,
-                            stored,
-                            existing["attestation_requirement"],
-                            existing["input_hash"],
-                        ),
-                        False,
-                    )
-            plan = con.execute(
-                "SELECT 1 FROM plan_versions WHERE id=? AND scenario_id=?",
+                    return (self._load_analysis_row(con, existing), False)
+            plan_row = con.execute(
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
                 (run.plan_version_id, run.scenario_id),
             ).fetchone()
-            if not plan:
+            if not plan_row:
                 raise PublicationConflict("经营分析引用的方案不存在")
+            plan = self._require_loaded_plan_for_use(self._load_plan_row(con, plan_row), PlanUseCase.analyze)
             row = con.execute(
                 "SELECT COALESCE(MAX(number), 0) + 1 AS number FROM decision_analysis_runs WHERE scenario_id=?",
                 (run.scenario_id,),
@@ -2713,12 +2978,28 @@ class Store:
                     (saved.logical_analysis_id,),
                 ).fetchall()
                 saved.attempt_number = max((int(item["attempt_number"]) for item in attempt_rows), default=0) + 1
+            reservation_payload = {
+                "policy_version": "FIELD_SERVICE_ANALYSIS_RESERVATION_V1",
+                "analysis_id": saved.id,
+                "input_hash": saved.input_hash,
+                "plan_manifest_hash": plan.publication_manifest_hash,
+                "started_at": saved.created_at,
+            }
+            saved.reservation_manifest = AnalysisReservationManifest(
+                **reservation_payload,
+                reservation_hash=content_hash(reservation_payload),
+            )
+            saved.self_integrity = AnalysisIntegrityStatus.verified
+            saved.parent_plan_integrity = AnalysisIntegrityStatus.verified
+            saved.effective_integrity = AnalysisIntegrityStatus.verified
+            saved.integrity_status = AnalysisIntegrityStatus.verified
             con.execute(
                 """
                 INSERT INTO decision_analysis_runs(
                     id, scenario_id, number, plan_version_id, analysis_type, input_hash,
+                    status, started_at, finished_at, analysis_manifest_hash,
                     attestation_requirement, payload, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
                 """,
                 (
                     saved.id,
@@ -2727,6 +3008,8 @@ class Store:
                     saved.plan_version_id,
                     saved.analysis_type,
                     saved.input_hash,
+                    saved.status,
+                    saved.created_at,
                     AttestationRequirement.required.value,
                     saved.model_dump_json(),
                     saved.created_at,
@@ -2749,7 +3032,11 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT payload, attestation_requirement, input_hash FROM decision_analysis_runs WHERE id=? AND scenario_id=?",
+                """
+                SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                       input_hash, status, started_at, finished_at, analysis_manifest_hash
+                FROM decision_analysis_runs WHERE id=? AND scenario_id=?
+                """,
                 (run.id, run.scenario_id),
             ).fetchone()
             if not row:
@@ -2757,21 +3044,11 @@ class Store:
             stored = DecisionAnalysisRun.model_validate_json(row["payload"])
             if stored.input_hash != run.input_hash or stored.plan_version_id != run.plan_version_id:
                 raise PublicationConflict("经营分析终态与预留输入不一致")
-            if stored.status != "RUNNING":
-                return self._validate_decision_analysis_integrity(
-                    con,
-                    stored,
-                    row["attestation_requirement"],
-                    row["input_hash"],
-                )
+            if row["status"] != "RUNNING":
+                return self._load_analysis_row(con, row)
             artifact_manifest: list[dict[str, str]] = []
             for artifact in artifacts or []:
-                expected_artifact_hash = content_hash(
-                    artifact.model_dump(
-                        exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
-                        mode="json",
-                    )
-                )
+                expected_artifact_hash = content_hash(_artifact_hash_payload(artifact))
                 if artifact.artifact_hash != expected_artifact_hash:
                     raise PublicationConflict("容量反事实证据指纹不一致")
                 artifact_manifest.append(
@@ -2782,6 +3059,7 @@ class Store:
                     }
                 )
             run.attestation_requirement = AttestationRequirement.required
+            run.reservation_manifest = stored.reservation_manifest
             run.result_hash = content_hash(run.result) if run.result is not None else None
             run.result_manifest = None
             run.failure_manifest = None
@@ -2806,10 +3084,19 @@ class Store:
             run.artifact_manifest = sorted(artifact_manifest, key=lambda item: item["artifact_id"])
             run.analysis_manifest_hash = content_hash(_analysis_manifest_payload(run))
             run.integrity_status = AnalysisIntegrityStatus.verified
+            run.self_integrity = AnalysisIntegrityStatus.verified
+            run.parent_plan_integrity = AnalysisIntegrityStatus.verified
+            run.effective_integrity = AnalysisIntegrityStatus.verified
             con.execute(
-                "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
-                (run.model_dump_json(), run.id),
+                """
+                UPDATE decision_analysis_runs
+                SET status=?, finished_at=?, analysis_manifest_hash=?, payload=?
+                WHERE id=? AND status='RUNNING'
+                """,
+                (run.status, run.finished_at, run.analysis_manifest_hash, run.model_dump_json(), run.id),
             )
+            if con.execute("SELECT changes()").fetchone()[0] != 1:
+                raise PublicationConflict("经营分析状态已变化，不能重复写入终态")
             for artifact in artifacts or []:
                 if artifact.analysis_run_id != run.id or artifact.scenario_id != run.scenario_id:
                     raise PublicationConflict("容量反事实证据与经营分析不一致")
@@ -2844,16 +3131,34 @@ class Store:
         run: DecisionAnalysisRun,
         requirement: str,
         relational_input_hash: str,
+        relational_status: str,
+        relational_analysis_manifest_hash: str | None,
+        relational_id: str,
+        relational_scenario_id: str,
+        relational_number: int,
+        relational_plan_version_id: str,
+        relational_analysis_type: str,
+        relational_created_at: str,
+        relational_started_at: str,
+        relational_finished_at: str | None,
     ) -> DecisionAnalysisRun:
         checked = run.model_copy(deep=True)
         checked.attestation_requirement = AttestationRequirement(requirement)
-        if checked.attestation_requirement is AttestationRequirement.legacy_migrated:
-            checked.integrity_status = AnalysisIntegrityStatus.legacy_unattested
-            return checked
-        if checked.runtime_manifest is None or checked.input_manifest is None:
-            return _failed_integrity_copy(checked, "required input or runtime manifest is missing")
+        if (
+            checked.id != relational_id
+            or checked.scenario_id != relational_scenario_id
+            or checked.number != relational_number
+            or checked.plan_version_id != relational_plan_version_id
+            or checked.analysis_type != relational_analysis_type
+            or checked.created_at != relational_created_at
+            or checked.created_at != relational_started_at
+            or checked.input_hash != relational_input_hash
+            or checked.status != relational_status
+            or checked.finished_at != relational_finished_at
+        ):
+            return _failed_integrity_copy(checked, "analysis relational identity or state mismatch")
         plan_row = con.execute(
-            "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
+            "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
             (checked.plan_version_id, checked.scenario_id),
         ).fetchone()
         if not plan_row:
@@ -2862,6 +3167,19 @@ class Store:
             plan = cls._load_plan_row(con, plan_row)
         except DecisionAnalysisIntegrityError:
             return _failed_integrity_copy(checked, "referenced plan is malformed")
+        checked.parent_plan_integrity = plan.effective_integrity
+        if plan.effective_integrity is AnalysisIntegrityStatus.failed:
+            return _failed_integrity_copy(checked, "referenced plan integrity failed")
+        if checked.attestation_requirement is AttestationRequirement.legacy_migrated:
+            checked.self_integrity = AnalysisIntegrityStatus.legacy_unattested
+            checked.effective_integrity = _effective_integrity(
+                checked.self_integrity,
+                checked.parent_plan_integrity,
+            )
+            checked.integrity_status = checked.effective_integrity
+            return checked
+        if checked.runtime_manifest is None or checked.input_manifest is None:
+            return _failed_integrity_copy(checked, "required input or runtime manifest is missing")
         from .decision import schedule_signature
 
         if checked.scenario_snapshot_hash != plan.scenario_snapshot_hash or checked.schedule_hash != schedule_signature(
@@ -2882,13 +3200,36 @@ class Store:
         if (
             checked.input_manifest != expected_input_manifest
             or checked.input_hash != expected_input_manifest.semantic_input_hash
-            or relational_input_hash != checked.input_hash
         ):
             return _failed_integrity_copy(checked, "decision input manifest mismatch")
         if checked.status == "RUNNING":
-            checked.integrity_status = AnalysisIntegrityStatus.verified
+            reservation = checked.reservation_manifest
+            expected_reservation_payload = {
+                "policy_version": "FIELD_SERVICE_ANALYSIS_RESERVATION_V1",
+                "analysis_id": checked.id,
+                "input_hash": checked.input_hash,
+                "plan_manifest_hash": plan.publication_manifest_hash,
+                "started_at": checked.created_at,
+            }
+            if (
+                reservation is None
+                or reservation.model_dump(exclude={"reservation_hash"}, mode="json") != expected_reservation_payload
+                or reservation.reservation_hash != content_hash(expected_reservation_payload)
+                or checked.result is not None
+                or checked.result_manifest is not None
+                or checked.failure_manifest is not None
+                or checked.analysis_manifest_hash is not None
+                or relational_analysis_manifest_hash is not None
+            ):
+                return _failed_integrity_copy(checked, "running reservation manifest mismatch")
+            checked.self_integrity = AnalysisIntegrityStatus.verified
+            checked.effective_integrity = _effective_integrity(
+                checked.self_integrity,
+                checked.parent_plan_integrity,
+            )
+            checked.integrity_status = checked.effective_integrity
             return checked
-        if not checked.analysis_manifest_hash:
+        if not checked.analysis_manifest_hash or checked.analysis_manifest_hash != relational_analysis_manifest_hash:
             return _failed_integrity_copy(checked, "required analysis manifest is missing")
         if checked.status == "COMPLETED":
             if (
@@ -2926,12 +3267,13 @@ class Store:
             artifact.attestation_requirement = AttestationRequirement(row["attestation_requirement"])
             if artifact.attestation_requirement is not AttestationRequirement.required or not artifact.artifact_hash:
                 return _failed_integrity_copy(checked, f"artifact {row['id']} lacks required attestation")
-            expected = content_hash(
-                artifact.model_dump(
-                    exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
-                    mode="json",
-                )
-            )
+            if (
+                artifact.id != row["id"]
+                or artifact.analysis_run_id != checked.id
+                or artifact.scenario_id != checked.scenario_id
+            ):
+                return _failed_integrity_copy(checked, f"artifact {row['id']} relational identity mismatch")
+            expected = content_hash(_artifact_hash_payload(artifact))
             if artifact.artifact_hash != expected:
                 return _failed_integrity_copy(checked, f"artifact {row['id']} hash mismatch")
             actual_artifacts[row["id"]] = artifact.artifact_hash
@@ -2940,7 +3282,12 @@ class Store:
             return _failed_integrity_copy(checked, "artifact manifest mismatch")
         if content_hash(_analysis_manifest_payload(checked)) != checked.analysis_manifest_hash:
             return _failed_integrity_copy(checked, "analysis manifest mismatch")
-        checked.integrity_status = AnalysisIntegrityStatus.verified
+        checked.self_integrity = AnalysisIntegrityStatus.verified
+        checked.effective_integrity = _effective_integrity(
+            checked.self_integrity,
+            checked.parent_plan_integrity,
+        )
+        checked.integrity_status = checked.effective_integrity
         return checked
 
     @classmethod
@@ -2958,6 +3305,16 @@ class Store:
             run,
             row["attestation_requirement"],
             row["input_hash"],
+            row["status"],
+            row["analysis_manifest_hash"],
+            str(row["id"]),
+            str(row["scenario_id"]),
+            int(row["number"]),
+            str(row["plan_version_id"]),
+            str(row["analysis_type"]),
+            str(row["created_at"]),
+            str(row["started_at"]),
+            str(row["finished_at"]) if row["finished_at"] is not None else None,
         )
 
     def list_verified_decision_analysis_runs(
@@ -2965,15 +3322,29 @@ class Store:
         scenario_id: str,
         plan_version_id: str,
     ) -> list[DecisionAnalysisRun]:
-        with self._connect() as con:
+        runs: list[DecisionAnalysisRun] = []
+        with self._lock, self._connect() as con:
             rows = con.execute(
                 """
-                SELECT id, payload, attestation_requirement, input_hash FROM decision_analysis_runs
+                SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                       input_hash, status, started_at, finished_at, analysis_manifest_hash
+                FROM decision_analysis_runs
                 WHERE scenario_id=? AND plan_version_id=? ORDER BY number
                 """,
                 (scenario_id, plan_version_id),
             ).fetchall()
-            return [self._load_analysis_row(con, row) for row in rows]
+            for row in rows:
+                try:
+                    runs.append(self._load_analysis_row(con, row))
+                except DecisionAnalysisIntegrityError as error:
+                    self._record_read_isolation(
+                        con,
+                        "decision_analysis_runs",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        f"read isolation: {error.record_type}",
+                    )
+        return runs
 
     def get_verified_decision_analysis_run(
         self,
@@ -2985,7 +3356,9 @@ class Store:
         with self._connect() as con:
             row = con.execute(
                 """
-                SELECT id, payload, attestation_requirement, input_hash FROM decision_analysis_runs
+                SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                       input_hash, status, started_at, finished_at, analysis_manifest_hash
+                FROM decision_analysis_runs
                 WHERE scenario_id=? AND (id=? OR number=?)
                 """,
                 (scenario_id, analysis_id, numeric),
@@ -2998,62 +3371,13 @@ class Store:
     def get_decision_analysis_run(self, scenario_id: str, analysis_id: str) -> DecisionAnalysisRun | None:
         return self.get_verified_decision_analysis_run(scenario_id, analysis_id)
 
-    def list_decision_analysis_artifacts(
-        self,
-        scenario_id: str,
-        analysis_run_id: str,
-    ) -> list[DecisionAnalysisArtifact]:
-        with self._connect() as con:
-            rows = con.execute(
-                """
-                SELECT id, payload, attestation_requirement FROM decision_analysis_artifacts
-                WHERE scenario_id=? AND analysis_run_id=? ORDER BY option_id
-                """,
-                (scenario_id, analysis_run_id),
-            ).fetchall()
-        artifacts: list[DecisionAnalysisArtifact] = []
-        for row in rows:
-            try:
-                artifact = _parse_decision_artifact(json.loads(row["payload"]))
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                raise DecisionAnalysisIntegrityError(
-                    "经营分析证据无法解析",
-                    record_id=str(row["id"]),
-                    record_type="DECISION_ANALYSIS_ARTIFACT",
-                ) from error
-            artifact.attestation_requirement = AttestationRequirement(row["attestation_requirement"])
-            expected_hash = content_hash(
-                artifact.model_dump(
-                    exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
-                    mode="json",
-                )
-            )
-            artifact.integrity_status = (
-                AnalysisIntegrityStatus.legacy_unattested
-                if artifact.attestation_requirement is AttestationRequirement.legacy_migrated
-                else AnalysisIntegrityStatus.verified
-                if artifact.artifact_hash and artifact.artifact_hash == expected_hash
-                else AnalysisIntegrityStatus.failed
-            )
-            artifacts.append(artifact)
-        return artifacts
-
-    def get_decision_analysis_artifact(
-        self,
-        scenario_id: str,
-        analysis_run_id: str,
-        artifact_id: str,
-    ) -> DecisionAnalysisArtifact | None:
-        with self._connect() as con:
-            row = con.execute(
-                """
-                SELECT id, payload, attestation_requirement FROM decision_analysis_artifacts
-                WHERE scenario_id=? AND analysis_run_id=? AND id=?
-                """,
-                (scenario_id, analysis_run_id, artifact_id),
-            ).fetchone()
-        if not row:
-            return None
+    @classmethod
+    def _load_artifact_row(
+        cls,
+        con: sqlite3.Connection,
+        row: sqlite3.Row,
+        parent: DecisionAnalysisRun,
+    ) -> DecisionAnalysisArtifact:
         try:
             artifact = _parse_decision_artifact(json.loads(row["payload"]))
         except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -3063,24 +3387,174 @@ class Store:
                 record_type="DECISION_ANALYSIS_ARTIFACT",
             ) from error
         artifact.attestation_requirement = AttestationRequirement(row["attestation_requirement"])
-        expected_hash = content_hash(
-            artifact.model_dump(
-                exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
-                mode="json",
-            )
+        relation_valid = (
+            artifact.id == row["id"]
+            and artifact.scenario_id == row["scenario_id"]
+            and artifact.analysis_run_id == row["analysis_run_id"]
         )
-        artifact.integrity_status = (
+        expected_hash = content_hash(_artifact_hash_payload(artifact))
+        artifact.self_integrity = (
             AnalysisIntegrityStatus.legacy_unattested
             if artifact.attestation_requirement is AttestationRequirement.legacy_migrated
             else AnalysisIntegrityStatus.verified
-            if artifact.artifact_hash and artifact.artifact_hash == expected_hash
+            if relation_valid and artifact.artifact_hash and artifact.artifact_hash == expected_hash
             else AnalysisIntegrityStatus.failed
         )
+        artifact.parent_analysis_integrity = parent.effective_integrity
+        artifact.effective_integrity = _effective_integrity(
+            artifact.self_integrity,
+            artifact.parent_analysis_integrity,
+        )
+        artifact.integrity_status = artifact.effective_integrity
         return artifact
 
-    def save_risk_comparison(self, comparison: RiskComparisonRun) -> RiskComparisonRun:
+    def list_decision_analysis_artifacts(
+        self,
+        scenario_id: str,
+        analysis_run_id: str,
+    ) -> list[DecisionAnalysisArtifact]:
+        with self._connect() as con:
+            parent_row = con.execute(
+                """
+                SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                       input_hash, status, started_at, finished_at, analysis_manifest_hash
+                FROM decision_analysis_runs WHERE scenario_id=? AND id=?
+                """,
+                (scenario_id, analysis_run_id),
+            ).fetchone()
+            if not parent_row:
+                return []
+            parent = self._load_analysis_row(con, parent_row)
+            rows = con.execute(
+                """
+                SELECT id, scenario_id, analysis_run_id, payload, attestation_requirement
+                FROM decision_analysis_artifacts
+                WHERE scenario_id=? AND analysis_run_id=? ORDER BY option_id
+                """,
+                (scenario_id, analysis_run_id),
+            ).fetchall()
+            return [self._load_artifact_row(con, row, parent) for row in rows]
+
+    def get_decision_analysis_artifact(
+        self,
+        scenario_id: str,
+        analysis_run_id: str,
+        artifact_id: str,
+    ) -> DecisionAnalysisArtifact | None:
+        with self._connect() as con:
+            parent_row = con.execute(
+                """
+                SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                       input_hash, status, started_at, finished_at, analysis_manifest_hash
+                FROM decision_analysis_runs WHERE scenario_id=? AND id=?
+                """,
+                (scenario_id, analysis_run_id),
+            ).fetchone()
+            if not parent_row:
+                return None
+            parent = self._load_analysis_row(con, parent_row)
+            row = con.execute(
+                """
+                SELECT id, scenario_id, analysis_run_id, payload, attestation_requirement
+                FROM decision_analysis_artifacts
+                WHERE scenario_id=? AND analysis_run_id=? AND id=?
+                """,
+                (scenario_id, analysis_run_id, artifact_id),
+            ).fetchone()
+            return self._load_artifact_row(con, row, parent) if row else None
+
+    @classmethod
+    def _comparison_dependency_integrity(
+        cls,
+        con: sqlite3.Connection,
+        comparison: RiskComparisonRun,
+    ) -> AnalysisIntegrityStatus:
+        dependencies: list[AnalysisIntegrityStatus] = []
+        for analysis_id, manifest_hash, trial_id, trial_hash, scenario_id, scenario_hash in (
+            (
+                comparison.before_analysis_id,
+                comparison.before_analysis_manifest_hash,
+                comparison.before_trial_artifact_id,
+                comparison.before_trial_artifact_hash,
+                comparison.before_scenario_artifact_id,
+                comparison.before_scenario_artifact_hash,
+            ),
+            (
+                comparison.after_analysis_id,
+                comparison.after_analysis_manifest_hash,
+                comparison.after_trial_artifact_id,
+                comparison.after_trial_artifact_hash,
+                comparison.after_scenario_artifact_id,
+                comparison.after_scenario_artifact_hash,
+            ),
+        ):
+            run_row = con.execute(
+                """
+                    SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
+                       input_hash, status, started_at, finished_at, analysis_manifest_hash
+                FROM decision_analysis_runs WHERE scenario_id=? AND id=?
+                """,
+                (comparison.scenario_id, analysis_id),
+            ).fetchone()
+            if not run_row:
+                return AnalysisIntegrityStatus.failed
+            run = cls._load_analysis_row(con, run_row)
+            dependencies.append(run.effective_integrity)
+            if (
+                run.status != "COMPLETED"
+                or run.analysis_manifest_hash != manifest_hash
+                or run.effective_integrity is not AnalysisIntegrityStatus.verified
+            ):
+                return _effective_integrity(*dependencies, AnalysisIntegrityStatus.failed)
+            for artifact_id, artifact_hash in ((trial_id, trial_hash), (scenario_id, scenario_hash)):
+                artifact_row = con.execute(
+                    """
+                    SELECT id, scenario_id, analysis_run_id, payload, attestation_requirement
+                    FROM decision_analysis_artifacts
+                    WHERE scenario_id=? AND analysis_run_id=? AND id=?
+                    """,
+                    (comparison.scenario_id, run.id, artifact_id),
+                ).fetchone()
+                if not artifact_row:
+                    return AnalysisIntegrityStatus.failed
+                artifact = cls._load_artifact_row(con, artifact_row, run)
+                dependencies.append(artifact.effective_integrity)
+                if artifact.artifact_hash != artifact_hash:
+                    return AnalysisIntegrityStatus.failed
+        return _effective_integrity(*dependencies) if dependencies else AnalysisIntegrityStatus.failed
+
+    def save_risk_comparison(
+        self,
+        comparison: RiskComparisonRun,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> RiskComparisonRun:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            existing_key = con.execute(
+                "SELECT * FROM risk_comparison_runs WHERE scenario_id=? AND idempotency_key=?",
+                (comparison.scenario_id, idempotency_key),
+            ).fetchone()
+            if existing_key:
+                if existing_key["request_fingerprint"] != request_fingerprint:
+                    raise PublicationConflict(
+                        "相同幂等键对应了不同风险比较请求",
+                        code="IDEMPOTENCY_KEY_REUSED",
+                    )
+                return self._load_risk_comparison_row(con, existing_key)
+            expected_input_hash = content_hash(_risk_comparison_input_payload(comparison))
+            if comparison.comparison_input_hash != expected_input_hash:
+                raise PublicationConflict("风险比较输入指纹不一致")
+            if self._comparison_dependency_integrity(con, comparison) is not AnalysisIntegrityStatus.verified:
+                raise PublicationConflict("风险比较引用的分析或 trial 证据未通过完整性校验")
+            semantic_hash = content_hash(_risk_comparison_hash_payload(comparison))
+            existing_semantic = con.execute(
+                "SELECT * FROM risk_comparison_runs WHERE scenario_id=? AND comparison_hash=?",
+                (comparison.scenario_id, semantic_hash),
+            ).fetchone()
+            if existing_semantic:
+                return self._load_risk_comparison_row(con, existing_semantic)
             row = con.execute(
                 "SELECT COALESCE(MAX(number), 0) + 1 AS number FROM risk_comparison_runs WHERE scenario_id=?",
                 (comparison.scenario_id,),
@@ -3088,49 +3562,114 @@ class Store:
             saved = comparison.model_copy(deep=True)
             saved.number = int(row["number"])
             saved.id = f"RC-{saved.scenario_id}-{saved.number}-{uuid.uuid4().hex[:6]}"
-            saved.comparison_hash = content_hash(
-                saved.model_dump(exclude={"comparison_hash", "integrity_status"}, mode="json")
-            )
+            saved.comparison_hash = semantic_hash
+            saved.attestation_requirement = AttestationRequirement.required
+            saved.self_integrity = AnalysisIntegrityStatus.verified
+            saved.effective_integrity = AnalysisIntegrityStatus.verified
+            saved.integrity_status = AnalysisIntegrityStatus.verified
+            saved.business_result_available = True
             con.execute(
                 """
                 INSERT INTO risk_comparison_runs(
-                    id, scenario_id, number, comparison_hash, payload, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, scenario_id, number, comparison_hash, comparison_input_hash,
+                    idempotency_key, request_fingerprint, attestation_requirement, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     saved.id,
                     saved.scenario_id,
                     saved.number,
                     saved.comparison_hash,
+                    saved.comparison_input_hash,
+                    idempotency_key,
+                    request_fingerprint,
+                    AttestationRequirement.required.value,
                     saved.model_dump_json(),
                     saved.created_at,
                 ),
             )
             return saved
 
-    def get_risk_comparison(self, scenario_id: str, comparison_id: str) -> RiskComparisonRun | None:
-        with self._connect() as con:
-            row = con.execute(
-                "SELECT payload, comparison_hash FROM risk_comparison_runs WHERE scenario_id=? AND id=?",
-                (scenario_id, comparison_id),
-            ).fetchone()
-        if not row:
-            return None
+    @classmethod
+    def _load_risk_comparison_row(cls, con: sqlite3.Connection, row: sqlite3.Row) -> RiskComparisonRun:
         try:
             comparison = RiskComparisonRun.model_validate_json(row["payload"])
         except (TypeError, ValueError) as error:
             raise DecisionAnalysisIntegrityError(
                 "配对风险比较记录无法解析",
-                record_id=comparison_id,
+                record_id=str(row["id"]),
                 record_type="RISK_COMPARISON_RUN",
             ) from error
-        expected = content_hash(comparison.model_dump(exclude={"comparison_hash", "integrity_status"}, mode="json"))
-        comparison.integrity_status = (
-            AnalysisIntegrityStatus.verified
-            if comparison.comparison_hash == row["comparison_hash"] == expected
+        comparison.attestation_requirement = AttestationRequirement(row["attestation_requirement"])
+        relation_valid = (
+            comparison.id == row["id"]
+            and comparison.scenario_id == row["scenario_id"]
+            and comparison.number == row["number"]
+            and comparison.created_at == row["created_at"]
+            and comparison.comparison_input_hash == row["comparison_input_hash"]
+            and comparison.comparison_hash == row["comparison_hash"]
+        )
+        expected_input_hash = content_hash(_risk_comparison_input_payload(comparison))
+        expected_hash = content_hash(_risk_comparison_hash_payload(comparison))
+        comparison.self_integrity = (
+            AnalysisIntegrityStatus.legacy_unattested
+            if comparison.attestation_requirement is AttestationRequirement.legacy_migrated
+            else AnalysisIntegrityStatus.verified
+            if relation_valid
+            and comparison.comparison_input_hash == expected_input_hash
+            and comparison.comparison_hash == expected_hash
             else AnalysisIntegrityStatus.failed
         )
+        dependency_integrity = (
+            AnalysisIntegrityStatus.legacy_unattested
+            if comparison.attestation_requirement is AttestationRequirement.legacy_migrated
+            else cls._comparison_dependency_integrity(con, comparison)
+        )
+        comparison.effective_integrity = _effective_integrity(
+            comparison.self_integrity,
+            dependency_integrity,
+        )
+        comparison.integrity_status = comparison.effective_integrity
+        comparison.business_result_available = comparison.effective_integrity is AnalysisIntegrityStatus.verified
         return comparison
+
+    def get_risk_comparison(self, scenario_id: str, comparison_id: str) -> RiskComparisonRun | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM risk_comparison_runs WHERE scenario_id=? AND id=?",
+                (scenario_id, comparison_id),
+            ).fetchone()
+            if not row:
+                return None
+            return self._load_risk_comparison_row(con, row)
+
+    def risk_comparison_for_idempotency(
+        self,
+        scenario_id: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> RiskComparisonRun | None:
+        """Resolve a comparison command before running its expensive child analyses."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM risk_comparison_runs WHERE scenario_id=? AND idempotency_key=?",
+                (scenario_id, idempotency_key),
+            ).fetchone()
+            if not row:
+                return None
+            if row["request_fingerprint"] != request_fingerprint:
+                raise PublicationConflict(
+                    "相同幂等键对应了不同风险比较请求",
+                    code="IDEMPOTENCY_KEY_REUSED",
+                )
+            comparison = self._load_risk_comparison_row(con, row)
+            if comparison.effective_integrity is not AnalysisIntegrityStatus.verified:
+                raise PublicationConflict(
+                    "已有风险比较的依赖证明已失效，不能作为幂等业务结果重放",
+                    code="RISK_COMPARISON_INTEGRITY_FAILED",
+                    details={"comparison_id": comparison.id},
+                )
+            return comparison
 
     def published_for_key(self, key: str, fingerprint: str) -> PlanVersion | None:
         with self._connect() as con:
@@ -3142,12 +3681,12 @@ class Store:
             if row["request_fingerprint"] != fingerprint:
                 raise PublicationConflict("相同幂等键对应了不同请求")
             plan_row = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=?",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=?",
                 (row["plan_version_id"],),
             ).fetchone()
             if not plan_row:
                 raise PublicationConflict("幂等发布记录引用的方案不存在")
-            return self._load_plan_row(con, plan_row)
+            return self._require_loaded_plan_for_use(self._load_plan_row(con, plan_row), PlanUseCase.replay)
 
     def plan_for_publication_key(self, key: str) -> PlanVersion | None:
         with self._connect() as con:
@@ -3158,26 +3697,52 @@ class Store:
             if not row:
                 return None
             plan_row = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE id=?",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=?",
                 (row["plan_version_id"],),
             ).fetchone()
             if not plan_row:
                 raise PublicationConflict("幂等发布记录引用的方案不存在")
-            return self._load_plan_row(con, plan_row)
+            return self._require_loaded_plan_for_use(self._load_plan_row(con, plan_row), PlanUseCase.replay)
 
-    def list_plan_versions(self, scenario_id: str, include_snapshots: bool = False) -> list[PlanVersion]:
-        with self._connect() as con:
+    def list_plan_versions_with_warnings(
+        self,
+        scenario_id: str,
+        include_snapshots: bool = False,
+    ) -> tuple[list[PlanVersion], list[dict[str, str]]]:
+        warnings: list[dict[str, str]] = []
+        with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? ORDER BY number",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? ORDER BY number",
                 (scenario_id,),
             ).fetchall()
             plans = []
             for row in rows:
-                plan = self._load_plan_row(con, row)
+                try:
+                    plan = self._load_plan_row(con, row)
+                except DecisionAnalysisIntegrityError as error:
+                    warnings.append(
+                        {
+                            "record_type": error.record_type,
+                            "record_id": error.record_id,
+                            "message": "方案记录无法解析，已从列表隔离",
+                        }
+                    )
+                    self._record_read_isolation(
+                        con,
+                        "plan_versions",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        f"read isolation: {error.record_type}",
+                    )
+                    continue
                 if not include_snapshots:
                     plan.scenario_snapshot = None
                     plan.artifacts = []
                 plans.append(plan)
+        return plans, warnings
+
+    def list_plan_versions(self, scenario_id: str, include_snapshots: bool = False) -> list[PlanVersion]:
+        plans, _warnings = self.list_plan_versions_with_warnings(scenario_id, include_snapshots)
         return plans
 
     def get_plan_version(self, scenario_id: str, version_id: str) -> PlanVersion | None:
@@ -3185,12 +3750,27 @@ class Store:
         numeric = int(normalized) if normalized.isdigit() else -1
         with self._connect() as con:
             row = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? AND (id=? OR number=?)",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? AND (id=? OR number=?)",
                 (scenario_id, version_id, numeric),
             ).fetchone()
             if not row:
                 return None
             return self._load_plan_row(con, row)
+
+    def require_plan_for_use(
+        self,
+        scenario_id: str,
+        version_id: str,
+        use_case: PlanUseCase,
+    ) -> PlanVersion:
+        plan = self.get_plan_version(scenario_id, version_id)
+        if plan is None:
+            raise PublicationConflict(
+                "方案版本不存在",
+                code="PLAN_NOT_FOUND",
+                details={"plan_version_id": version_id, "use_case": use_case.value},
+            )
+        return self._require_loaded_plan_for_use(plan, use_case)
 
     def active_plan_version(self, scenario_id: str) -> PlanVersion | None:
         with self._connect() as con:
@@ -3211,7 +3791,7 @@ class Store:
     def rename_plan_version(self, scenario_id: str, version_id: str, label: str) -> PlanVersion | None:
         with self._lock, self._connect() as con:
             row = con.execute(
-                "SELECT id, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? AND id=?",
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? AND id=?",
                 (scenario_id, version_id),
             ).fetchone()
             if not row:
@@ -3249,7 +3829,11 @@ class Store:
         return None
 
     def list_schedules(self, scenario_id: str) -> list[ScheduleResult]:
-        return [plan.selected for plan in self.list_plan_versions(scenario_id)]
+        return [
+            plan.selected
+            for plan in self.list_plan_versions(scenario_id)
+            if plan.effective_integrity is AnalysisIntegrityStatus.verified
+        ]
 
     def list_profiles(self, include_stable: bool = True) -> list[StrategyProfile]:
         with self._connect() as con:

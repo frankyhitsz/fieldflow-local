@@ -6,11 +6,14 @@ from backend.fixtures import get_fixture
 from backend.hashing import content_hash
 from backend.models import (
     AnalysisHorizon,
+    AnalysisIntegrityStatus,
     CapacityAnalysisRequest,
     DecisionCostPolicy,
     LaborCostMode,
     PlanVersion,
+    PublicationVerificationArtifact,
 )
+from backend.provenance import build_plan_manifest_payload
 from backend.scheduler import baseline_schedule
 
 
@@ -83,6 +86,18 @@ def test_any_capacity_option_marked_feasible_has_no_verification_violations(
     for technician, overtime_limit in zip(scenario.technicians, overtime_limits, strict=True):
         technician.overtime_limit = overtime_limit
     schedule = baseline_schedule(scenario, 1)
+    report: dict[str, object] = {}
+    artifact_payload = {
+        "policy_version": "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+        "candidate_snapshot": {},
+        "planning_context_snapshot": None,
+        "transaction_verification_report": report,
+        "verified_schedule_hash": content_hash(schedule),
+    }
+    verification = PublicationVerificationArtifact(
+        **artifact_payload,
+        artifact_hash=content_hash(artifact_payload),
+    )
     plan = PlanVersion(
         id="PV-property-capacity",
         scenario_id=scenario.id,
@@ -94,7 +109,17 @@ def test_any_capacity_option_marked_feasible_has_no_verification_violations(
         scenario_snapshot=scenario,
         selected=schedule,
         scenario_snapshot_hash=content_hash(scenario),
+        published_schedule_hash=content_hash(schedule),
+        publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+        publication_verification_report_hash=content_hash(report),
+        publication_verification_artifact=verification,
+        publication_manifest_version="FIELD_SERVICE_PUBLICATION_MANIFEST_V2",
+        publication_manifest_hash="pending",
+        integrity_status=AnalysisIntegrityStatus.verified,
+        self_integrity=AnalysisIntegrityStatus.verified,
+        effective_integrity=AnalysisIntegrityStatus.verified,
     )
+    plan.publication_manifest_hash = content_hash(build_plan_manifest_payload(plan))
     request = CapacityAnalysisRequest.model_validate(
         {
             "option_ids": [option],
@@ -106,7 +131,7 @@ def test_any_capacity_option_marked_feasible_has_no_verification_violations(
         assert result.option_applicable
         assert result.schedule_feasible
         assert result.violations == []
-    if result.fixed_cost_cadence.value == "ONE_TIME":
+    if result.feasible and result.fixed_cost_cadence.value == "ONE_TIME":
         assert result.horizon_total_impact_cents == (
             result.daily_operating_delta_cents * horizon_days + result.one_time_investment_cents
         )

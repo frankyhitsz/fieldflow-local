@@ -8,9 +8,52 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .hashing import HASH_SCHEMA_VERSION, content_hash
-from .models import DecisionAnalysisContext, DecisionInputManifest, RuntimeManifest
+from .models import DecisionAnalysisContext, DecisionInputManifest, PlanVersion, RuntimeManifest
 
 DECISION_ALGORITHM_VERSION = "FIELD_SERVICE_DECISION_V3"
+
+
+def build_plan_manifest_payload(plan: PlanVersion) -> dict[str, object]:
+    """Return the immutable V2 facts that make a published plan actionable."""
+    artifacts = [
+        {
+            "artifact_id": artifact.id,
+            "role": artifact.role,
+            "strategy": artifact.strategy,
+            "schedule_hash": content_hash(artifact.schedule),
+        }
+        for artifact in sorted(plan.artifacts, key=lambda item: (item.role, item.id))
+    ]
+    return {
+        "policy_version": "FIELD_SERVICE_PUBLICATION_MANIFEST_V2",
+        "identity": {
+            "id": plan.id,
+            "scenario_id": plan.scenario_id,
+            "number": plan.number,
+            "action": plan.action,
+            "data_revision": plan.data_revision,
+            "created_at": plan.created_at,
+        },
+        "lineage": {
+            "source_version_id": plan.source_version_id,
+            "lineage_source_version_id": plan.lineage_source_version_id,
+            "stability_baseline_version_id": plan.stability_baseline_version_id,
+            "relation": plan.relation,
+            "candidate_id": plan.candidate_id,
+            "source_plan_snapshot_hash": plan.source_plan_snapshot_hash,
+        },
+        "content": {
+            "scenario_snapshot_hash": plan.scenario_snapshot_hash,
+            "selected_schedule_hash": plan.published_schedule_hash,
+            "planning_context_hash": plan.publication_planning_context_hash,
+            "verification_artifact_hash": (
+                plan.publication_verification_artifact.artifact_hash if plan.publication_verification_artifact else None
+            ),
+            "verification_report_hash": plan.publication_verification_report_hash,
+            "verification_policy_version": plan.publication_verification_policy_version,
+        },
+        "artifacts": artifacts,
+    }
 
 
 @lru_cache(maxsize=1)

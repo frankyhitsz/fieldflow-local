@@ -6,7 +6,7 @@ from .travel import TravelTimeProvider
 
 
 def work_order_planning_payload(order: WorkOrder) -> dict:
-    """Fields that can change whether or how a pending visit may be executed."""
+    """All fields that can change optimization or assignment feasibility."""
     return {
         "id": order.id,
         "required_skills": [skill.value for skill in order.required_skills],
@@ -20,6 +20,30 @@ def work_order_planning_payload(order: WorkOrder) -> dict:
         "vip": order.vip,
         "is_emergency": order.is_emergency,
         "reported_at": order.reported_at,
+    }
+
+
+def work_order_assignment_feasibility_payload(order: WorkOrder) -> dict:
+    """Only facts that can make the published technician/visit infeasible."""
+    return {
+        "id": order.id,
+        "required_skills": [skill.value for skill in order.required_skills],
+        "location": order.location.model_dump(mode="json"),
+        "service_duration": order.service_duration,
+        "window_start": order.window_start,
+        "window_end": order.window_end,
+        "reported_at": order.reported_at,
+    }
+
+
+def work_order_objective_payload(order: WorkOrder) -> dict:
+    return {
+        "id": order.id,
+        "sla_deadline": order.sla_deadline,
+        "priority": order.priority.value,
+        "drop_penalty": order.drop_penalty,
+        "vip": order.vip,
+        "is_emergency": order.is_emergency,
     }
 
 
@@ -60,7 +84,7 @@ def assignment_planning_fingerprint(
     locks = {item.work_order_id: item.technician_id for item in scenario.locked_assignments}
     return content_hash(
         {
-            "work_order": work_order_planning_payload(order),
+            "work_order_feasibility": work_order_assignment_feasibility_payload(order),
             "technician": technician_planning_payload(technician),
             "locked_technician_id": locks.get(order.id),
             "travel_model_fingerprint": provider.fingerprint,

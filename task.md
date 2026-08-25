@@ -4,50 +4,44 @@
 
 ## 本轮目标
 
-逐条复核 `pro-plan.md` 的 P0/P1/P2 和 FF-1201～FF-1283。v0.5.5 必须完成决策证据与语义正确性的 M0 门禁；能在现有本地单机契约内安全完成的高优先级项一并修复。需要新 worker、业务实体、外部数据、许可证或仓库治理决策的项目留下具体边界，不创建占位实现。
+复核变更后的 `pro-plan.md`。v0.5.6 完成 M0 的证据闭包、Plan 使用门禁和经营口径修复；P1/P2 中需要 worker、外部数据、新业务实体、许可证或仓库治理决定的项目说明边界，不以空接口冒充完成。
 
-## 第一轮：证明链和失败关闭
+## 第一轮：信任闭包与使用门禁
 
-- [x] Schema v18 为 Plan、A、Artifact 增加不可降级的关系型证明要求；旧数据显式迁移为 Legacy。
-- [x] POST 重放、GET、列表、同步兼容接口、retry、rerun 和风险比较统一使用校验读取路径。
-- [x] 新增 input/result/failure/runtime manifest，绑定请求、政策、上下文、快照、排程、旅行模型、依赖环境和错误。
-- [x] 损坏或缺证据的 required 记录进入 `FAILED`，不再向调用方返回 result。
-- [x] 修复旧唯一约束迁移丢失 Decision Artifact 的路径，并增加真实 v14 Artifact 保全样本。
-- [x] 损坏 JSON 使用 `json_valid` 隔离、quarantine 和稳定 409，不再静默成为可信记录。
+- [x] Schema v19 为 A 增加关系型状态、开始/结束时间、lease 字段和 ReservationManifest；数据库触发器禁止终态回退。
+- [x] Plan Manifest V2 绑定关系型身份、不可变头、完整血缘、PlanningContext、VerificationArtifact 和 Plan Artifact 清单。
+- [x] Plan → A → Artifact → RiskComparison 统一返回 self/parent/effective trust；父依赖失败时业务结果不可继续使用。
+- [x] 执行、分析、重放、人工改派、克隆、恢复、比较、报告和 `/schedules` 使用统一 Plan 门禁。
+- [x] Legacy Plan 只读；新增 re-attestation 命令从冻结快照创建新 V，不修改旧记录，不消耗 D。
+- [x] RiskComparison 绑定两端 A 与 trial/scenario-set Artifact；幂等预检在子分析之前，GET 和重放复核全部依赖。
 
-## 第二轮：重排、风险和命令恢复
+## 第二轮：经营语义与字段影响
 
-- [x] 普通方案统一使用完整冻结范围；重排成本、容量、风险统一使用发布时剩余范围和同一排程签名。
-- [x] 容量尾部追加在空未来路线下仍使用 route entry 的位置、可用时间和返回点。
-- [x] 风险事件先独立生成再选择承接技师；空闲技师计算出发、服务、返程和加班。
-- [x] 缺勤/突发“发生”与“造成损害”分开，保存 trial 证据；配对比较持久化差值区间和 win/tie/loss。
-- [x] exact retry 与 current rerun 都使用持久幂等命令协议；修复命令已预留但 A 未绑定时重启卡死。
-- [x] 人工改派锁使用引用计数回收；启动只对账所属分析命名空间。
+- [x] `PUBLICATION_REMAINING_PLAN` 强制单日范围；PAID_SHIFT 拆分完整日承诺和剩余增量，空闲技师不计增量。
+- [x] 容量分析复用剩余成本口径；供应商容量未确认的外包改为条件状态，正式 KPI、可执行性和经济建议为空。
+- [x] 风险统计拆分已发布承诺与全部需求 SLA；应急进入全部需求分母，并保存完成、准时和未服务概率。
+- [x] 应急技师按 trial 随机进度选择，应急去程应用相同旅行扰动。
+- [x] assignment-feasibility fingerprint 与目标偏好拆分；优先级、VIP、drop penalty 不再阻止既有分配开工。
+- [x] 字段按 metadata、commercial/objective、assignment feasibility、execution 分类；元数据编辑不再清空当前方案。
 
-## 第三轮：数据语义、界面和工程门禁
+## 第三轮：损坏隔离、界面与回归矩阵
 
-- [x] 公共实验评分保存完整政策快照；公平 KPI 增加归一化最小/最大负载。
-- [x] Booking ID、客户窗口迟到和相对计划偏差分别保存；旧字段保留读取兼容。
-- [x] 方案名称迁入 `plan_metadata`；`plan_applicability` 成为当前方案权威并同步场景缓存。
-- [x] 跨业务快照比较不再返回误导性 delta；哈希规范增加版本和 Unicode NFC。
-- [x] 外包证据明确容量、起止时间和 SLA 未验证，界面不把测算假设显示为承诺。
-- [x] 运营复盘增加 Plan/A 完整性、RuntimeManifest、发布上下文、场景集和下载入口。
-- [x] 加入 ESLint/React Hooks、局部 strict Pyright、85% 覆盖门槛、Python 依赖一致性检查和固定 SHA 的 GitHub Actions。
-- [x] `docs/pro-plan-v0.5.4-assessment.md` 逐项记录完成、部分完成、反驳和所有者决策。
+- [x] v1 历史重建前逐行归档旧方案相关表；迁移仍先创建时间戳数据库备份。
+- [x] 场景、Plan 和 A 列表隔离无法解析的记录；Plan 列表返回跳过数量，`/api/integrity-issues` 提供不含业务 payload 的隔离索引。
+- [x] 前端不把 Legacy/FAILED 作为默认业务结果；禁用执行型操作并提供 Legacy 重新认证入口。
+- [x] 前端展示有效信任、条件外包、完整日/剩余人工、已发布承诺/全部需求 SLA 和应急指标。
+- [x] 新增 Legacy 门禁、re-attestation、父级篡改传播、Plan 血缘/Artifact 篡改、通用报告旁路、关系型终态、剩余 PAID_SHIFT、多日拒绝、条件外包、应急统计、风险比较依赖/幂等和损坏列表隔离测试。
+- [x] 后端完整测试第一轮：213 passed。
+- [x] React 组件 10 项、ESLint、TypeScript 和生产构建第一轮：通过。
+- [x] 第二轮：`make lint`、89.53% 覆盖率、组件、构建、Demo、Benchmark 和依赖审计通过；修复 benchmark 仍构造旧式 Plan 的回归。
+- [x] 第三轮：关系型 A 身份复核发现并补齐 started_at/Plan/type 交叉验证；Playwright API lifecycle 通过。本机 Chromium/Chrome 页面进程受 SIGTRAP/SIGABRT 限制，完整 5 项由 GitHub Linux CI 复核。
+- [ ] GitHub Actions：推送后确认 Python 3.11、完整 fieldflow 和 Playwright 均通过。
 
-## 必须保持为后续范围
+## 逐条裁决边界
 
-- FF-1220～FF-1224、FF-1228：持久 Job Queue、Outbox、独立求解子进程、硬取消、完整依赖注入和运维 CLI 需要运行架构升级。
-- FF-1240～FF-1250：收件箱、完整 Booking、技师端、资产、周期维护、库存、通知和导入导出需要新的业务实体与数据来源。
-- FF-1260～FF-1266：incurred/实时 remaining、多日、组合容量和校准风险模型需要执行历史或模型版本升级。
-- FF-1280～FF-1283：正式 Benchmark、许可证、治理、单一锁工具和发布材料分别需要独立验证或仓库所有者决定。
+- M0 FF-1301～FF-1309、FF-1311 已完成；FF-1310 完成备份、旧行归档和关键列表隔离，显式迁移 CLI 与全表健康扫描归入 v0.6.0。
+- M1 FF-1320～FF-1328 需要持久 Job Queue、Outbox、独立求解进程、完整依赖注入、修订拆分、时变旅行或数据保留策略，不属于本次同步单机补丁。
+- M2/M3 的正式 Booking、技师端、资产、库存、通知、导入导出、组合容量、风险校准和多日规划需要新的业务实体或真实数据，不创建不可用占位能力。
+- LICENSE、分支保护和 required checks 会改变法律或仓库治理状态，保留给仓库所有者明确决定。
 
-## 验证状态
-
-- [x] P0/P1 定向故障注入和迁移测试：通过；迁移触发器与 WAL 初始化回归已发现并修复。
-- [x] React 组件 10 项、ESLint、TypeScript 和生产构建：通过。
-- [x] 后端完整测试：203 passed；coverage 89.84%，85% 门槛通过。
-- [x] Ruff、Pyright、ESLint、React Hooks、TypeScript、OpenAPI、依赖一致性与 Python/npm 审计：通过。
-- [x] React 10 项、生产构建、Demo、Benchmark 和 Playwright API 主流程：通过。
-- [x] Playwright：本机 API lifecycle 通过；本机页面浏览器受 SIGTRAP/SIGABRT 限制，GitHub Linux CI #36 补证 5/5 通过。
-- [x] GitHub Actions #36：`python-compat` 与完整 `fieldflow` 均成功。
+详细证据与反驳见 `docs/pro-plan-v0.5.6-assessment.md`。
