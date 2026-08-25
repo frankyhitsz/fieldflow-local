@@ -47,10 +47,11 @@ const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', descripti
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; existingFailed?: boolean; noEmergency?: boolean } = {}) {
+function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; existingFailed?: boolean; noEmergency?: boolean; riskGate?: Promise<void> } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const analysisRequest = url.endsWith('/analysis-runs') && init?.body ? JSON.parse(String(init.body)) as { analysis_type: 'COST' | 'CAPACITY' | 'RISK'; analysis_scope: string; request: { analysis_horizon?: { days: number } } } : undefined
+    if (analysisRequest?.analysis_type === 'RISK' && options.riskGate) await options.riskGate
     if (analysisRequest?.analysis_type === 'RISK' && options.failRisk) return new Response(JSON.stringify({ detail: { message: '风险引擎暂不可用' } }), { status: 500, headers: { 'Content-Type': 'application/json' } })
     const effectiveUrl = analysisRequest ? analysisRequest.analysis_type === 'COST' ? '/cost-analysis' : analysisRequest.analysis_type === 'RISK' ? '/risk-simulation' : '/capacity-analysis' : url
     const context = { analysis_scope: 'EX_ANTE_FROZEN_PLAN', current_execution_watermark: 2, analysis_as_of_time: 630, execution_context_hash: 'events', actual_execution_included: false, algorithm_version: 'FIELD_SERVICE_DECISION_V3', build_sha: 'test-sha' }
@@ -223,6 +224,20 @@ describe('FieldFlow navigation and render safety', () => {
     expect(await screen.findByText(/1,234\.00/)).toBeInTheDocument()
     expect(screen.getByText('风险引擎暂不可用')).toBeInTheDocument()
     expect(screen.queryByText('88%')).not.toBeInTheDocument()
+  })
+
+  it('shows a completed cost result without waiting for the risk simulation', async () => {
+    let releaseRisk: (() => void) | undefined
+    const riskGate = new Promise<void>(resolve => { releaseRisk = resolve })
+    mockApi(plan, { riskGate }); render(<App />)
+    await screen.findByRole('heading', { name: '今日调度测试' })
+    fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
+    await screen.findByText(/当前版本还没有经营分析/)
+    fireEvent.click(screen.getByRole('button', { name: '生成成本与风险分析' }))
+    expect(await screen.findByText(/1,234\.00/)).toBeInTheDocument()
+    expect(screen.queryByText('88%')).not.toBeInTheDocument()
+    releaseRisk?.()
+    expect(await screen.findByText('88%')).toBeInTheDocument()
   })
 
   it('labels overtime base wage and premium as separate cost components', async () => {

@@ -185,17 +185,32 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   const runCostAndRisk = async () => {
     if (!planVersionId) return
     setLoadingDecision(true); setDecisionErrors([])
-    const [costOutcome, riskOutcome] = await Promise.allSettled([
-      api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { horizonDays: effectiveHorizonDays }).then(waitForRun),
-      api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { horizonDays: effectiveHorizonDays, emergencyLocationPolicy }).then(waitForRun),
-    ])
-    const errors: string[] = []
-    if (costOutcome.status === 'fulfilled') {
-      try { setCost(completedResult(costOutcome.value, '成本分析')); setAnalysisNumbers(current => ({ ...current, cost: costOutcome.value.number })) } catch (error) { rememberRetryable(costOutcome.value); errors.push(error instanceof Error ? error.message : '成本分析失败') }
-    } else errors.push(costOutcome.reason instanceof Error ? costOutcome.reason.message : '成本分析失败')
-    if (riskOutcome.status === 'fulfilled') {
-      try { setRisk(completedResult(riskOutcome.value, '风险分析')); setRiskAnalysisRunId(riskOutcome.value.id); setRiskScenarioArtifact(undefined); setAnalysisNumbers(current => ({ ...current, risk: riskOutcome.value.number })) } catch (error) { rememberRetryable(riskOutcome.value); errors.push(error instanceof Error ? error.message : '风险分析失败') }
-    } else errors.push(riskOutcome.reason instanceof Error ? riskOutcome.reason.message : '风险分析失败')
+    const runCost = async (): Promise<string | undefined> => {
+      let run: DecisionAnalysisRun<CostAnalysis> | undefined
+      try {
+        run = await waitForRun(await api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { horizonDays: effectiveHorizonDays }))
+        setCost(completedResult(run, '成本分析'))
+        setAnalysisNumbers(current => ({ ...current, cost: run?.number }))
+      } catch (error) {
+        if (run) rememberRetryable(run)
+        return error instanceof Error ? error.message : '成本分析失败'
+      }
+      return undefined
+    }
+    const runRisk = async (): Promise<string | undefined> => {
+      let run: DecisionAnalysisRun<RiskSimulation> | undefined
+      try {
+        run = await waitForRun(await api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { horizonDays: effectiveHorizonDays, emergencyLocationPolicy }))
+        setRisk(completedResult(run, '风险分析'))
+        setRiskAnalysisRunId(run.id); setRiskScenarioArtifact(undefined)
+        setAnalysisNumbers(current => ({ ...current, risk: run?.number }))
+      } catch (error) {
+        if (run) rememberRetryable(run)
+        return error instanceof Error ? error.message : '风险分析失败'
+      }
+      return undefined
+    }
+    const errors = (await Promise.all([runCost(), runRisk()])).filter((message): message is string => !!message)
     setDecisionErrors(errors); setLoadingDecision(false)
   }
   const runCapacity = async () => {

@@ -69,4 +69,6 @@ LICENSE 需要仓库所有者选择 MIT 或 Apache-2.0；分支保护、required
 - FF-1706：D000/连续链、proof origin、invalid descendant 和 O(1) 写入。
 - FF-1707：Risk V6 位置政策、迟到拆分、工单 outcome、条件样本和 Artifact 详情策略。
 
-最终验收由 [GitHub Actions #50](https://github.com/frankyhitsz/fieldflow-local/actions/runs/32873627146) 完成：Ubuntu Python 3.11、Ubuntu Python 3.12 全流程和 macOS Python 3.12 三个任务全部通过。后端 271 项、覆盖率 88.45%，8/8 mutation smoke、React 15 项、Playwright 5/5，静态检查、runtime/dev/npm 依赖审计、构建、Demo 和 Benchmark 同步通过。实现提交为 `f9b8c40`。
+完整验收首先由 [GitHub Actions #50](https://github.com/frankyhitsz/fieldflow-local/actions/runs/32873627146) 完成：Ubuntu Python 3.11、Ubuntu Python 3.12 全流程和 macOS Python 3.12 三个任务全部通过。后端 271 项、覆盖率 88.45%，8/8 mutation smoke、React 15 项、Playwright 5/5，静态检查、runtime/dev/npm 依赖审计、构建、Demo 和 Benchmark 同步通过。实现提交为 `f9b8c40`。
+
+文档提交后的 Actions #51 暴露一个真实的时序问题：成本和风险请求虽然并发发起，界面仍等到较慢的风险模拟结束才显示已完成的成本结果。现已改为每项完成即独立更新，并新增受控延迟风险请求的 React 回归测试；当前前端测试为 16 项。
