@@ -23,7 +23,7 @@ const schedule: Schedule = {
   business_score: 100, business_score_policy_version: 'FIELD_SERVICE_SCORE_V2',
   scenario_snapshot_hash: 'test', solver_config_hash: 'test', solver_policy: null, travel_model_version: 'EUCLIDEAN_GRID_V2', travel_model_fingerprint: 'test',
   metric_policy_version: 'FIELD_SERVICE_METRICS_V2', solver_name: 'test', solver_version: '1',
-  kpis: { completion_rate: 1, sla_on_time_rate: 1, sla_late_count: 0, total_travel_minutes: 10, total_service_minutes: 30, total_overtime_minutes: 0, average_utilization: .5, unassigned_count: 0, high_priority_missed: 0, workload_stddev: 0, stability_rate: null, assigned_on_time_rate: 1, committed_on_time_rate: 1, total_late_minutes: 0, p90_late_minutes: 0, total_waiting_minutes: 0, average_occupied_utilization: .67, workload_range: 0, normalized_workload_range: 0, same_technician_rate: null, adjacency_preservation_rate: null, start_time_shift_median: null, start_time_shift_p90: null, start_time_shift_over_15m_count: null, customer_notification_count: null, technician: [{ technician_id: 'TECH-01', service_minutes: 30, travel_minutes: 10, overtime_minutes: 0, utilization: .5, assignment_count: 1, waiting_minutes: 0, occupied_minutes: 40, service_utilization: .5, occupied_utilization: .67, travel_ratio: .25, waiting_ratio: 0, overtime_ratio: 0, normalized_workload: .67 }] },
+  kpis: { completion_rate: 1, sla_on_time_rate: 1, sla_late_count: 0, total_travel_minutes: 10, total_service_minutes: 30, total_overtime_minutes: 0, average_utilization: .5, unassigned_count: 0, high_priority_missed: 0, workload_stddev: 0, stability_rate: null, assigned_on_time_rate: 1, committed_on_time_rate: 1, total_late_minutes: 0, p90_late_minutes: 0, total_waiting_minutes: 0, average_occupied_utilization: .67, workload_range: 0, normalized_workload_range: 0, min_normalized_workload: .67, max_normalized_workload: .67, same_technician_rate: null, adjacency_preservation_rate: null, start_time_shift_median: null, start_time_shift_p90: null, start_time_shift_over_15m_count: null, customer_notification_count: null, technician: [{ technician_id: 'TECH-01', service_minutes: 30, travel_minutes: 10, overtime_minutes: 0, utilization: .5, assignment_count: 1, waiting_minutes: 0, occupied_minutes: 40, service_utilization: .5, occupied_utilization: .67, travel_ratio: .25, waiting_ratio: 0, overtime_ratio: 0, normalized_workload: .67 }] },
 }
 
 const plan: PlanVersion = {
@@ -35,6 +35,7 @@ const plan: PlanVersion = {
   candidate_id: 'CAND-1', scenario_snapshot_hash: 'test', published_schedule_hash: 'schedule-test',
   publication_verification_policy_version: 'FIELD_SERVICE_PUBLICATION_VERIFICATION_V1',
   publication_verification_report_hash: 'verification-test', source_plan_snapshot_hash: null,
+  attestation_requirement: 'REQUIRED', integrity_status: 'VERIFIED',
 }
 
 const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', description: '均衡业务指标', builtin: true, time_limit_seconds: 2, created_at: '2026-08-23T00:00:00Z', weights: { travel_weight: 4, sla_late_weight: 12, overtime_weight: 8, imbalance_weight: 1, replan_change_weight: 80, unassigned_penalty_scale: 1 } }]
@@ -158,15 +159,15 @@ describe('FieldFlow navigation and render safety', () => {
     await screen.findByRole('heading', { name: '今日调度测试' })
     fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
     expect(await screen.findByText(/当前版本还没有经营分析/)).toBeInTheDocument()
-    expect(screen.getByText('事前冻结计划分析，不含实际执行')).toBeInTheDocument()
+    expect(screen.getByText('完整冻结计划范围')).toBeInTheDocument()
     expect(vi.mocked(fetch).mock.calls.filter(([input, init]) => String(input).endsWith('/analysis-runs') && init?.method === 'POST')).toHaveLength(0)
     fireEvent.click(screen.getByRole('button', { name: '生成成本与风险分析' }))
     expect(await screen.findByText(/1,234\.00/)).toBeInTheDocument()
     expect(screen.getByText('88%')).toBeInTheDocument()
     expect(screen.getByText('35 分钟')).toBeInTheDocument()
-    const analysisBodies = vi.mocked(fetch).mock.calls.filter(([input, init]) => String(input).endsWith('/analysis-runs') && init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)) as { analysis_scope: string })
+    const analysisBodies = vi.mocked(fetch).mock.calls.filter(([input, init]) => String(input).endsWith('/analysis-runs') && init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)) as { analysis_scope?: string })
     expect(analysisBodies).toHaveLength(2)
-    expect(analysisBodies.every(body => body.analysis_scope === 'EX_ANTE_FROZEN_PLAN')).toBe(true)
+    expect(analysisBodies.every(body => body.analysis_scope === undefined)).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: '测算六种容量方案' }))
     expect(await screen.findByText('增加一名候选技师')).toBeInTheDocument()
     expect(screen.getByText('+5pp')).toBeInTheDocument()

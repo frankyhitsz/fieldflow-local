@@ -31,6 +31,48 @@
         "title": "AdditionalTechnicianCostMode",
         "type": "string"
       },
+      "AnalysisFailureManifest": {
+        "properties": {
+          "error_code": {
+            "title": "Error Code",
+            "type": "string"
+          },
+          "error_hash": {
+            "title": "Error Hash",
+            "type": "string"
+          },
+          "failure_stage": {
+            "title": "Failure Stage",
+            "type": "string"
+          },
+          "finished_at": {
+            "title": "Finished At",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_ANALYSIS_FAILURE_MANIFEST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "FAILED",
+              "INTERRUPTED"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "error_hash",
+          "error_code",
+          "failure_stage",
+          "finished_at"
+        ],
+        "title": "AnalysisFailureManifest",
+        "type": "object"
+      },
       "AnalysisHorizon": {
         "properties": {
           "currency": {
@@ -64,6 +106,14 @@
           "LEGACY_UNATTESTED"
         ],
         "title": "AnalysisIntegrityStatus",
+        "type": "string"
+      },
+      "AttestationRequirement": {
+        "enum": [
+          "REQUIRED",
+          "LEGACY_MIGRATED"
+        ],
+        "title": "AttestationRequirement",
         "type": "string"
       },
       "CapacityAnalysis": {
@@ -378,6 +428,10 @@
             "default": "CAPACITY_COUNTERFACTUAL",
             "title": "Artifact Type",
             "type": "string"
+          },
+          "attestation_requirement": {
+            "$ref": "#/components/schemas/AttestationRequirement",
+            "default": "REQUIRED"
           },
           "changed_inputs": {
             "additionalProperties": true,
@@ -1514,6 +1568,10 @@
             "title": "Attempt Number",
             "type": "integer"
           },
+          "attestation_requirement": {
+            "$ref": "#/components/schemas/AttestationRequirement",
+            "default": "REQUIRED"
+          },
           "build_sha": {
             "default": "legacy-unknown",
             "title": "Build Sha",
@@ -1556,6 +1614,16 @@
             ],
             "title": "Execution Context Hash"
           },
+          "failure_manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AnalysisFailureManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "finished_at": {
             "anyOf": [
               {
@@ -1574,6 +1642,16 @@
           "input_hash": {
             "title": "Input Hash",
             "type": "string"
+          },
+          "input_manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DecisionInputManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "integrity_status": {
             "$ref": "#/components/schemas/AnalysisIntegrityStatus",
@@ -1640,6 +1718,16 @@
             ],
             "title": "Result Hash"
           },
+          "result_manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DecisionResultManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "retry_of_analysis_id": {
             "anyOf": [
               {
@@ -1650,6 +1738,16 @@
               }
             ],
             "title": "Retry Of Analysis Id"
+          },
+          "runtime_manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "scenario_id": {
             "title": "Scenario Id",
@@ -1711,6 +1809,8 @@
       },
       "DecisionAnalysisScope": {
         "enum": [
+          "FROZEN_FULL_PLAN",
+          "PUBLICATION_REMAINING_PLAN",
           "EX_ANTE_FROZEN_PLAN",
           "INCURRED_ACTUAL",
           "REMAINING_FORECAST",
@@ -1797,6 +1897,93 @@
         "title": "DecisionCostPolicy",
         "type": "object"
       },
+      "DecisionInputManifest": {
+        "properties": {
+          "analysis_context_hash": {
+            "title": "Analysis Context Hash",
+            "type": "string"
+          },
+          "plan_manifest_hash": {
+            "title": "Plan Manifest Hash",
+            "type": "string"
+          },
+          "policy_hash": {
+            "title": "Policy Hash",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_DECISION_INPUT_MANIFEST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "request_hash": {
+            "title": "Request Hash",
+            "type": "string"
+          },
+          "runtime_manifest_hash": {
+            "title": "Runtime Manifest Hash",
+            "type": "string"
+          },
+          "scenario_snapshot_hash": {
+            "title": "Scenario Snapshot Hash",
+            "type": "string"
+          },
+          "schedule_hash": {
+            "title": "Schedule Hash",
+            "type": "string"
+          },
+          "semantic_input_hash": {
+            "title": "Semantic Input Hash",
+            "type": "string"
+          },
+          "travel_model_fingerprint": {
+            "title": "Travel Model Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_hash",
+          "policy_hash",
+          "analysis_context_hash",
+          "plan_manifest_hash",
+          "runtime_manifest_hash",
+          "scenario_snapshot_hash",
+          "schedule_hash",
+          "travel_model_fingerprint",
+          "semantic_input_hash"
+        ],
+        "title": "DecisionInputManifest",
+        "type": "object"
+      },
+      "DecisionResultManifest": {
+        "properties": {
+          "finished_at": {
+            "title": "Finished At",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_DECISION_RESULT_MANIFEST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "result_hash": {
+            "title": "Result Hash",
+            "type": "string"
+          },
+          "status": {
+            "const": "COMPLETED",
+            "default": "COMPLETED",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_hash",
+          "finished_at"
+        ],
+        "title": "DecisionResultManifest",
+        "type": "object"
+      },
       "ExecutionSourceAssignment": {
         "properties": {
           "actual_start_at": {
@@ -1811,6 +1998,19 @@
               }
             ],
             "title": "Actual Start At"
+          },
+          "booking_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Booking Id"
           },
           "future_sequence": {
             "anyOf": [
@@ -1987,6 +2187,33 @@
             "title": "Assumed On Time",
             "type": "boolean"
           },
+          "capacity_verified": {
+            "default": false,
+            "title": "Capacity Verified",
+            "type": "boolean"
+          },
+          "committed_finish_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committed Finish Time"
+          },
+          "committed_start_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committed Start Time"
+          },
           "cost_cents": {
             "default": 0,
             "minimum": 0.0,
@@ -2004,6 +2231,12 @@
             "const": "SAME_DAY_WITHIN_SLA",
             "default": "SAME_DAY_WITHIN_SLA",
             "title": "Service Assumption",
+            "type": "string"
+          },
+          "sla_commitment": {
+            "const": "UNVERIFIED_ASSUMPTION",
+            "default": "UNVERIFIED_ASSUMPTION",
+            "title": "Sla Commitment",
             "type": "string"
           },
           "work_order_id": {
@@ -2098,6 +2331,19 @@
       },
       "FrozenBookingIdentity": {
         "properties": {
+          "booking_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Booking Id"
+          },
           "source_assignment_hash": {
             "anyOf": [
               {
@@ -2352,6 +2598,47 @@
         "title": "OptimizeRequest",
         "type": "object"
       },
+      "PairedMetricSummary": {
+        "properties": {
+          "ci_high": {
+            "title": "Ci High",
+            "type": "number"
+          },
+          "ci_low": {
+            "title": "Ci Low",
+            "type": "number"
+          },
+          "loss_count": {
+            "minimum": 0.0,
+            "title": "Loss Count",
+            "type": "integer"
+          },
+          "mean_delta": {
+            "title": "Mean Delta",
+            "type": "number"
+          },
+          "tie_count": {
+            "minimum": 0.0,
+            "title": "Tie Count",
+            "type": "integer"
+          },
+          "win_count": {
+            "minimum": 0.0,
+            "title": "Win Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mean_delta",
+          "ci_low",
+          "ci_high",
+          "win_count",
+          "tie_count",
+          "loss_count"
+        ],
+        "title": "PairedMetricSummary",
+        "type": "object"
+      },
       "PlanCostBreakdown": {
         "properties": {
           "cash_operating_cost_cents": {
@@ -2480,6 +2767,10 @@
             "title": "Artifacts",
             "type": "array"
           },
+          "attestation_requirement": {
+            "$ref": "#/components/schemas/AttestationRequirement",
+            "default": "REQUIRED"
+          },
           "candidate_id": {
             "anyOf": [
               {
@@ -2506,6 +2797,10 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "integrity_status": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
           },
           "label": {
             "maxLength": 60,
@@ -3057,6 +3352,98 @@
         "title": "RestoreRequest",
         "type": "object"
       },
+      "RiskComparisonRun": {
+        "properties": {
+          "after_analysis_id": {
+            "title": "After Analysis Id",
+            "type": "string"
+          },
+          "after_plan_version_id": {
+            "title": "After Plan Version Id",
+            "type": "string"
+          },
+          "before_analysis_id": {
+            "title": "Before Analysis Id",
+            "type": "string"
+          },
+          "before_plan_version_id": {
+            "title": "Before Plan Version Id",
+            "type": "string"
+          },
+          "comparison_hash": {
+            "title": "Comparison Hash",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "delta": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Delta",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "integrity_status": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "VERIFIED"
+          },
+          "number": {
+            "minimum": 0.0,
+            "title": "Number",
+            "type": "integer"
+          },
+          "paired_disruption_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_overtime_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_sla_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_unserved_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_set_hash": {
+            "title": "Scenario Set Hash",
+            "type": "string"
+          },
+          "trials": {
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "number",
+          "before_analysis_id",
+          "after_analysis_id",
+          "before_plan_version_id",
+          "after_plan_version_id",
+          "scenario_set_hash",
+          "trials",
+          "paired_sla_delta",
+          "paired_overtime_delta",
+          "paired_unserved_delta",
+          "paired_disruption_delta",
+          "comparison_hash",
+          "created_at"
+        ],
+        "title": "RiskComparisonRun",
+        "type": "object"
+      },
       "RiskDecisionAnalysisRunRequest": {
         "additionalProperties": false,
         "properties": {
@@ -3233,6 +3620,34 @@
       },
       "RiskSimulationResult": {
         "properties": {
+          "absence_caused_failure_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Absence Caused Failure Probability",
+            "type": "number"
+          },
+          "absence_caused_overtime_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Absence Caused Overtime Probability",
+            "type": "number"
+          },
+          "absence_caused_sla_degradation_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Absence Caused Sla Degradation Probability",
+            "type": "number"
+          },
+          "absence_caused_unserved_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Absence Caused Unserved Probability",
+            "type": "number"
+          },
           "absence_disruption_probability": {
             "default": 0,
             "maximum": 1.0,
@@ -3524,9 +3939,27 @@
             "title": "Sla Rate Ci Low",
             "type": "number"
           },
+          "technician_absence_event_probability": {
+            "default": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Technician Absence Event Probability",
+            "type": "number"
+          },
           "travel_model_fingerprint": {
             "title": "Travel Model Fingerprint",
             "type": "string"
+          },
+          "trial_outcome_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Outcome Artifact Id"
           },
           "trials": {
             "title": "Trials",
@@ -3566,6 +3999,104 @@
           "expected_unserved_orders"
         ],
         "title": "RiskSimulationResult",
+        "type": "object"
+      },
+      "RiskTrialMetric": {
+        "properties": {
+          "disrupted": {
+            "title": "Disrupted",
+            "type": "boolean"
+          },
+          "sla_on_time_rate": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Sla On Time Rate",
+            "type": "number"
+          },
+          "total_overtime_minutes": {
+            "minimum": 0.0,
+            "title": "Total Overtime Minutes",
+            "type": "integer"
+          },
+          "total_unserved_orders": {
+            "minimum": 0.0,
+            "title": "Total Unserved Orders",
+            "type": "integer"
+          },
+          "trial": {
+            "minimum": 0.0,
+            "title": "Trial",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trial",
+          "sla_on_time_rate",
+          "total_overtime_minutes",
+          "total_unserved_orders",
+          "disrupted"
+        ],
+        "title": "RiskTrialMetric",
+        "type": "object"
+      },
+      "RiskTrialOutcomeArtifact": {
+        "properties": {
+          "analysis_run_id": {
+            "title": "Analysis Run Id",
+            "type": "string"
+          },
+          "artifact_hash": {
+            "default": "",
+            "title": "Artifact Hash",
+            "type": "string"
+          },
+          "artifact_type": {
+            "const": "RISK_TRIAL_OUTCOMES",
+            "default": "RISK_TRIAL_OUTCOMES",
+            "title": "Artifact Type",
+            "type": "string"
+          },
+          "attestation_requirement": {
+            "$ref": "#/components/schemas/AttestationRequirement",
+            "default": "REQUIRED"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "integrity_status": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/RiskTrialMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_set_hash": {
+            "title": "Scenario Set Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "scenario_id",
+          "analysis_run_id",
+          "scenario_set_hash",
+          "metrics",
+          "created_at"
+        ],
+        "title": "RiskTrialOutcomeArtifact",
         "type": "object"
       },
       "RollbackPreview": {
@@ -3754,6 +4285,64 @@
           "return_location"
         ],
         "title": "RouteEntryContext",
+        "type": "object"
+      },
+      "RuntimeManifest": {
+        "properties": {
+          "architecture": {
+            "title": "Architecture",
+            "type": "string"
+          },
+          "build_sha": {
+            "title": "Build Sha",
+            "type": "string"
+          },
+          "dependency_lock_hash": {
+            "title": "Dependency Lock Hash",
+            "type": "string"
+          },
+          "hash_schema_version": {
+            "title": "Hash Schema Version",
+            "type": "string"
+          },
+          "operating_system": {
+            "title": "Operating System",
+            "type": "string"
+          },
+          "ortools_version": {
+            "title": "Ortools Version",
+            "type": "string"
+          },
+          "policy_version": {
+            "default": "FIELD_SERVICE_RUNTIME_MANIFEST_V1",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "pydantic_version": {
+            "title": "Pydantic Version",
+            "type": "string"
+          },
+          "python_version": {
+            "title": "Python Version",
+            "type": "string"
+          },
+          "sqlite_version": {
+            "title": "Sqlite Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hash_schema_version",
+          "python_version",
+          "ortools_version",
+          "sqlite_version",
+          "pydantic_version",
+          "operating_system",
+          "architecture",
+          "build_sha",
+          "dependency_lock_hash"
+        ],
+        "title": "RuntimeManifest",
         "type": "object"
       },
       "ScenarioCreate": {
@@ -4062,6 +4651,16 @@
           "high_priority_missed": {
             "title": "High Priority Missed",
             "type": "integer"
+          },
+          "max_normalized_workload": {
+            "default": 0,
+            "title": "Max Normalized Workload",
+            "type": "number"
+          },
+          "min_normalized_workload": {
+            "default": 0,
+            "title": "Min Normalized Workload",
+            "type": "number"
           },
           "normalized_workload_range": {
             "default": 0,
@@ -4750,6 +5349,13 @@
             "title": "Duration Minutes",
             "type": "integer"
           },
+          "event_id": {
+            "default": "EMERGENCY",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
           "event_time": {
             "maximum": 2280.0,
             "minimum": 0.0,
@@ -4762,11 +5368,25 @@
           "required_skill": {
             "$ref": "#/components/schemas/Skill"
           },
+          "sla_deadline": {
+            "default": 2280,
+            "maximum": 2760.0,
+            "minimum": 0.0,
+            "title": "Sla Deadline",
+            "type": "integer"
+          },
           "technician_id": {
-            "maxLength": 80,
-            "minLength": 1,
-            "title": "Technician Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Technician Id"
           },
           "trial": {
             "minimum": 0.0,
@@ -4776,7 +5396,6 @@
         },
         "required": [
           "trial",
-          "technician_id",
           "event_time",
           "location",
           "duration_minutes",
@@ -4801,6 +5420,10 @@
             "default": "SIMULATION_SCENARIO_SET",
             "title": "Artifact Type",
             "type": "string"
+          },
+          "attestation_requirement": {
+            "$ref": "#/components/schemas/AttestationRequirement",
+            "default": "REQUIRED"
           },
           "created_at": {
             "title": "Created At",
@@ -4834,7 +5457,7 @@
             "type": "string"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V2",
+            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V3",
             "title": "Policy Version",
             "type": "string"
           },
@@ -5301,6 +5924,13 @@
             "default": "",
             "title": "Scenario Snapshot Hash",
             "type": "string"
+          },
+          "score_policy_snapshot": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Score Policy Snapshot",
+            "type": "object"
           },
           "score_policy_version": {
             "default": "FIELD_SERVICE_SCORE_V2",
@@ -6232,6 +6862,12 @@
             "title": "Created At",
             "type": "string"
           },
+          "customer_window_late_start_minutes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Customer Window Late Start Minutes",
+            "type": "integer"
+          },
           "early_start_override_reason": {
             "anyOf": [
               {
@@ -6302,6 +6938,17 @@
               }
             ],
             "title": "Planned Start At"
+          },
+          "planned_start_variance_minutes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Start Variance Minutes"
           },
           "scenario_id": {
             "title": "Scenario Id",
@@ -6636,7 +7283,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.4"
+    "version": "0.5.5"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -6842,6 +7489,9 @@
                       },
                       {
                         "$ref": "#/components/schemas/SimulationScenarioSetArtifact"
+                      },
+                      {
+                        "$ref": "#/components/schemas/RiskTrialOutcomeArtifact"
                       }
                     ]
                   },
@@ -6909,6 +7559,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SimulationScenarioSetArtifact"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RiskTrialOutcomeArtifact"
                     }
                   ],
                   "title": "Response Get Decision Analysis Artifact Api Scenarios  Scenario Id  Analysis Runs  Analysis Id  Artifacts  Artifact Id  Get"
@@ -6950,6 +7603,15 @@
             "required": true,
             "schema": {
               "title": "Analysis Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }
@@ -8302,9 +8964,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Compare Plan Risk Paired Api Scenarios  Scenario Id  Risk Comparison Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/RiskComparisonRun"
                 }
               }
             },
@@ -8322,6 +8982,54 @@
           }
         },
         "summary": "Compare Plan Risk Paired"
+      }
+    },
+    "/api/scenarios/{scenario_id}/risk-comparisons/{comparison_id}": {
+      "get": {
+        "operationId": "get_risk_comparison_api_scenarios__scenario_id__risk_comparisons__comparison_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comparison_id",
+            "required": true,
+            "schema": {
+              "title": "Comparison Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskComparisonRun"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Risk Comparison"
       }
     },
     "/api/scenarios/{scenario_id}/schedule-candidates/{candidate_id}": {

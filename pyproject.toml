@@ -28,6 +28,7 @@ dev = [
 
 [tool.pyright]
 include = ["backend", "scripts"]
+strict = ["backend/hashing.py", "backend/provenance.py"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false

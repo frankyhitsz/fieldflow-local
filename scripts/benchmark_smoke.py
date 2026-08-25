@@ -190,7 +190,7 @@ try:
         context=DecisionAnalysisContext(analysis_scope=DecisionAnalysisScope.remaining_forecast),
     )
 except DecisionAnalysisError as error:
-    assert error.code == "ANALYSIS_SCOPE_NOT_SUPPORTED"
+    assert error.code == "ANALYSIS_SCOPE_MISMATCH"
 else:
     raise AssertionError("decision analysis accepted an unimplemented remaining forecast")
 

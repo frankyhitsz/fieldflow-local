@@ -16,7 +16,8 @@ export type ExecutionEvent = {
   plan_version_id: string; idempotency_key: string; created_at: string
   booking_id: string; source_assignment_hash: string; source_sequence: number
   planned_start_at: number | null; planned_finish_at: number | null
-  actual_duration_minutes: number | null; actual_late_start_minutes: number
+  actual_duration_minutes: number | null; customer_window_late_start_minutes: number
+  planned_start_variance_minutes: number | null; actual_late_start_minutes: number
   early_start_override_reason: string | null; estimated_remaining_minutes: number | null; note: string
 }
 export type ExecutionResult = { scenario: Scenario; event: ExecutionEvent }
@@ -53,7 +54,8 @@ export type Kpis = {
   workload_stddev: number; stability_rate: number | null; technician: TechKpi[]
   assigned_on_time_rate: number; committed_on_time_rate: number
   total_late_minutes: number; p90_late_minutes: number; total_waiting_minutes: number
-  average_occupied_utilization: number; workload_range: number; normalized_workload_range: number
+  average_occupied_utilization: number; workload_range: number; min_normalized_workload: number
+  max_normalized_workload: number; normalized_workload_range: number
   same_technician_rate: number | null; adjacency_preservation_rate: number | null
   start_time_shift_median: number | null; start_time_shift_p90: number | null
   start_time_shift_over_15m_count: number | null; customer_notification_count: number | null
@@ -96,6 +98,10 @@ export type PlanVersion = {
   candidate_id: string | null; scenario_snapshot_hash: string; published_schedule_hash: string
   publication_verification_policy_version: string; publication_verification_report_hash: string
   publication_planning_context_hash?: string | null; publication_manifest_hash?: string
+  publication_planning_context?: Record<string, unknown> | null
+  publication_verification_artifact?: Record<string, unknown> | null
+  attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'
+  integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'
   source_plan_snapshot_hash: string | null
 }
 
@@ -130,7 +136,7 @@ export type StrategyExperiment = {
   status: 'QUEUED' | 'RUNNING' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'COMPLETED_WITH_ERRORS' | 'FAILED' | 'INTERRUPTED'; progress: number
   error: string | null; created_at: string; profile_ids: string[]
   requested_time_limit_seconds: number | null; candidates: StrategyCandidate[]
-  fingerprint: string; scenario_snapshot_hash: string; score_policy_version: string
+  fingerprint: string; scenario_snapshot_hash: string; score_policy_version: string; score_policy_snapshot: Record<string, number>
   travel_model_version: string; travel_model_fingerprint: string; solver_version: string; candidate_errors: Record<string, string>
   finished_at: string | null; cancel_requested_at: string | null
   winner_candidate_id: string | null; winner_plan_version_id: string | null; published_at: string | null
@@ -144,7 +150,7 @@ export type CostBreakdown = {
   total_cost_cents: number; technician_cost_cents: Record<string, number>
 }
 
-export type DecisionAnalysisScope = 'EX_ANTE_FROZEN_PLAN' | 'INCURRED_ACTUAL' | 'REMAINING_FORECAST' | 'ACTUAL_PLUS_FORECAST'
+export type DecisionAnalysisScope = 'FROZEN_FULL_PLAN' | 'PUBLICATION_REMAINING_PLAN' | 'EX_ANTE_FROZEN_PLAN' | 'INCURRED_ACTUAL' | 'REMAINING_FORECAST' | 'ACTUAL_PLUS_FORECAST'
 export type AnalysisHorizon = { days: number; workdays_per_month: number; currency: 'CNY' }
 export type CostCadence = 'ONE_TIME' | 'PER_DAY' | 'PER_SHIFT' | 'PER_ORDER' | 'PER_MONTH'
 export type AnalysisContextFields = {
@@ -205,6 +211,9 @@ export type RiskSimulation = AnalysisContextFields & {
   full_day_total_late_minutes_p50: number; full_day_total_late_minutes_p90: number; full_day_total_late_minutes_p95: number
   late_minutes_p50: number; late_minutes_p90: number; late_minutes_p95: number
   expected_overtime_minutes: number; additional_disruption_probability: number
+  technician_absence_event_probability: number; absence_caused_failure_probability: number
+  absence_caused_unserved_probability: number; absence_caused_sla_degradation_probability: number
+  absence_caused_overtime_probability: number
   absence_disruption_probability: number; no_show_disruption_probability: number
   window_failure_probability: number; overtime_failure_probability: number; emergency_capacity_disruption_probability: number
   emergency_event_probability: number; emergency_caused_failure_probability: number
@@ -215,6 +224,7 @@ export type RiskSimulation = AnalysisContextFields & {
   plan_failure_probability: number; expected_unserved_orders: number
   assumptions: string[]
   scenario_set_artifact_id: string | null
+  trial_outcome_artifact_id: string | null
 }
 
 export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimulation> = {
@@ -225,12 +235,16 @@ export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimula
   active_booking_ids: string[]; travel_model_fingerprint: string
   policy_version: string; policy_snapshot: Record<string, unknown>; code_version: string
   algorithm_version: string; build_sha: string; input_hash: string
+  runtime_manifest: Record<string, unknown> | null
+  input_manifest: Record<string, unknown> | null
   request_snapshot: Record<string, unknown>; logical_analysis_id: string
   retry_of_analysis_id: string | null; attempt_number: number
   supersedes_analysis_id: string | null
   status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; result: T | null
   result_hash: string | null; artifact_manifest: { artifact_id: string; artifact_type: string; artifact_hash: string }[]
+  result_manifest: Record<string, unknown> | null; failure_manifest: Record<string, unknown> | null
   analysis_manifest_hash: string | null; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'
+  attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'
   error: Record<string, unknown> | null; created_at: string; finished_at: string | null
 }
 
@@ -239,18 +253,24 @@ export type CapacityCounterfactualArtifact = {
   id: string; scenario_id: string; analysis_run_id: string; option_id: CapacityOption['option_id']
   schedule: Schedule; verification_report: { valid: boolean; violations: CapacityViolation[] }
   route_diff: Record<string, unknown>[]; changed_inputs: Record<string, unknown>
-  external_assignments: { work_order_id: string; provider_id: string; service_assumption: string; assumed_on_time: boolean; cost_cents: number }[]
+  external_assignments: { work_order_id: string; provider_id: string; service_assumption: string; capacity_verified: boolean; committed_start_time: number | null; committed_finish_time: number | null; sla_commitment: 'UNVERIFIED_ASSUMPTION'; assumed_on_time: boolean; cost_cents: number }[]
   work_order_dispositions: { work_order_id: string; disposition: 'INTERNAL' | 'EXTERNAL' | 'UNSERVED'; technician_id: string | null; external_provider_id: string | null }[]
   counterfactual_kpis: { active_work_order_count: number; internal_assignment_count: number; external_assignment_count: number; unserved_count: number; completion_rate: number; sla_on_time_rate: number; travel_minutes: number; overtime_minutes: number } | null
-  artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; created_at: string
+  artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string
 }
 
 export type SimulationScenarioSetArtifact = {
   artifact_type: 'SIMULATION_SCENARIO_SET'; id: string; scenario_id: string; analysis_run_id: string
   policy_version: string; keyed_random_version: string; scenario_snapshot_hash: string; seed: number; trials: number
   technician_ids: string[]; work_order_ids: string[]; exogenous_parameters: Record<string, number>
-  emergency_events: { trial: number; technician_id: string; event_time: number; location: Point; duration_minutes: number; required_skill: string }[]
-  scenario_set_hash: string; artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; created_at: string
+  emergency_events: { trial: number; event_id: string; technician_id: string | null; event_time: number; location: Point; duration_minutes: number; required_skill: string; sla_deadline: number }[]
+  scenario_set_hash: string; artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string
 }
 
-export type DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSetArtifact
+export type RiskTrialOutcomeArtifact = {
+  artifact_type: 'RISK_TRIAL_OUTCOMES'; id: string; scenario_id: string; analysis_run_id: string
+  scenario_set_hash: string; metrics: { trial: number; sla_on_time_rate: number; total_overtime_minutes: number; total_unserved_orders: number; disrupted: boolean }[]
+  artifact_hash: string; integrity_status: 'VERIFIED' | 'FAILED' | 'LEGACY_UNATTESTED'; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string
+}
+
+export type DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSetArtifact | RiskTrialOutcomeArtifact

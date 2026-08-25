@@ -44,7 +44,7 @@ Business score policy: `FIELD_SERVICE_SCORE_V2`
 - `baseline_unserved_orders`: work already unserved by the published plan.
 - `expected_total_unserved_orders`: baseline unserved work plus simulated additional loss.
 
-Decision figures are valid only for the recorded snapshot, complete schedule hash, publication context, travel model, policy, algorithm version, build SHA, and input fingerprint. The implemented scope is `EX_ANTE_FROZEN_PLAN`: it excludes actual execution and is not a remaining-work forecast. For a replan, route-sensitive figures begin at each technician's frozen publication-time route entry.
+Decision figures are valid only for the recorded snapshot, complete schedule hash, publication context, travel model, policy, runtime manifest, algorithm version, build SHA and input fingerprint. Non-replan plans use `FROZEN_FULL_PLAN`. Replans use `PUBLICATION_REMAINING_PLAN`: figures begin at each technician's frozen publication-time route entry and exclude work already frozen as started or completed at publication.
 
 The risk field `monte_carlo_mean_ci_low/high` is an interval for simulation mean error, not a confidence interval for uncertain real-world parameters. `full_day_total_late_minutes_p50/p90/p95` is the percentile of total late minutes across a simulated service day, not the percentile of individual work-order lateness. Keyed random draws let plans with the same snapshot, seed and risk policy share `simulation_scenario_set_hash` for paired comparison. The scenario-set artifact freezes each emergency event's target technician, time, location, duration and skill before either plan is evaluated.
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 import os
 import re
+import statistics
 import threading
 import uuid
 from collections.abc import Callable
@@ -15,7 +17,7 @@ from urllib.parse import urlsplit
 import ortools
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import TypeAdapter
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -24,7 +26,6 @@ from ._version import __version__
 from .decision import (
     DecisionAnalysisError,
     build_simulation_scenario_set,
-    canonical_decision_input_hash,
     capacity_analysis,
     cost_analysis,
     schedule_signature,
@@ -57,14 +58,17 @@ from .models import (
     ManualReassignmentRequest,
     ManualReassignmentResult,
     OptimizeRequest,
+    PairedMetricSummary,
     PlanningContext,
     PlanVersion,
     PlanVersionPatch,
     PublicationPlanningContext,
     ReplanRequest,
     RestoreRequest,
+    RiskComparisonRun,
     RiskSimulationRequest,
     RiskSimulationResult,
+    RiskTrialOutcomeArtifact,
     RollbackPreview,
     ScenarioCreate,
     ScheduleArtifact,
@@ -90,7 +94,12 @@ from .models import (
     WorkOrderUpdate,
 )
 from .normalization import normalize_schedule
-from .provenance import DECISION_ALGORITHM_VERSION, decision_build_sha
+from .provenance import (
+    DECISION_ALGORITHM_VERSION,
+    build_decision_input_manifest,
+    decision_build_sha,
+    decision_runtime_manifest,
+)
 from .report import build_report
 from .scheduler import (
     baseline_schedule,
@@ -100,14 +109,14 @@ from .scheduler import (
     replan_schedule,
     scenario_for_profile,
 )
-from .storage import PublicationConflict, ScenarioRevisionConflict, Store
+from .storage import DecisionAnalysisIntegrityError, PublicationConflict, ScenarioRevisionConflict, Store
 from .verification import verify_schedule
 
 DB_PATH = Path(os.getenv("FIELDFLOW_DB", Path(__file__).resolve().parents[1] / "fieldflow.db"))
 store: Store | None = None
 experiment_executor: ThreadPoolExecutor | None = None
 experiment_slots: threading.BoundedSemaphore | None = None
-manual_reassignment_locks: dict[str, threading.RLock] = {}
+manual_reassignment_locks: dict[str, tuple[threading.RLock, int]] = {}
 manual_reassignment_locks_guard = threading.Lock()
 EXPERIMENT_QUEUE_CAPACITY = 4
 router = APIRouter()
@@ -1318,9 +1327,18 @@ def manual_reassignment(scenario_id: str, request: ManualReassignmentRequest) ->
     """Serialize one local idempotency key while the recoverable saga advances."""
     lock_key = f"{scenario_id}:{request.idempotency_key}"
     with manual_reassignment_locks_guard:
-        command_lock = manual_reassignment_locks.setdefault(lock_key, threading.RLock())
-    with command_lock:
-        return _manual_reassignment(scenario_id, request)
+        command_lock, users = manual_reassignment_locks.get(lock_key, (threading.RLock(), 0))
+        manual_reassignment_locks[lock_key] = (command_lock, users + 1)
+    try:
+        with command_lock:
+            return _manual_reassignment(scenario_id, request)
+    finally:
+        with manual_reassignment_locks_guard:
+            current_lock, current_users = manual_reassignment_locks.get(lock_key, (command_lock, 1))
+            if current_lock is command_lock and current_users <= 1:
+                manual_reassignment_locks.pop(lock_key, None)
+            elif current_lock is command_lock:
+                manual_reassignment_locks[lock_key] = (command_lock, current_users - 1)
 
 
 @router.get("/api/scenarios/{scenario_id}/schedules", response_model=list[ScheduleResult])
@@ -1858,39 +1876,32 @@ def resolve_decision_analysis_context(
     requested_scope: DecisionAnalysisScope | None,
 ) -> DecisionAnalysisContext:
     require_scenario(scenario_id)
-    events = require_store().list_execution_events(scenario_id)
-    snapshot_has_execution = bool(
-        plan.scenario_snapshot
-        and any(item.status is not WorkOrderStatus.pending for item in plan.scenario_snapshot.work_orders)
+    publication_context = plan.publication_planning_context
+    expected_scope = (
+        DecisionAnalysisScope.publication_remaining_plan
+        if plan.selected.kind == "replan" and publication_context is not None
+        else DecisionAnalysisScope.frozen_full_plan
     )
-    if requested_scope is None and (events or snapshot_has_execution):
-        raise HTTPException(
-            409,
-            detail={
-                "code": "ANALYSIS_SCOPE_REQUIRED",
-                "message": "场景已有执行事实；请选择“事前冻结计划分析”，或等待执行感知预测功能",
-                "supported_scope": DecisionAnalysisScope.ex_ante_frozen_plan.value,
-                "current_execution_watermark": events[-1].sequence if events else 0,
-            },
-        )
-    scope = requested_scope or DecisionAnalysisScope.ex_ante_frozen_plan
-    if scope is not DecisionAnalysisScope.ex_ante_frozen_plan:
+    if requested_scope is None or requested_scope is DecisionAnalysisScope.ex_ante_frozen_plan:
+        scope = expected_scope
+    else:
+        scope = requested_scope
+    if scope is not expected_scope:
         raise HTTPException(
             422,
             detail={
-                "code": "ANALYSIS_SCOPE_NOT_SUPPORTED",
-                "message": "当前版本只支持事前冻结计划分析；实际与剩余预测尚未实现",
+                "code": "ANALYSIS_SCOPE_MISMATCH",
+                "message": "请求范围与方案类型不一致；普通方案使用完整冻结范围，重排方案使用发布时剩余范围",
                 "requested_scope": scope.value,
-                "supported_scopes": [DecisionAnalysisScope.ex_ante_frozen_plan.value],
+                "supported_scopes": [expected_scope.value],
             },
         )
-    publication_context = plan.publication_planning_context
     active_booking_ids = (
         sorted(
             {
-                item.source_assignment_hash
+                str(item.booking_id or item.source_assignment_hash)
                 for item in publication_context.frozen_booking_identities
-                if item.source_assignment_hash
+                if item.booking_id or item.source_assignment_hash
             }
         )
         if publication_context
@@ -2037,10 +2048,6 @@ def execute_decision_analysis_run(
     provider = require_store().travel_provider
     if request.analysis_type == "COST":
         cost_parameters = request.request
-        authoritative_request: object = {
-            "policy": cost_parameters.cost_policy,
-            "analysis_horizon": cost_parameters.analysis_horizon,
-        }
         policy_version = cost_parameters.cost_policy.policy_version
         policy_snapshot = {
             "cost_policy": cost_parameters.cost_policy.model_dump(mode="json"),
@@ -2051,7 +2058,6 @@ def execute_decision_analysis_run(
         capacity_request = CapacityAnalysisRequest.model_validate(
             {**capacity_parameters.model_dump(mode="json"), "analysis_scope": context.analysis_scope}
         )
-        authoritative_request = capacity_request
         policy_version = capacity_request.capacity_policy.policy_version
         policy_snapshot = capacity_request.model_dump(mode="json")
     else:
@@ -2059,19 +2065,22 @@ def execute_decision_analysis_run(
         risk_request = RiskSimulationRequest.model_validate(
             {**risk_parameters.model_dump(mode="json"), "analysis_scope": context.analysis_scope}
         )
-        resolved_seed = (
-            plan.scenario_snapshot.seed if risk_request.seed is None and plan.scenario_snapshot else risk_request.seed
-        )
-        authoritative_request = {"request": risk_request, "resolved_seed": resolved_seed}
         policy_version = "FIELD_SERVICE_SIMULATION_V3"
         policy_snapshot = risk_request.model_dump(mode="json")
-    input_hash = canonical_decision_input_hash(
-        plan,
-        request.analysis_type,
-        authoritative_request,
-        context,
-        provider,
+    request_snapshot = request.model_dump(mode="json")
+    runtime_manifest = decision_runtime_manifest()
+    input_manifest = build_decision_input_manifest(
+        analysis_type=request.analysis_type,
+        request_snapshot=request_snapshot,
+        policy_snapshot=policy_snapshot,
+        analysis_context=context,
+        plan_manifest_hash=plan.publication_manifest_hash,
+        runtime_manifest=runtime_manifest,
+        scenario_snapshot_hash=plan.scenario_snapshot_hash,
+        schedule_hash=schedule_signature(plan.selected),
+        travel_model_fingerprint=provider.fingerprint,
     )
+    input_hash = input_manifest.semantic_input_hash
     reserved, created = require_store().reserve_decision_analysis_run(
         DecisionAnalysisRun(
             id="pending",
@@ -2094,8 +2103,10 @@ def execute_decision_analysis_run(
             code_version=__version__,
             algorithm_version=DECISION_ALGORITHM_VERSION,
             build_sha=decision_build_sha(),
+            runtime_manifest=runtime_manifest,
             input_hash=input_hash,
-            request_snapshot=request.model_dump(mode="json"),
+            input_manifest=input_manifest,
+            request_snapshot=request_snapshot,
             logical_analysis_id=retry_of.logical_analysis_id if retry_of else "",
             retry_of_analysis_id=retry_of.id if retry_of else None,
             attempt_number=(retry_of.attempt_number + 1) if retry_of else 1,
@@ -2109,6 +2120,15 @@ def execute_decision_analysis_run(
         response.status_code = status.HTTP_201_CREATED
         if on_reserved:
             on_reserved(reserved)
+    elif reserved.integrity_status is AnalysisIntegrityStatus.failed:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "ANALYSIS_INTEGRITY_FAILED",
+                "message": "已有经营分析的证明校验失败，不能重放或用于业务计算",
+                "analysis_id": reserved.id,
+            },
+        )
     elif reserved.status == "RUNNING":
         response.status_code = status.HTTP_202_ACCEPTED
     elif reserved.status in {"FAILED", "INTERRUPTED"}:
@@ -2136,10 +2156,17 @@ def execute_decision_analysis_run(
                 provider,
                 context=context,
                 horizon=cost_parameters.analysis_horizon,
+                expected_input_hash=input_hash,
             )
             result_hash = result.analysis_input_hash
         elif request.analysis_type == "CAPACITY":
-            result = capacity_analysis(plan, capacity_request, provider, context=context)
+            result = capacity_analysis(
+                plan,
+                capacity_request,
+                provider,
+                context=context,
+                expected_input_hash=input_hash,
+            )
             result_hash = result.analysis_input_hash
             for option in result.options:
                 if option.diagnostic_schedule is None or option.verification_report is None:
@@ -2159,7 +2186,10 @@ def execute_decision_analysis_run(
                     created_at=_now(),
                 )
                 artifact.artifact_hash = content_hash(
-                    artifact.model_dump(exclude={"artifact_hash", "integrity_status"}, mode="json")
+                    artifact.model_dump(
+                        exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
+                        mode="json",
+                    )
                 )
                 artifact.integrity_status = AnalysisIntegrityStatus.verified
                 artifacts.append(artifact)
@@ -2172,7 +2202,13 @@ def execute_decision_analysis_run(
                 option.work_order_dispositions = []
                 option.counterfactual_kpis = None
         else:
-            result = simulate_plan_risk(plan, risk_request, provider, context=context)
+            result = simulate_plan_risk(
+                plan,
+                risk_request,
+                provider,
+                context=context,
+                expected_input_hash=input_hash,
+            )
             result_hash = result.simulation_input_hash
             if plan.scenario_snapshot is None:
                 raise DecisionAnalysisError("PLAN_SNAPSHOT_MISSING", "方案缺少业务快照")
@@ -2180,6 +2216,7 @@ def execute_decision_analysis_run(
                 plan.scenario_snapshot,
                 risk_request,
                 result.seed,
+                context.analysis_as_of_time or 0,
             )
             if content_hash(scenario_set_manifest) != result.simulation_scenario_set_hash:
                 raise DecisionAnalysisError(
@@ -2207,17 +2244,38 @@ def execute_decision_analysis_run(
                     "technician_absence_basis_points": risk_request.technician_absence_basis_points,
                     "emergency_order_basis_points": risk_request.emergency_order_basis_points,
                     "customer_no_show_basis_points": risk_request.customer_no_show_basis_points,
+                    "analysis_as_of_time": context.analysis_as_of_time or 0,
                 },
                 emergency_events=emergency_events,
                 scenario_set_hash=result.simulation_scenario_set_hash,
                 created_at=_now(),
             )
             scenario_set_artifact.artifact_hash = content_hash(
-                scenario_set_artifact.model_dump(exclude={"artifact_hash", "integrity_status"}, mode="json")
+                scenario_set_artifact.model_dump(
+                    exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
+                    mode="json",
+                )
             )
             scenario_set_artifact.integrity_status = AnalysisIntegrityStatus.verified
             artifacts.append(scenario_set_artifact)
             result.scenario_set_artifact_id = scenario_set_artifact.id
+            trial_outcome_artifact = RiskTrialOutcomeArtifact(
+                id=f"DAA-{reserved.id}-trial-outcomes",
+                scenario_id=scenario_id,
+                analysis_run_id=reserved.id,
+                scenario_set_hash=result.simulation_scenario_set_hash,
+                metrics=result.trial_metrics,
+                created_at=_now(),
+            )
+            trial_outcome_artifact.artifact_hash = content_hash(
+                trial_outcome_artifact.model_dump(
+                    exclude={"artifact_hash", "integrity_status", "attestation_requirement"},
+                    mode="json",
+                )
+            )
+            trial_outcome_artifact.integrity_status = AnalysisIntegrityStatus.verified
+            artifacts.append(trial_outcome_artifact)
+            result.trial_outcome_artifact_id = trial_outcome_artifact.id
         if result_hash != input_hash:
             raise DecisionAnalysisError(
                 "ANALYSIS_INPUT_HASH_MISMATCH",
@@ -2282,10 +2340,20 @@ def retry_decision_analysis_run(
             409,
             {"code": "ANALYSIS_INTEGRITY_FAILED", "message": "原分析记录完整性校验失败，不能精确重试"},
         )
+    if original.input_manifest is None or original.runtime_manifest is None:
+        raise HTTPException(
+            409,
+            {
+                "code": "ANALYSIS_EXACT_RETRY_MANIFEST_MISSING",
+                "message": "原分析没有完整输入和运行时清单，不能声称精确重试；请按当前上下文重跑",
+            },
+        )
     provider = require_store().travel_provider
     mismatch: list[str] = []
     if original.build_sha != decision_build_sha():
         mismatch.append("build_sha")
+    if content_hash(original.runtime_manifest) != content_hash(decision_runtime_manifest()):
+        mismatch.append("runtime_manifest")
     if original.travel_model_fingerprint != provider.fingerprint:
         mismatch.append("travel_model_fingerprint")
     if original.scenario_snapshot_hash != plan.scenario_snapshot_hash:
@@ -2322,7 +2390,8 @@ def retry_decision_analysis_run(
         existing = require_store().get_command_record(namespace, key, fingerprint)
     except PublicationConflict as error:
         raise HTTPException(409, detail={"code": "IDEMPOTENCY_KEY_REUSED", "message": str(error)}) from error
-    if existing:
+    retry_parent = original
+    if existing and existing["status"] != "FAILED_RETRYABLE":
         if existing["resource_id"]:
             replay = require_store().get_decision_analysis_run(scenario_id, existing["resource_id"])
             if replay:
@@ -2332,11 +2401,15 @@ def retry_decision_analysis_run(
             409,
             detail={"code": "IDEMPOTENT_REQUEST_IN_PROGRESS", "message": "相同精确重试正在执行"},
         )
+    if existing and existing["status"] == "FAILED_RETRYABLE" and existing["resource_id"]:
+        replay = require_store().get_decision_analysis_run(scenario_id, existing["resource_id"])
+        if replay and replay.status in {"FAILED", "INTERRUPTED"}:
+            retry_parent = replay
     created = require_store().begin_command_record(
         namespace,
         key,
         fingerprint,
-        status="RUNNING",
+        status="RESERVED",
         resource_type="decision_analysis_run",
         resource_id=None,
         payload={"original_analysis_id": original.id},
@@ -2349,21 +2422,33 @@ def retry_decision_analysis_run(
             namespace,
             key,
             fingerprint,
-            status="RUNNING",
+            status="ANALYSIS_RESERVED",
             resource_type="decision_analysis_run",
             resource_id=reserved.id,
             payload={"original_analysis_id": original.id, "analysis_id": reserved.id},
         )
 
-    retried = execute_decision_analysis_run(
-        scenario_id,
-        plan,
-        request,
-        response,
-        retry_of=original,
-        context_override=retry_context,
-        on_reserved=record_reserved,
-    )
+    try:
+        retried = execute_decision_analysis_run(
+            scenario_id,
+            plan,
+            request,
+            response,
+            retry_of=retry_parent,
+            context_override=retry_context,
+            on_reserved=record_reserved,
+        )
+    except Exception:
+        require_store().update_command_record(
+            namespace,
+            key,
+            fingerprint,
+            status="FAILED_RETRYABLE",
+            resource_type="decision_analysis_run",
+            resource_id=None,
+            payload={"original_analysis_id": original.id, "stage": "EXECUTION_FAILED"},
+        )
+        raise
     require_store().update_command_record(
         namespace,
         key,
@@ -2385,6 +2470,7 @@ def rerun_decision_analysis_current(
     scenario_id: str,
     analysis_id: str,
     response: Response,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> DecisionAnalysisRun:
     original = require_store().get_decision_analysis_run(scenario_id, analysis_id)
     if not original:
@@ -2394,15 +2480,98 @@ def rerun_decision_analysis_current(
         raise HTTPException(409, {"code": "ANALYSIS_PLAN_MISSING", "message": "原分析引用的方案已不存在"})
     if not original.request_snapshot:
         raise HTTPException(409, {"code": "ANALYSIS_REQUEST_SNAPSHOT_MISSING", "message": "旧分析缺少请求快照"})
+    if original.integrity_status is AnalysisIntegrityStatus.failed:
+        raise HTTPException(
+            409,
+            {"code": "ANALYSIS_INTEGRITY_FAILED", "message": "原分析请求快照未通过完整性校验，不能重跑"},
+        )
+    if not 8 <= len(idempotency_key) <= 120:
+        raise HTTPException(422, detail={"code": "INVALID_IDEMPOTENCY_KEY", "message": "幂等键长度须为 8–120"})
     request = TypeAdapter(DecisionAnalysisRunRequest).validate_python(original.request_snapshot)
-    return execute_decision_analysis_run(
-        scenario_id,
-        plan,
-        request,
-        response,
-        force_new=True,
-        supersedes_analysis_id=original.id,
+    namespace = f"{scenario_id}:analysis-rerun-current"
+    fingerprint = content_hash(
+        {
+            "original_analysis_id": original.id,
+            "request": request,
+            "current_plan_manifest_hash": plan.publication_manifest_hash,
+            "current_build_sha": decision_build_sha(),
+            "current_runtime_manifest": decision_runtime_manifest(),
+        }
     )
+    try:
+        existing = require_store().get_command_record(namespace, idempotency_key, fingerprint)
+    except PublicationConflict as error:
+        raise HTTPException(409, detail={"code": "IDEMPOTENCY_KEY_REUSED", "message": str(error)}) from error
+    retry_parent: DecisionAnalysisRun | None = None
+    if existing and existing["status"] != "FAILED_RETRYABLE":
+        if existing["resource_id"]:
+            replay = require_store().get_decision_analysis_run(scenario_id, existing["resource_id"])
+            if replay:
+                response.status_code = status.HTTP_202_ACCEPTED if replay.status == "RUNNING" else status.HTTP_200_OK
+                return replay
+        raise HTTPException(
+            409,
+            detail={"code": "IDEMPOTENT_REQUEST_IN_PROGRESS", "message": "相同当前环境重跑正在执行"},
+        )
+    if existing and existing["status"] == "FAILED_RETRYABLE" and existing["resource_id"]:
+        replay = require_store().get_decision_analysis_run(scenario_id, existing["resource_id"])
+        if replay and replay.status in {"FAILED", "INTERRUPTED"}:
+            retry_parent = replay
+    created = require_store().begin_command_record(
+        namespace,
+        idempotency_key,
+        fingerprint,
+        status="RESERVED",
+        resource_type="decision_analysis_run",
+        resource_id=None,
+        payload={"original_analysis_id": original.id},
+    )
+    if not created:
+        raise HTTPException(409, detail={"code": "IDEMPOTENT_REQUEST_IN_PROGRESS", "message": "相同重跑正在执行"})
+
+    def record_reserved(reserved: DecisionAnalysisRun) -> None:
+        require_store().update_command_record(
+            namespace,
+            idempotency_key,
+            fingerprint,
+            status="ANALYSIS_RESERVED",
+            resource_type="decision_analysis_run",
+            resource_id=reserved.id,
+            payload={"original_analysis_id": original.id, "analysis_id": reserved.id},
+        )
+
+    try:
+        rerun = execute_decision_analysis_run(
+            scenario_id,
+            plan,
+            request,
+            response,
+            retry_of=retry_parent,
+            force_new=retry_parent is None,
+            supersedes_analysis_id=original.id,
+            on_reserved=record_reserved,
+        )
+    except Exception:
+        require_store().update_command_record(
+            namespace,
+            idempotency_key,
+            fingerprint,
+            status="FAILED_RETRYABLE",
+            resource_type="decision_analysis_run",
+            resource_id=None,
+            payload={"original_analysis_id": original.id, "stage": "EXECUTION_FAILED"},
+        )
+        raise
+    require_store().update_command_record(
+        namespace,
+        idempotency_key,
+        fingerprint,
+        status="COMPLETED",
+        resource_type="decision_analysis_run",
+        resource_id=rerun.id,
+        payload={"analysis_id": rerun.id, "attempt_number": rerun.attempt_number},
+    )
+    return rerun
 
 
 @router.get(
@@ -2459,13 +2628,41 @@ def get_decision_analysis_artifact(
     return artifact
 
 
-@router.post("/api/scenarios/{scenario_id}/risk-comparison")
+def paired_metric_summary(
+    before_values: list[float],
+    after_values: list[float],
+    *,
+    higher_is_better: bool,
+) -> PairedMetricSummary:
+    if len(before_values) != len(after_values) or not before_values:
+        raise HTTPException(
+            409,
+            detail={"code": "PAIRED_TRIAL_EVIDENCE_MISMATCH", "message": "配对 trial 证据数量不一致"},
+        )
+    deltas = [after - before for before, after in zip(before_values, after_values, strict=True)]
+    mean_delta = statistics.fmean(deltas)
+    standard_error = statistics.stdev(deltas) / math.sqrt(len(deltas)) if len(deltas) > 1 else 0.0
+    margin = 1.96 * standard_error
+    wins = sum(1 for delta in deltas if delta > 0) if higher_is_better else sum(1 for delta in deltas if delta < 0)
+    losses = sum(1 for delta in deltas if delta < 0) if higher_is_better else sum(1 for delta in deltas if delta > 0)
+    ties = len(deltas) - wins - losses
+    return PairedMetricSummary(
+        mean_delta=round(mean_delta, 6),
+        ci_low=round(mean_delta - margin, 6),
+        ci_high=round(mean_delta + margin, 6),
+        win_count=wins,
+        tie_count=ties,
+        loss_count=losses,
+    )
+
+
+@router.post("/api/scenarios/{scenario_id}/risk-comparison", response_model=RiskComparisonRun)
 def compare_plan_risk_paired(
     scenario_id: str,
     request: RiskSimulationRequest,
     before: str = Query(...),
     after: str = Query(...),
-) -> dict[str, object]:
+) -> RiskComparisonRun:
     before_plan = require_store().get_plan_version(scenario_id, before)
     after_plan = require_store().get_plan_version(scenario_id, after)
     if not before_plan or not after_plan:
@@ -2504,32 +2701,109 @@ def compare_plan_risk_paired(
             409,
             detail={"code": "PAIRED_SCENARIO_SET_MISMATCH", "message": "两次分析没有绑定同一共同随机场景集"},
         )
-    return {
-        "scenario_set_hash": before_run.result.simulation_scenario_set_hash,
-        "before_analysis_id": before_run.id,
-        "after_analysis_id": after_run.id,
-        "before_plan_version_id": before_plan.id,
-        "after_plan_version_id": after_plan.id,
-        "delta": {
-            "expected_sla_on_time_rate": round(
-                after_run.result.expected_sla_on_time_rate - before_run.result.expected_sla_on_time_rate,
-                4,
-            ),
-            "expected_overtime_minutes": round(
-                after_run.result.expected_overtime_minutes - before_run.result.expected_overtime_minutes,
-                2,
-            ),
-            "additional_disruption_probability": round(
-                after_run.result.additional_disruption_probability
-                - before_run.result.additional_disruption_probability,
-                4,
-            ),
-            "expected_total_unserved_orders": round(
-                after_run.result.expected_total_unserved_orders - before_run.result.expected_total_unserved_orders,
-                2,
-            ),
-        },
+    before_artifact = (
+        require_store().get_decision_analysis_artifact(
+            scenario_id,
+            before_run.id,
+            before_run.result.trial_outcome_artifact_id,
+        )
+        if before_run.result.trial_outcome_artifact_id
+        else None
+    )
+    after_artifact = (
+        require_store().get_decision_analysis_artifact(
+            scenario_id,
+            after_run.id,
+            after_run.result.trial_outcome_artifact_id,
+        )
+        if after_run.result.trial_outcome_artifact_id
+        else None
+    )
+    if (
+        not isinstance(before_artifact, RiskTrialOutcomeArtifact)
+        or not isinstance(after_artifact, RiskTrialOutcomeArtifact)
+        or before_artifact.integrity_status is not AnalysisIntegrityStatus.verified
+        or after_artifact.integrity_status is not AnalysisIntegrityStatus.verified
+        or before_artifact.scenario_set_hash != after_artifact.scenario_set_hash
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PAIRED_TRIAL_EVIDENCE_INVALID",
+                "message": "配对风险比较缺少完整且使用同一场景集的 trial 证据",
+            },
+        )
+    before_metrics = sorted(before_artifact.metrics, key=lambda item: item.trial)
+    after_metrics = sorted(after_artifact.metrics, key=lambda item: item.trial)
+    if [item.trial for item in before_metrics] != [item.trial for item in after_metrics]:
+        raise HTTPException(
+            409,
+            detail={"code": "PAIRED_TRIAL_INDEX_MISMATCH", "message": "两个分析的 trial 编号不一致"},
+        )
+    delta = {
+        "expected_sla_on_time_rate": round(
+            after_run.result.expected_sla_on_time_rate - before_run.result.expected_sla_on_time_rate,
+            4,
+        ),
+        "expected_overtime_minutes": round(
+            after_run.result.expected_overtime_minutes - before_run.result.expected_overtime_minutes,
+            2,
+        ),
+        "additional_disruption_probability": round(
+            after_run.result.additional_disruption_probability - before_run.result.additional_disruption_probability,
+            4,
+        ),
+        "expected_total_unserved_orders": round(
+            after_run.result.expected_total_unserved_orders - before_run.result.expected_total_unserved_orders,
+            2,
+        ),
     }
+    comparison = RiskComparisonRun(
+        id="pending",
+        scenario_id=scenario_id,
+        number=0,
+        before_analysis_id=before_run.id,
+        after_analysis_id=after_run.id,
+        before_plan_version_id=before_plan.id,
+        after_plan_version_id=after_plan.id,
+        scenario_set_hash=before_artifact.scenario_set_hash,
+        trials=len(before_metrics),
+        paired_sla_delta=paired_metric_summary(
+            [item.sla_on_time_rate for item in before_metrics],
+            [item.sla_on_time_rate for item in after_metrics],
+            higher_is_better=True,
+        ),
+        paired_overtime_delta=paired_metric_summary(
+            [float(item.total_overtime_minutes) for item in before_metrics],
+            [float(item.total_overtime_minutes) for item in after_metrics],
+            higher_is_better=False,
+        ),
+        paired_unserved_delta=paired_metric_summary(
+            [float(item.total_unserved_orders) for item in before_metrics],
+            [float(item.total_unserved_orders) for item in after_metrics],
+            higher_is_better=False,
+        ),
+        paired_disruption_delta=paired_metric_summary(
+            [float(item.disrupted) for item in before_metrics],
+            [float(item.disrupted) for item in after_metrics],
+            higher_is_better=False,
+        ),
+        delta=delta,
+        comparison_hash="pending",
+        created_at=_now(),
+    )
+    return require_store().save_risk_comparison(comparison)
+
+
+@router.get(
+    "/api/scenarios/{scenario_id}/risk-comparisons/{comparison_id}",
+    response_model=RiskComparisonRun,
+)
+def get_risk_comparison(scenario_id: str, comparison_id: str) -> RiskComparisonRun:
+    comparison = require_store().get_risk_comparison(scenario_id, comparison_id)
+    if comparison is None:
+        raise HTTPException(404, "风险比较记录不存在")
+    return comparison
 
 
 def schedule_change_rows(
@@ -3010,6 +3284,14 @@ def build_comparison(
         else []
     )
     b, a = before.kpis, after.kpis
+    comparable_delta = {
+        "sla_late_count": a.sla_late_count - b.sla_late_count,
+        "travel_minutes": a.total_travel_minutes - b.total_travel_minutes,
+        "overtime_minutes": a.total_overtime_minutes - b.total_overtime_minutes,
+        "unassigned_count": a.unassigned_count - b.unassigned_count,
+        "completion_rate": round(a.completion_rate - b.completion_rate, 4),
+        "stability_rate": a.stability_rate,
+    }
     return Comparison(
         scenario_id=scenario_id,
         before=before,
@@ -3018,12 +3300,11 @@ def build_comparison(
             "objective": round(after.objective - before.objective, 2)
             if same_snapshot and after.strategy == before.strategy
             else None,
-            "sla_late_count": a.sla_late_count - b.sla_late_count,
-            "travel_minutes": a.total_travel_minutes - b.total_travel_minutes,
-            "overtime_minutes": a.total_overtime_minutes - b.total_overtime_minutes,
-            "unassigned_count": a.unassigned_count - b.unassigned_count,
-            "completion_rate": round(a.completion_rate - b.completion_rate, 4),
-            "stability_rate": a.stability_rate,
+            **(
+                {key: value for key, value in comparable_delta.items()}
+                if same_snapshot
+                else {key: None for key in comparable_delta}
+            ),
         },
         changed_orders=changed,
         comparable=same_snapshot,
@@ -3135,6 +3416,16 @@ def delete_strategy_profile(profile_id: str) -> Response:
     return Response(status_code=204)
 
 
+COMMON_EVALUATION_POLICY = {
+    "travel": 0.20,
+    "sla_late": 0.25,
+    "overtime": 0.15,
+    "normalized_workload_range": 0.10,
+    "unassigned_penalty": 0.25,
+    "replan_changes": 0.05,
+}
+
+
 def common_evaluation_score(scenario: ScheduleScenario, result: ScheduleResult) -> float:
     order_map = {order.id: order for order in scenario.work_orders}
     total_shift = max(1, sum(item.shift_end - item.shift_start for item in scenario.technicians))
@@ -3150,12 +3441,12 @@ def common_evaluation_score(scenario: ScheduleScenario, result: ScheduleResult) 
     changes = sum(1 for item in result.assignments if item.changed)
     active_count = max(1, len([item for item in scenario.work_orders if item.status != WorkOrderStatus.completed]))
     normalized = (
-        result.kpis.total_travel_minutes / total_shift * 0.20
-        + result.kpis.total_late_minutes / total_service * 0.25
-        + result.kpis.total_overtime_minutes / total_shift * 0.15
-        + result.kpis.normalized_workload_range * 0.10
-        + unassigned / total_penalty * 0.25
-        + changes / active_count * 0.05
+        result.kpis.total_travel_minutes / total_shift * COMMON_EVALUATION_POLICY["travel"]
+        + result.kpis.total_late_minutes / total_service * COMMON_EVALUATION_POLICY["sla_late"]
+        + result.kpis.total_overtime_minutes / total_shift * COMMON_EVALUATION_POLICY["overtime"]
+        + result.kpis.normalized_workload_range * COMMON_EVALUATION_POLICY["normalized_workload_range"]
+        + unassigned / total_penalty * COMMON_EVALUATION_POLICY["unassigned_penalty"]
+        + changes / active_count * COMMON_EVALUATION_POLICY["replan_changes"]
     )
     return round(normalized * 1000, 2)
 
@@ -3389,6 +3680,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
             "travel_model_version": require_store().travel_provider.version,
             "travel_model_fingerprint": require_store().travel_provider.fingerprint,
             "score_policy_version": "FIELD_SERVICE_SCORE_V2",
+            "score_policy_snapshot": COMMON_EVALUATION_POLICY,
             "seed": scenario.seed,
         }
     )
@@ -3407,6 +3699,7 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
         fingerprint=experiment_fingerprint,
         scenario_snapshot_hash=scenario_snapshot_hash,
         score_policy_version="FIELD_SERVICE_SCORE_V2",
+        score_policy_snapshot=COMMON_EVALUATION_POLICY,
         travel_model_version=require_store().travel_provider.version,
         travel_model_fingerprint=require_store().travel_provider.fingerprint,
         solver_version=ortools.__version__,
@@ -3635,6 +3928,20 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @application.exception_handler(DecisionAnalysisIntegrityError)
+    async def decision_integrity_error_handler(_request: Request, error: DecisionAnalysisIntegrityError):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": "MALFORMED_ATTESTED_RECORD",
+                    "message": str(error),
+                    "record_id": error.record_id,
+                    "record_type": error.record_type,
+                }
+            },
+        )
 
     @application.middleware("http")
     async def validate_browser_origin(request: Request, call_next):

@@ -486,6 +486,8 @@ def calculate_kpis(
         if tech_kpis
         else 0,
         workload_range=workload_range,
+        min_normalized_workload=round(min(normalized_values), 4) if normalized_values else 0,
+        max_normalized_workload=round(max(normalized_values), 4) if normalized_values else 0,
         normalized_workload_range=round(max(normalized_values) - min(normalized_values), 4) if normalized_values else 0,
         same_technician_rate=round(same_technician_rate, 4) if same_technician_rate is not None else None,
         adjacency_preservation_rate=round(adjacency_rate, 4) if adjacency_rate is not None else None,

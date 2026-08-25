@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
+
+HASH_SCHEMA_VERSION = "FIELD_SERVICE_CANONICAL_JSON_V2"
 
 
 def _jsonable(value: Any) -> Any:
@@ -14,11 +17,16 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        mapping = cast(dict[object, object], value)
+        return {unicodedata.normalize("NFC", str(key)): _jsonable(item) for key, item in mapping.items()}
     if isinstance(value, list | tuple):
-        return [_jsonable(item) for item in value]
+        sequence = cast(list[object] | tuple[object, ...], value)
+        return [_jsonable(item) for item in sequence]
     if isinstance(value, set):
-        return sorted((_jsonable(item) for item in value), key=repr)
+        members = cast(set[object], value)
+        return sorted((_jsonable(item) for item in members), key=repr)
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
     return value
 
 
@@ -27,4 +35,5 @@ def canonical_json(value: Any) -> str:
 
 
 def content_hash(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+    payload = f"{HASH_SCHEMA_VERSION}\n{canonical_json(value)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

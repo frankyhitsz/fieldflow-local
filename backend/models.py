@@ -69,6 +69,9 @@ class PlanCoverageStatus(str, Enum):
 
 
 class DecisionAnalysisScope(str, Enum):
+    frozen_full_plan = "FROZEN_FULL_PLAN"
+    publication_remaining_plan = "PUBLICATION_REMAINING_PLAN"
+    # Read compatibility for A records created before v0.5.5.
     ex_ante_frozen_plan = "EX_ANTE_FROZEN_PLAN"
     incurred_actual = "INCURRED_ACTUAL"
     remaining_forecast = "REMAINING_FORECAST"
@@ -77,7 +80,7 @@ class DecisionAnalysisScope(str, Enum):
     @classmethod
     def _missing_(cls, value: object) -> DecisionAnalysisScope | None:
         if value == "FULL_DAY_PLAN":
-            return cls.ex_ante_frozen_plan
+            return cls.frozen_full_plan
         return None
 
 
@@ -121,6 +124,11 @@ class AnalysisIntegrityStatus(str, Enum):
     verified = "VERIFIED"
     failed = "FAILED"
     legacy_unattested = "LEGACY_UNATTESTED"
+
+
+class AttestationRequirement(str, Enum):
+    required = "REQUIRED"
+    legacy_migrated = "LEGACY_MIGRATED"
 
 
 class CapacityCostSource(str, Enum):
@@ -367,6 +375,8 @@ class ScheduleKPI(BaseModel):
     total_waiting_minutes: int = 0
     average_occupied_utilization: float = 0
     workload_range: int = 0
+    min_normalized_workload: float = 0
+    max_normalized_workload: float = 0
     normalized_workload_range: float = 0
     same_technician_rate: float | None = None
     adjacency_preservation_rate: float | None = None
@@ -527,10 +537,23 @@ class WorkOrderExecutionEvent(BaseModel):
     planned_start_at: int | None = Field(default=None, ge=0, le=2280)
     planned_finish_at: int | None = Field(default=None, ge=0, le=2760)
     actual_duration_minutes: int | None = Field(default=None, ge=1, le=2280)
+    customer_window_late_start_minutes: int = Field(default=0, ge=0)
+    planned_start_variance_minutes: int | None = None
+    # Compatibility alias retained for clients before v0.5.5.
     actual_late_start_minutes: int = Field(default=0, ge=0)
     early_start_override_reason: str | None = None
     estimated_remaining_minutes: int | None = Field(default=None, ge=1, le=480)
     note: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_late_start_name(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        if "customer_window_late_start_minutes" not in migrated:
+            migrated["customer_window_late_start_minutes"] = migrated.get("actual_late_start_minutes", 0)
+        return migrated
 
 
 class WorkOrderExecutionResult(BaseModel):
@@ -610,6 +633,7 @@ class RouteEntryContext(BaseModel):
 class FrozenBookingIdentity(BaseModel):
     work_order_id: Identifier
     technician_id: Identifier
+    booking_id: Identifier | None = None
     source_sequence: int | None = Field(default=None, ge=1)
     source_assignment_hash: str | None = None
 
@@ -670,6 +694,8 @@ class PlanVersion(BaseModel):
     publication_manifest_hash: str = ""
     source_plan_snapshot_hash: str | None = None
     coverage_status: PlanCoverageStatus = PlanCoverageStatus.current_and_complete
+    attestation_requirement: AttestationRequirement = AttestationRequirement.required
+    integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
 
 
 class PlanVersionPatch(BaseModel):
@@ -809,6 +835,7 @@ class StrategyExperiment(BaseModel):
     fingerprint: str = ""
     scenario_snapshot_hash: str = ""
     score_policy_version: str = "FIELD_SERVICE_SCORE_V2"
+    score_policy_snapshot: dict[str, float] = Field(default_factory=dict)
     travel_model_version: str = "EUCLIDEAN_GRID_V2"
     travel_model_fingerprint: str = "EUCLIDEAN_GRID_V2"
     solver_version: str = ""
@@ -1043,6 +1070,10 @@ class ExternalAssignment(BaseModel):
     work_order_id: Identifier
     provider_id: Identifier = "EXTERNAL-PROVIDER"
     service_assumption: Literal["SAME_DAY_WITHIN_SLA"] = "SAME_DAY_WITHIN_SLA"
+    capacity_verified: bool = False
+    committed_start_time: int | None = None
+    committed_finish_time: int | None = None
+    sla_commitment: Literal["UNVERIFIED_ASSUMPTION"] = "UNVERIFIED_ASSUMPTION"
     assumed_on_time: bool = True
     cost_cents: int = Field(default=0, ge=0)
 
@@ -1203,6 +1234,11 @@ class RiskSimulationResult(BaseModel):
     late_minutes_p95: int = Field(ge=0)
     expected_overtime_minutes: float = Field(ge=0)
     additional_disruption_probability: float = Field(ge=0, le=1)
+    technician_absence_event_probability: float = Field(default=0, ge=0, le=1)
+    absence_caused_failure_probability: float = Field(default=0, ge=0, le=1)
+    absence_caused_unserved_probability: float = Field(default=0, ge=0, le=1)
+    absence_caused_sla_degradation_probability: float = Field(default=0, ge=0, le=1)
+    absence_caused_overtime_probability: float = Field(default=0, ge=0, le=1)
     absence_disruption_probability: float = Field(default=0, ge=0, le=1)
     no_show_disruption_probability: float = Field(default=0, ge=0, le=1)
     window_failure_probability: float = Field(default=0, ge=0, le=1)
@@ -1223,6 +1259,8 @@ class RiskSimulationResult(BaseModel):
     expected_unserved_orders: float = Field(ge=0)
     assumptions: list[str] = Field(default_factory=list)
     scenario_set_artifact_id: str | None = None
+    trial_outcome_artifact_id: str | None = None
+    trial_metrics: list[RiskTrialMetric] = Field(default_factory=list, exclude=True)
 
 
 class CostAnalysisParameters(BaseModel):
@@ -1271,6 +1309,48 @@ class DecisionAnalysisContext(BaseModel):
     active_booking_ids: list[str] = Field(default_factory=list)
 
 
+class RuntimeManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_RUNTIME_MANIFEST_V1"
+    hash_schema_version: str
+    python_version: str
+    ortools_version: str
+    sqlite_version: str
+    pydantic_version: str
+    operating_system: str
+    architecture: str
+    build_sha: str
+    dependency_lock_hash: str
+
+
+class DecisionInputManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_DECISION_INPUT_MANIFEST_V1"
+    request_hash: str
+    policy_hash: str
+    analysis_context_hash: str
+    plan_manifest_hash: str
+    runtime_manifest_hash: str
+    scenario_snapshot_hash: str
+    schedule_hash: str
+    travel_model_fingerprint: str
+    semantic_input_hash: str
+
+
+class DecisionResultManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_DECISION_RESULT_MANIFEST_V1"
+    status: Literal["COMPLETED"] = "COMPLETED"
+    result_hash: str
+    finished_at: str
+
+
+class AnalysisFailureManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_ANALYSIS_FAILURE_MANIFEST_V1"
+    status: Literal["FAILED", "INTERRUPTED"]
+    error_hash: str
+    error_code: str
+    failure_stage: str
+    finished_at: str
+
+
 class DecisionAnalysisRun(BaseModel):
     id: str
     scenario_id: str
@@ -1292,7 +1372,9 @@ class DecisionAnalysisRun(BaseModel):
     code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
+    runtime_manifest: RuntimeManifest | None = None
     input_hash: str
+    input_manifest: DecisionInputManifest | None = None
     request_snapshot: dict[str, Any] = Field(default_factory=dict)
     logical_analysis_id: str = ""
     retry_of_analysis_id: str | None = None
@@ -1301,9 +1383,12 @@ class DecisionAnalysisRun(BaseModel):
     status: Literal["RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"] = "RUNNING"
     result: CostAnalysis | CapacityAnalysis | RiskSimulationResult | None = None
     result_hash: str | None = None
+    result_manifest: DecisionResultManifest | None = None
+    failure_manifest: AnalysisFailureManifest | None = None
     artifact_manifest: list[dict[str, str]] = Field(default_factory=list)
     analysis_manifest_hash: str | None = None
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    attestation_requirement: AttestationRequirement = AttestationRequirement.required
     error: dict[str, Any] | None = None
     created_at: str
     finished_at: str | None = None
@@ -1337,16 +1422,40 @@ class CapacityCounterfactualArtifact(BaseModel):
     counterfactual_kpis: CapacityCounterfactualKPI | None = None
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    attestation_requirement: AttestationRequirement = AttestationRequirement.required
     created_at: str
 
 
 class SimulationEmergencyEvent(BaseModel):
     trial: int = Field(ge=0)
-    technician_id: Identifier
+    event_id: Identifier = "EMERGENCY"
+    technician_id: Identifier | None = None
     event_time: int = Field(ge=0, le=2280)
     location: Point
     duration_minutes: int = Field(ge=1, le=480)
     required_skill: Skill
+    sla_deadline: int = Field(default=2280, ge=0, le=2760)
+
+
+class RiskTrialMetric(BaseModel):
+    trial: int = Field(ge=0)
+    sla_on_time_rate: float = Field(ge=0, le=1)
+    total_overtime_minutes: int = Field(ge=0)
+    total_unserved_orders: int = Field(ge=0)
+    disrupted: bool
+
+
+class RiskTrialOutcomeArtifact(BaseModel):
+    artifact_type: Literal["RISK_TRIAL_OUTCOMES"] = "RISK_TRIAL_OUTCOMES"
+    id: str
+    scenario_id: str
+    analysis_run_id: str
+    scenario_set_hash: str
+    metrics: list[RiskTrialMetric]
+    artifact_hash: str = ""
+    integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    attestation_requirement: AttestationRequirement = AttestationRequirement.required
+    created_at: str
 
 
 class SimulationScenarioSetArtifact(BaseModel):
@@ -1354,7 +1463,7 @@ class SimulationScenarioSetArtifact(BaseModel):
     id: str
     scenario_id: str
     analysis_run_id: str
-    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V2"
+    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V3"
     keyed_random_version: str = "FIELD_SERVICE_KEYED_RANDOM_V1"
     scenario_snapshot_hash: str
     seed: int
@@ -1366,10 +1475,40 @@ class SimulationScenarioSetArtifact(BaseModel):
     scenario_set_hash: str
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    attestation_requirement: AttestationRequirement = AttestationRequirement.required
     created_at: str
 
 
-DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSetArtifact
+DecisionAnalysisArtifact = CapacityCounterfactualArtifact | SimulationScenarioSetArtifact | RiskTrialOutcomeArtifact
+
+
+class PairedMetricSummary(BaseModel):
+    mean_delta: float
+    ci_low: float
+    ci_high: float
+    win_count: int = Field(ge=0)
+    tie_count: int = Field(ge=0)
+    loss_count: int = Field(ge=0)
+
+
+class RiskComparisonRun(BaseModel):
+    id: str
+    scenario_id: str
+    number: int = Field(ge=0)
+    before_analysis_id: str
+    after_analysis_id: str
+    before_plan_version_id: str
+    after_plan_version_id: str
+    scenario_set_hash: str
+    trials: int = Field(ge=1)
+    paired_sla_delta: PairedMetricSummary
+    paired_overtime_delta: PairedMetricSummary
+    paired_unserved_delta: PairedMetricSummary
+    paired_disruption_delta: PairedMetricSummary
+    delta: dict[str, float] = Field(default_factory=dict)
+    comparison_hash: str
+    integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    created_at: str
 
 
 class VerificationIssue(BaseModel):
@@ -1404,6 +1543,7 @@ class ExecutionSourceAssignment(BaseModel):
     work_order_id: Identifier
     technician_id: Identifier
     source_schedule_id: str
+    booking_id: Identifier | None = None
     source_assignment_hash: str
     sequence: int = Field(ge=1)
     source_sequence: int | None = Field(default=None, ge=1)

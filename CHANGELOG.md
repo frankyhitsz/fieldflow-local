@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.5.4 — unreleased
+## 0.5.5 — 2026-08-25
+
+- Made required Plan, A and Artifact attestations fail closed across every read, replay and retry path; legacy status now comes from an immutable schema column.
+- Added complete input, result and failure manifests plus Python, solver, database, model, platform, build and dependency runtime provenance.
+- Unified replan cost, capacity and risk around the publication-time remaining-work view and fixed route-entry tail append behavior.
+- Separated risk event occurrence from caused harm, modeled idle responders, persisted per-trial evidence and added auditable paired comparisons.
+- Made exact retry and current rerun idempotent across crashes before A allocation.
+- Preserved analysis artifacts during legacy constraint migration, quarantined malformed JSON and moved plan display metadata out of frozen payloads.
+- Added ESLint/React Hooks checks, strict Pyright on provenance code, an 85% coverage gate, dependency-declaration checks and commit-pinned GitHub Actions.
+- Marked outsourced capacity and SLA as unverified assumptions when no supplier commitment exists.
+
+## 0.5.4 — 2026-08-24
 
 - Bound every published replan to an immutable publication-time route-entry context used by risk and capacity analysis.
 - Made outsourced coverage self-contained with external assignments, work-order dispositions, formal counterfactual KPIs and artifact hashes.

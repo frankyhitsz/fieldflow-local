@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import platform
+import sqlite3
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from .hashing import content_hash
+from .hashing import HASH_SCHEMA_VERSION, content_hash
+from .models import DecisionAnalysisContext, DecisionInputManifest, RuntimeManifest
 
 DECISION_ALGORITHM_VERSION = "FIELD_SERVICE_DECISION_V3"
 
@@ -23,3 +27,74 @@ def decision_build_sha() -> str:
         for path in sorted(backend_root.glob("*.py"))
     ]
     return f"dev-{content_hash(source)[:16]}"
+
+
+def _package_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "not-installed"
+
+
+@lru_cache(maxsize=1)
+def decision_runtime_manifest() -> RuntimeManifest:
+    root = Path(__file__).resolve().parent.parent
+    lock_inputs: list[dict[str, str]] = []
+    for relative in ("pyproject.toml", "requirements.txt", "frontend/package-lock.json"):
+        path = root / relative
+        if path.exists():
+            lock_inputs.append({"path": relative, "content": path.read_text(encoding="utf-8")})
+    return RuntimeManifest(
+        hash_schema_version=HASH_SCHEMA_VERSION,
+        python_version=platform.python_version(),
+        ortools_version=_package_version("ortools"),
+        sqlite_version=sqlite3.sqlite_version,
+        pydantic_version=_package_version("pydantic"),
+        operating_system=f"{platform.system()} {platform.release()}",
+        architecture=platform.machine() or "unknown",
+        build_sha=decision_build_sha(),
+        dependency_lock_hash=content_hash(lock_inputs),
+    )
+
+
+def build_decision_input_manifest(
+    *,
+    analysis_type: str,
+    request_snapshot: object,
+    policy_snapshot: object,
+    analysis_context: DecisionAnalysisContext,
+    plan_manifest_hash: str,
+    runtime_manifest: RuntimeManifest,
+    scenario_snapshot_hash: str,
+    schedule_hash: str,
+    travel_model_fingerprint: str,
+) -> DecisionInputManifest:
+    request_hash = content_hash(request_snapshot)
+    policy_hash = content_hash(policy_snapshot)
+    context_hash = content_hash(analysis_context)
+    runtime_hash = content_hash(runtime_manifest)
+    semantic_hash = content_hash(
+        {
+            "policy_version": "FIELD_SERVICE_DECISION_SEMANTIC_INPUT_V1",
+            "analysis_type": analysis_type,
+            "request_hash": request_hash,
+            "policy_hash": policy_hash,
+            "analysis_context_hash": context_hash,
+            "plan_manifest_hash": plan_manifest_hash,
+            "runtime_manifest_hash": runtime_hash,
+            "scenario_snapshot_hash": scenario_snapshot_hash,
+            "schedule_hash": schedule_hash,
+            "travel_model_fingerprint": travel_model_fingerprint,
+        }
+    )
+    return DecisionInputManifest(
+        request_hash=request_hash,
+        policy_hash=policy_hash,
+        analysis_context_hash=context_hash,
+        plan_manifest_hash=plan_manifest_hash,
+        runtime_manifest_hash=runtime_hash,
+        scenario_snapshot_hash=scenario_snapshot_hash,
+        schedule_hash=schedule_hash,
+        travel_model_fingerprint=travel_model_fingerprint,
+        semantic_input_hash=semantic_hash,
+    )

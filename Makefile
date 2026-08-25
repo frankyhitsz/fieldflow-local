@@ -15,10 +15,11 @@ lint:
 	$(PYTHON) -m ruff format --check backend tests scripts
 	$(PYTHON) -m pyright
 	PYTHONPATH=. FIELDFLOW_DB=/tmp/fieldflow-openapi.db $(PYTHON) scripts/check_openapi.py
-	cd frontend && npm run typecheck
+	$(PYTHON) scripts/check_dependencies.py
+	cd frontend && npm run lint && npm run typecheck
 
 test:
-	FIELDFLOW_DB=/tmp/fieldflow-tests.db $(PYTEST) --cov=backend --cov-report=term-missing --cov-fail-under=75 -q
+	FIELDFLOW_DB=/tmp/fieldflow-tests.db $(PYTEST) --cov=backend --cov-report=term-missing --cov-fail-under=85 -q
 
 audit:
 	.venv/bin/pip-audit --cache-dir /tmp/fieldflow-pip-audit -r requirements.txt

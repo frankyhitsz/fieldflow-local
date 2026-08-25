@@ -26,10 +26,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     })
   } catch (error) {
     if (controller.signal.aborted && !init?.signal?.aborted) {
-      throw new Error('请求超过 35 秒未完成。求解仍可能在后台结束，请查看方案历史后再重试。')
+      throw new Error('请求超过 35 秒未完成。求解仍可能在后台结束，请查看方案历史后再重试。', { cause: error })
     }
-    if (init?.signal?.aborted) throw new Error('请求已取消')
-    throw new Error('无法连接 FieldFlow 本地服务。请在项目目录运行“make demo”，并确认终端显示的访问地址与当前地址一致。')
+    if (init?.signal?.aborted) throw new Error('请求已取消', { cause: error })
+    throw new Error('无法连接 FieldFlow 本地服务。请在项目目录运行“make demo”，并确认终端显示的访问地址与当前地址一致。', { cause: error })
   } finally {
     window.clearTimeout(timeout)
     init?.signal?.removeEventListener('abort', relayAbort)
@@ -103,11 +103,11 @@ export const api = {
       : analysisType === 'CAPACITY'
         ? { reference_mode: options?.referenceMode || 'SELECTED_PLAN_DELTA', analysis_horizon: horizon }
         : { seed: options?.seed ?? null, trials: options?.trials ?? 500 }
-    return request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, analysis_scope: 'EX_ANTE_FROZEN_PLAN', request: parameters }) })
+    return request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, request: parameters }) })
   },
   decisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}`),
   retryDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string, idempotencyKey = `analysis-retry-${crypto.randomUUID()}`) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } }),
-  rerunDecisionAnalysisCurrent: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/rerun-current`, { method: 'POST' }),
+  rerunDecisionAnalysisCurrent: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string, idempotencyKey = `analysis-rerun-${crypto.randomUUID()}`) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/rerun-current`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } }),
   decisionAnalysisArtifacts: (scenarioId: string, analysisId: string) => request<DecisionAnalysisArtifact[]>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts`),
   decisionAnalysisArtifact: (scenarioId: string, analysisId: string, artifactId: string) => request<DecisionAnalysisArtifact>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/artifacts/${artifactId}`),
   createTechnician: (scenarioId: string, technician: Technician) => request<Scenario>(`/api/scenarios/${scenarioId}/technicians`, { method: 'POST', body: JSON.stringify(technician) }),

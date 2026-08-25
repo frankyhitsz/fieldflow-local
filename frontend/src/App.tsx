@@ -195,8 +195,7 @@ function ExplanationPanel({ scenario, schedule, orderId, readOnly = false, onClo
   const unassigned = schedule?.unassigned.find(u => u.work_order_id === orderId)
   const tech = assignment ? scenario.technicians.find(t => t.id === assignment.technician_id) : undefined
   const candidates = order ? scenario.technicians.filter(t => order.required_skills.every(s => t.skills.includes(s))) : []
-  const [manualTech, setManualTech] = useState('')
-  useEffect(() => setManualTech(assignment?.technician_id || candidates[0]?.id || ''), [orderId, assignment?.technician_id, candidates[0]?.id])
+  const [manualTech, setManualTech] = useState(() => assignment?.technician_id || candidates[0]?.id || '')
   if (!order) return null
   return <aside className="detail-drawer" aria-label="工单详情">
     <div className="drawer-top"><div><span className={`priority ${order.priority}`}>{priorityLabel[order.priority]}</span>{order.is_emergency && <span className="emergency-tag">突发</span>}<span className="mono">{order.id}</span></div><div>{!readOnly && <button className="icon-btn" onClick={() => onEdit(order)} aria-label="编辑工单"><Edit3 size={16} /></button>}<button className="icon-btn" onClick={onClose} aria-label="关闭工单详情"><X size={18} /></button></div></div>
@@ -566,9 +565,9 @@ export default function App() {
       }} />}
       {view === 'technicians' && <TechniciansView scenario={scenario} schedule={schedule} onEdit={initial => setTechEditor({ initial })} onAdd={() => setTechEditor({})} />}
       {view === 'lab' && <StrategyLab key={scenario.id} scenario={scenario} profiles={profiles} loadingDataset={!!loadingScenarioId} onSelectDataset={id => { void loadScenario(id); setView('lab') }} onReloadProfiles={async () => setProfiles(await api.strategyProfiles())} onPublished={async plan => { if (activeScenarioId.current !== plan.scenario_id) return; const [fresh, planItems] = await Promise.all([api.scenario(plan.scenario_id), api.planVersions(plan.scenario_id)]); if (activeScenarioId.current !== plan.scenario_id) return; setScenario(fresh); setPlans(planItems); setSchedule(plan.selected); setHistoricalScenario(undefined); setBaseline(undefined); setView('dispatch') }} onToast={setToast} />}
-      {view === 'review' && <ReviewView scenarioId={scenario.id} planVersionId={(plans.find(item => item.selected.id === schedule?.id) || plans.find(item => item.active))?.id} schedule={schedule} baseline={baseline} />}
+      {view === 'review' && <ReviewView key={(plans.find(item => item.selected.id === schedule?.id) || activePlan)?.id} scenarioId={scenario.id} planVersionId={(plans.find(item => item.selected.id === schedule?.id) || activePlan)?.id} schedule={schedule} baseline={baseline} />}
     </main>
-    {selected && <ExplanationPanel scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
+    {selected && <ExplanationPanel key={`${selected.id}:${schedule?.id || 'unscheduled'}`} scenario={shownScenario} schedule={schedule} orderId={selected.id} readOnly={!!historicalScenario} onClose={() => setSelectedId(undefined)} onEdit={initial => setWorkEditor({ initial })} onExecute={(assignment, action) => setExecutionEditor({ assignment, action })} onAssign={async (orderId, technicianId) => {
       setWorking('正在改派并局部重排')
       try {
         const result = await api.manualReassignment(scenario.id, orderId, technicianId, replanTime, scenario.revision, commandKey('manual-reassignment'))

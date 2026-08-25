@@ -52,29 +52,28 @@ function ProfileEditor({ initial, onClose, onSaved }: { initial?: StrategyProfil
 
 export function StrategyLab({ scenario, profiles, loadingDataset, onSelectDataset, onReloadProfiles, onPublished, onToast }: { scenario: Scenario; profiles: StrategyProfile[]; loadingDataset: boolean; onSelectDataset: (id: string) => void; onReloadProfiles: () => Promise<void>; onPublished: (plan: PlanVersion) => void; onToast: (message: string) => void }) {
   const selectable = profiles.filter(profile => profile.id !== 'stable')
-  const [selected, setSelected] = useState<string[]>([])
+  const [selected, setSelected] = useState<string[]>(() => selectable.map(profile => profile.id))
   const [experiment, setExperiment] = useState<StrategyExperiment>()
   const [editor, setEditor] = useState<StrategyProfile | null | undefined>()
   const [working, setWorking] = useState('')
 
+  const experimentId = experiment?.id
+  const experimentStatus = experiment?.status
+  const experimentScenarioId = experiment?.scenario_id
   useEffect(() => {
-    if (!selected.length && selectable.length) setSelected(selectable.map(profile => profile.id))
-  }, [selectable.length])
-
-  useEffect(() => {
-    if (!experiment || !activeExperimentStatuses.includes(experiment.status)) return
+    if (!experimentId || !experimentScenarioId || !experimentStatus || !activeExperimentStatuses.includes(experimentStatus)) return
     let cancelled = false
     const controller = new AbortController()
     const timer = window.setTimeout(async () => {
       try {
-        const next = await api.experiment(experiment.scenario_id, experiment.id, controller.signal)
+        const next = await api.experiment(experimentScenarioId, experimentId, controller.signal)
         if (!cancelled) setExperiment(next)
       } catch (cause) {
         if (!cancelled && !controller.signal.aborted) onToast(cause instanceof Error ? cause.message : '实验进度读取失败')
       }
     }, 650)
     return () => { cancelled = true; controller.abort(); window.clearTimeout(timer) }
-  }, [experiment?.id, experiment?.status])
+  }, [experimentId, experimentScenarioId, experimentStatus, onToast])
 
   const run = async () => {
     setWorking('正在准备实验')

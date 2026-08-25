@@ -20,7 +20,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - 工单、技师、锁定和执行事实变化产生下一条 `D`，不会占用 V。
 - 成功发布正式方案才在事务内分配下一条 `V`；内部基线、候选、失败和取消均不占号。
 - 经营分析开始前分配下一条 `A`，并记录 `RUNNING`、`COMPLETED`、`FAILED` 或 `INTERRUPTED`。相同 V、分析类型和完整输入指纹在运行中返回 202、完成后返回 200。精确 retry 复用冻结输入并在事务内分配唯一 attempt；运行环境变化时拒绝。按当前上下文重跑会创建新的 logical analysis。
-- `PlanVersion` 的冻结 payload 不保存运行时 `active` 和 `coverage_status` 变化；这两项由 `plan_applicability` 投影覆盖。显式重命名仍属于可编辑展示元数据。
+- `PlanVersion` 的冻结 payload 不保存运行时 `active`、`coverage_status` 或名称变化；适用性由 `plan_applicability` 投影覆盖，名称、备注和标签由 `plan_metadata` 覆盖。
 
 ## 正式方案与硬承诺
 
@@ -58,19 +58,19 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 
 ## 经营分析
 
-- 经营分析只接受冻结 V，并把运行保存为不可变 `DecisionAnalysisRun`。请求按 COST、CAPACITY、RISK 判别，只允许一个 `request` 参数对象，不接受会被静默覆盖的并列参数。记录包含执行范围与水位、分析时点、执行上下文、快照和完整排程哈希、行程与政策指纹、语义版本、算法版本、构建 SHA、输入哈希、原始请求、attempt 谱系、终态、结果或结构化错误。
-- 范围枚举为 `EX_ANTE_FROZEN_PLAN`、`INCURRED_ACTUAL`、`REMAINING_FORECAST` 和 `ACTUAL_PLUS_FORECAST`。当前只实现事前冻结计划；已有任何执行事件时必须显式选择，结果标明不含实际执行。事前分析绑定 V 的发布上下文，不把查询时的当前执行水位混入输入。其余范围返回 `ANALYSIS_SCOPE_NOT_SUPPORTED`。
+- 经营分析只接受冻结 V，并把运行保存为不可变 `DecisionAnalysisRun`。请求按 COST、CAPACITY、RISK 判别，只允许一个 `request` 参数对象，不接受会被静默覆盖的并列参数。记录包含执行范围与水位、分析时点、执行上下文、快照和完整排程哈希、行程与政策指纹、语义版本、算法版本、构建 SHA、RuntimeManifest、输入哈希、原始请求、attempt 谱系、终态、结果或结构化错误。
+- 普通计划使用 `FROZEN_FULL_PLAN`；带发布上下文的重排使用 `PUBLICATION_REMAINING_PLAN`，从冻结 route entry 开始并排除发布时已开始或完成的服务。`EX_ANTE_FROZEN_PLAN` 仅作为旧客户端兼容别名，由接口映射到上述实际范围。成本、容量和风险必须使用同一工作视图及排程签名。
 - 成本只使用整数分，并拆分正常人工、加班基础工资和加班溢价。`OCCUPIED_MINUTES` 的正常人工已包含加班分钟基础工资；`PAID_SHIFT` 另列加班基础工资。`AnalysisHorizon`、`CostCadence` 和 `LaborCostMode` 防止一次性投入与单日运营成本混算；总经济影响不是财务结算。
 - 容量默认采用 `SELECTED_PLAN_DELTA + TAIL_APPEND_ONLY`：当前 V 的 assignment 固定，只在路线尾部安置原未服务需求。新增技师使用显式或保守 archetype，补技能以未服务需求为目标。可选受控重算时，参照和方案使用相同确定性政策。
 - 每个容量反事实都检查工单唯一性与覆盖、技能、客户窗口、旅行连续性、服务时长、锁定、固定 assignment、真实返程和加班上限。外包选项保存显式 `ExternalAssignment`、逐工单 disposition、外部 SLA 假设和统一 KPI。新增技师与外包成本分别选择工资/固定费和成本政策/容量政策来源，不能重复计费。`option_applicable` 与 `schedule_feasible` 分开返回；违规方案的正式 KPI 和经济建议为 null，只保留诊断指标。每个选项的完整证据保存为带哈希 Artifact。
 - “调整出发点”只表示将一名高行程技师的出发点移至需求中心，不声称新增了完整服务站点。
-- 风险默认遵循正式方案开始时刻。replan 路线从发布时 route entry 开始。随机量按 `(seed, trial, event_type, entity_id)` 派生；计划无关的场景集保存突发事件目标、时间、位置、时长和技能。配对比较必须复用同一场景集哈希。Monte Carlo 均值抽样区间与全日总迟到分钟分位分开命名；突发事件发生与其造成的窗口、加班、未服务或 SLA 损害分别报告。
-- A 终态保存 `result_hash`、Artifact 哈希清单和总清单哈希。GET 会重算，篡改或缺失证据标记 `FAILED`；没有证明字段的旧记录标记 `LEGACY_UNATTESTED`。
+- 风险默认遵循正式方案开始时刻。replan 路线从发布时 route entry 开始。随机量按 `(seed, trial, event_type, entity_id)` 派生；计划无关的场景集保存突发事件时间、位置、时长、技能和 SLA。配对比较必须复用同一场景集哈希，并持久保存配对差值、95% 区间和 win/tie/loss。Monte Carlo 均值抽样区间与全日总迟到分钟分位分开命名；事件发生与由事件造成的窗口、加班、未服务或 SLA 损害分别报告。
+- A 终态保存 input/result/failure manifest、Artifact 哈希清单和总清单哈希。所有读取和重放路径都会重算；篡改或缺失证据标记 `FAILED` 并移除 result。Schema v18 前的记录由关系列显式标记 `LEGACY_MIGRATED`，不能仅靠删除 JSON 字段降级。
 - 运营复盘初次进入只读取已有 A；用户显式点击才创建。成本与风险并行使用部分成功语义，任一失败不隐藏另一项结果。同步直接分析接口保留兼容但在 OpenAPI 标记 deprecated。
 
 ## 兼容与迁移
 
-- Schema v10 把技师浮点成本保值迁移为整数分；v11 增加命令发布键；v12 增加方案适用性投影；v13 增加持久经营分析记录；v14 增加分析运行终态恢复；v15 移除阻止显式 retry 的输入唯一约束；v16 增加容量反事实 Artifact；v17 增加 `(logical_analysis_id, attempt_number)` 唯一尝试表。
+- Schema v10 把技师浮点成本保值迁移为整数分；v11 增加命令发布键；v12 增加方案适用性投影；v13 增加持久经营分析记录；v14 增加分析运行终态恢复；v15 移除阻止显式 retry 的输入唯一约束；v16 增加容量反事实 Artifact；v17 增加唯一尝试表；v18 增加不可降级证明要求、风险比较、可编辑方案元数据、损坏记录隔离和适用性同步。
 - v1 旧方案历史缺少完整业务快照，按已确认的产品决定先生成时间戳备份再重建，当前业务数据保留。
 - 旧 `/schedules` 和同步经营分析接口继续兼容；同步分析接口内部也创建或复用持久 A，不再绕过审计。
 
@@ -90,5 +90,5 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - 决策分析绑定选中 V 的发布上下文、完整排程、行程、政策、算法和构建来源；显式事前分析允许在执行后复核，当前执行事件变化不能改变历史输入。
 - 容量中所有 `feasible` 结果通过完整反事实验证；成本周期逐项对账；风险遵循发布时间并使用准确统计标签。
 - 紧急命令中断恢复、人工改派三个持久阶段崩溃、PlanVersion payload 不变和历史稳定性谱系有回归测试。
-- Schema v1–v16 均迁移到 v17 并通过完整性与外键检查。
-- Ruff、Pyright、TypeScript、依赖审计、OpenAPI 快照、属性测试、后端与 React 测试、生产构建、Demo、Benchmark 和 Playwright 主流程通过后才能交付。
+- Schema v1–v17 均迁移到 v18 并通过完整性、Artifact 保全与外键检查。
+- Ruff、Pyright、ESLint、React Hooks、TypeScript、依赖一致性、依赖审计、OpenAPI 快照、属性测试、后端与 React 测试、生产构建、Demo、Benchmark 和 Playwright 主流程通过后才能交付。

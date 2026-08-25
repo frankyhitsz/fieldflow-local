@@ -3,7 +3,7 @@ import {
   AlertTriangle, BarChart3, Edit3, Plus, Save, ShieldCheck, Trash2, X, Zap,
 } from 'lucide-react'
 import { api } from './api'
-import type { CapacityAnalysis, CapacityCounterfactualArtifact, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, Scenario, Schedule, Technician, WorkOrder } from './types'
+import type { CapacityAnalysis, CapacityCounterfactualArtifact, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, Scenario, Schedule, SimulationScenarioSetArtifact, Technician, WorkOrder } from './types'
 
 const skillLabel: Record<string, string> = { electrical: '电气', hvac: '暖通', network: '网络' }
 const kindLabel = { baseline: '人工基线', optimized: '优化方案', replan: '局部重排' }
@@ -101,24 +101,28 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   const [horizonDays, setHorizonDays] = useState(1)
   const [decisionErrors, setDecisionErrors] = useState<string[]>([])
   const [retryableRuns, setRetryableRuns] = useState<DecisionAnalysisRun[]>([])
+  const [evidenceRuns, setEvidenceRuns] = useState<DecisionAnalysisRun[]>([])
+  const [planEvidence, setPlanEvidence] = useState<PlanVersion>()
   const [capacityAnalysisRunId, setCapacityAnalysisRunId] = useState<string>()
+  const [riskAnalysisRunId, setRiskAnalysisRunId] = useState<string>()
   const [capacityArtifact, setCapacityArtifact] = useState<CapacityCounterfactualArtifact>()
-  const [loadingExisting, setLoadingExisting] = useState(false)
+  const [riskScenarioArtifact, setRiskScenarioArtifact] = useState<SimulationScenarioSetArtifact>()
+  const [loadingExisting, setLoadingExisting] = useState(() => !!planVersionId)
   const [loadingDecision, setLoadingDecision] = useState(false)
   useEffect(() => {
     let cancelled = false
-    setCost(undefined); setRisk(undefined); setCapacity(undefined); setAnalysisNumbers({}); setDecisionErrors([]); setRetryableRuns([]); setCapacityAnalysisRunId(undefined); setCapacityArtifact(undefined)
     if (!planVersionId) return () => { cancelled = true }
-    setLoadingExisting(true)
-    api.analysisRuns(scenarioId, planVersionId)
-      .then(runs => {
+    Promise.all([api.analysisRuns(scenarioId, planVersionId), api.planVersion(scenarioId, planVersionId)])
+      .then(([runs, plan]) => {
         if (cancelled) return
+        setEvidenceRuns(runs); setPlanEvidence(plan)
         const latest = (type: DecisionAnalysisRun['analysis_type']) => [...runs].reverse().find(item => item.analysis_type === type && item.status === 'COMPLETED' && item.integrity_status !== 'FAILED' && item.result)
         const costRun = latest('COST') as DecisionAnalysisRun<CostAnalysis> | undefined
         const riskRun = latest('RISK') as DecisionAnalysisRun<RiskSimulation> | undefined
         const capacityRun = latest('CAPACITY') as DecisionAnalysisRun<CapacityAnalysis> | undefined
         setCost(costRun?.result || undefined); setRisk(riskRun?.result || undefined); setCapacity(capacityRun?.result || undefined)
         setCapacityAnalysisRunId(capacityRun?.id)
+        setRiskAnalysisRunId(riskRun?.id)
         setAnalysisNumbers({ cost: costRun?.number, risk: riskRun?.number, capacity: capacityRun?.number })
         const issues = runs.filter(item => item.status === 'FAILED' || item.status === 'INTERRUPTED' || item.integrity_status === 'FAILED')
         if (issues.length) {
@@ -161,7 +165,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
       if (retried.analysis_type === 'COST') {
         setCost(retried.result as CostAnalysis); setAnalysisNumbers(current => ({ ...current, cost: retried.number }))
       } else if (retried.analysis_type === 'RISK') {
-        setRisk(retried.result as RiskSimulation); setAnalysisNumbers(current => ({ ...current, risk: retried.number }))
+        setRisk(retried.result as RiskSimulation); setRiskAnalysisRunId(retried.id); setRiskScenarioArtifact(undefined); setAnalysisNumbers(current => ({ ...current, risk: retried.number }))
       } else {
         setCapacity(retried.result as CapacityAnalysis); setCapacityAnalysisRunId(retried.id); setAnalysisNumbers(current => ({ ...current, capacity: retried.number }))
       }
@@ -182,7 +186,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
       try { setCost(completedResult(costOutcome.value, '成本分析')); setAnalysisNumbers(current => ({ ...current, cost: costOutcome.value.number })) } catch (error) { rememberRetryable(costOutcome.value); errors.push(error instanceof Error ? error.message : '成本分析失败') }
     } else errors.push(costOutcome.reason instanceof Error ? costOutcome.reason.message : '成本分析失败')
     if (riskOutcome.status === 'fulfilled') {
-      try { setRisk(completedResult(riskOutcome.value, '风险分析')); setAnalysisNumbers(current => ({ ...current, risk: riskOutcome.value.number })) } catch (error) { rememberRetryable(riskOutcome.value); errors.push(error instanceof Error ? error.message : '风险分析失败') }
+      try { setRisk(completedResult(riskOutcome.value, '风险分析')); setRiskAnalysisRunId(riskOutcome.value.id); setRiskScenarioArtifact(undefined); setAnalysisNumbers(current => ({ ...current, risk: riskOutcome.value.number })) } catch (error) { rememberRetryable(riskOutcome.value); errors.push(error instanceof Error ? error.message : '风险分析失败') }
     } else errors.push(riskOutcome.reason instanceof Error ? riskOutcome.reason.message : '风险分析失败')
     setDecisionErrors(errors); setLoadingDecision(false)
   }
@@ -207,6 +211,20 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
       setDecisionErrors([error instanceof Error ? error.message : '读取容量证据失败'])
     }
   }
+  const showRiskScenarioArtifact = async () => {
+    if (!riskAnalysisRunId || !risk?.scenario_set_artifact_id) return
+    try {
+      const artifact = await api.decisionAnalysisArtifact(scenarioId, riskAnalysisRunId, risk.scenario_set_artifact_id)
+      if (artifact.artifact_type !== 'SIMULATION_SCENARIO_SET') throw new Error('该证据不是风险场景集')
+      setRiskScenarioArtifact(artifact)
+    } catch (error) {
+      setDecisionErrors([error instanceof Error ? error.message : '读取风险场景证据失败'])
+    }
+  }
+  const downloadEvidence = (name: string, payload: unknown) => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }))
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = name; anchor.click(); URL.revokeObjectURL(url)
+  }
   const breakdownLabels: Record<string, string> = { travel: '行程代价', sla_late: 'SLA 延迟代价', overtime: '加班代价', unassigned: '未分配代价', imbalance: '负载不均代价', replan_changes: '方案变更代价' }
   const cadenceLabel = { ONE_TIME: '一次性', PER_DAY: '每日', PER_SHIFT: '每班', PER_ORDER: '每单', PER_MONTH: '每月' }
   const unitLabel = { INVESTMENT: '项投入', PLAN_DAY: '个计划日', TECHNICIAN_SHIFT: '个技师班次/日', WORK_ORDER: '张工单/日', WORK_MONTH: '个工作月' }
@@ -224,13 +242,18 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     delta.overtime > 0 ? `加班增加 ${delta.overtime} 分钟` : delta.overtime < 0 ? `加班减少 ${-delta.overtime} 分钟` : '加班不变',
     delta.travel > 0 ? `行程增加 ${delta.travel} 分钟` : delta.travel < 0 ? `行程减少 ${-delta.travel} 分钟` : '行程不变',
   ] : []
+  const analysisScope = cost?.analysis_scope ?? risk?.analysis_scope ?? capacity?.analysis_scope
+  const remainingScope = analysisScope === 'PUBLICATION_REMAINING_PLAN'
   return <section className="page-view">
     <div className="page-title"><div><span className="eyebrow">OPERATIONS REVIEW</span><h1>运营复盘</h1><p>查看计算耗时、现场耗时，以及各项指标相对基线的变化。</p></div><span className="revision-badge">{strategyLabel[schedule.strategy]}策略</span></div>
     <div className="review-summary"><div><small>方案计算用时</small><b>{schedule.runtime_ms}<em> ms</em></b><p>生成本方案所用的时间。</p></div><div><small>业务评分</small><b>{schedule.business_score?.toLocaleString() ?? '—'}</b><p>{schedule.business_score_policy_version} 重算结果；求解器原始目标为 {schedule.solver_objective_value?.toLocaleString() ?? '—'}。</p></div><div><small>计划占用时间</small><b>{schedule.kpis.total_travel_minutes + schedule.kpis.total_waiting_minutes + schedule.kpis.total_service_minutes}<em> 分钟</em></b><p>计划行程、等待和服务时间合计，不代表实际工时。</p></div></div>
     {tradeoffs.length > 0 && <div className="tradeoff-card"><ShieldCheck size={20} /><div><h2>与基线相比</h2><p>{tradeoffs.join('；')}。方案排序依据为当前策略权重。</p></div></div>}
     <div className="review-grid"><article><h2>目标值构成</h2><div className="cost-bars">{Object.entries(schedule.objective_breakdown).map(([key, value]) => <div key={key}><span>{breakdownLabels[key] || key}</span><i><b style={{ width: `${value / maxCost * 100}%` }} /></i><strong>{Math.round(value)}</strong></div>)}</div></article><article><h2>技师工作量</h2>{schedule.kpis.technician.map(item => <div className="util-row" key={item.technician_id}><span>{item.technician_id}</span><i><b style={{ width: `${Math.min(100, item.utilization * 100)}%` }} /></i><strong>{pct(item.utilization)}</strong><small>{item.assignment_count} 单</small></div>)}</article></div>
     <div className="decision-head"><div><span className="eyebrow">DECISION SUPPORT</span><h2>经营决策测算</h2><p>分析绑定 V{String(cost?.plan_number ?? risk?.plan_number ?? schedule.version).padStart(3, '0')} 的冻结方案、旅行模型、政策与代码来源。进入页面只读取已有 A；点击生成才会新增记录，不会生成 D 或 V。</p></div><div className="decision-actions"><label>成本/容量周期（工作日）<input aria-label="分析工作日" type="number" min="1" max="365" value={horizonDays} onChange={event => setHorizonDays(Math.max(1, Math.min(365, Number(event.target.value) || 1)))} /></label><button disabled={!planVersionId || loadingDecision} onClick={runCostAndRisk}>生成成本与风险分析</button><label>容量参照<select aria-label="容量分析参照" value={capacityMode} onChange={event => { setCapacityMode(event.target.value as typeof capacityMode); setCapacity(undefined); setAnalysisNumbers(current => ({ ...current, capacity: undefined })) }}><option value="SELECTED_PLAN_DELTA">相对当前 V</option><option value="CONTROLLED_REOPTIMIZATION">相对同算法重算基线</option></select></label><button disabled={!planVersionId || loadingDecision} onClick={runCapacity}>测算六种容量方案</button></div></div>
-    <div className="decision-scope-banner"><ShieldCheck size={18} /><div><b>事前冻结计划分析，不含实际执行</b><span>不代表当前剩余预测。{Math.max(cost?.current_execution_watermark || 0, risk?.current_execution_watermark || 0, capacity?.current_execution_watermark || 0) > 0 ? ` 已绑定执行水位 ${Math.max(cost?.current_execution_watermark || 0, risk?.current_execution_watermark || 0, capacity?.current_execution_watermark || 0)}。` : ''}</span></div></div>
+    {planEvidence && <div className={`evidence-ledger ${(planEvidence.integrity_status || 'LEGACY_UNATTESTED').toLowerCase()}`}><div><b>V{String(planEvidence.number).padStart(3, '0')} 发布证明 · {planEvidence.integrity_status || 'LEGACY_UNATTESTED'}</b><span>{!planEvidence.attestation_requirement || planEvidence.attestation_requirement === 'LEGACY_MIGRATED' ? '迁移前历史记录，未达到当前证明标准。' : `发布清单 ${planEvidence.publication_manifest_hash?.slice(0, 12)}…`}</span></div><details><summary>查看 PublicationContext 与验证证据</summary><pre>{JSON.stringify({ publication_planning_context: planEvidence.publication_planning_context, publication_verification_artifact: planEvidence.publication_verification_artifact }, null, 2)}</pre></details><button onClick={() => downloadEvidence(`V${String(planEvidence.number).padStart(3, '0')}-publication-evidence.json`, planEvidence)}>下载证据</button></div>}
+    {evidenceRuns.some(run => run.attestation_requirement === 'LEGACY_MIGRATED') && <div className="decision-status legacy"><AlertTriangle size={16} />历史 A 记录来自证明制度启用前，可查看但不应与 VERIFIED 记录等同解释。</div>}
+    {evidenceRuns.length > 0 && <div className="analysis-ledger">{evidenceRuns.slice(-8).map(run => <details key={run.id} className={(run.integrity_status || 'LEGACY_UNATTESTED').toLowerCase()}><summary>A{String(run.number).padStart(3, '0')} · {run.analysis_type} · {run.integrity_status || 'LEGACY_UNATTESTED'}</summary><p>{run.analysis_scope} · {run.status} · input {run.input_hash ? `${run.input_hash.slice(0, 12)}…` : 'legacy'}</p><button onClick={() => downloadEvidence(`A${String(run.number).padStart(3, '0')}-manifest.json`, { input_manifest: run.input_manifest, result_manifest: run.result_manifest, failure_manifest: run.failure_manifest, artifact_manifest: run.artifact_manifest, runtime_manifest: run.runtime_manifest, analysis_manifest_hash: run.analysis_manifest_hash })}>下载 Manifest</button></details>)}</div>}
+    <div className="decision-scope-banner"><ShieldCheck size={18} /><div><b>{remainingScope ? '发布时剩余计划范围' : '完整冻结计划范围'}</b><span>{remainingScope ? '从重排发布时的路线入口开始，成本、容量和风险排除已冻结服务。' : '分析完整发布计划，不把查询时的新执行事实混入历史输入。'}{Math.max(cost?.current_execution_watermark || 0, risk?.current_execution_watermark || 0, capacity?.current_execution_watermark || 0) > 0 ? ` 已绑定发布执行水位 ${Math.max(cost?.current_execution_watermark || 0, risk?.current_execution_watermark || 0, capacity?.current_execution_watermark || 0)}。` : ''}</span></div></div>
     {!planVersionId && <div className="empty-view compact">当前显示的排程尚未对应公开版本，无法冻结经营测算输入。</div>}
     {loadingExisting && <div className="decision-status">正在读取已有分析记录…</div>}
     {loadingDecision && <div className="decision-status">正在生成冻结快照分析记录…</div>}
@@ -247,9 +270,12 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
       <article><small>风险调整后 SLA</small><b>{risk ? pct(risk.expected_sla_on_time_rate) : '—'}</b><p>{risk ? `模拟均值抽样区间 ${pct(risk.monte_carlo_mean_ci_low)}–${pct(risk.monte_carlo_mean_ci_high)} · A${String(analysisNumbers.risk).padStart(3, '0')}` : '—'}</p></article>
       <article><small>全日总迟到分钟 P95</small><b>{risk ? `${risk.full_day_total_late_minutes_p95} 分钟` : '—'}</b><p>P50 {risk?.full_day_total_late_minutes_p50 ?? '—'} · P90 {risk?.full_day_total_late_minutes_p90 ?? '—'} 分钟</p></article>
       <article><small>新增业务损害概率</small><b>{risk ? pct(risk.additional_disruption_probability) : '—'}</b><p>{risk ? `突发事件发生 ${pct(risk.emergency_event_probability)} · 实际致损 ${pct(risk.emergency_caused_failure_probability)} · 条件致损 ${pct(risk.emergency_failure_given_event_probability)}` : '—'}</p></article>
+      <article><small>技师缺勤</small><b>{risk ? pct(risk.absence_caused_failure_probability) : '—'}</b><p>{risk ? `事件发生 ${pct(risk.technician_absence_event_probability)} · 只有实际改变结果才计为致损` : '—'}</p></article>
     </div>}
+    {risk && <div className="risk-evidence-actions"><button disabled={!risk.scenario_set_artifact_id} onClick={showRiskScenarioArtifact}>查看共同随机场景集</button></div>}
+    {riskScenarioArtifact && <article className="tradeoff-card capacity-evidence" aria-live="polite"><ShieldCheck size={20} /><div><h2>风险共同场景集</h2><p>完整性：{riskScenarioArtifact.integrity_status} · {riskScenarioArtifact.trials} trials · 突发事件 {riskScenarioArtifact.emergency_events.length} 个 · 指纹 {riskScenarioArtifact.scenario_set_hash.slice(0, 12)}…</p><details><summary>查看外生参数与事件样例</summary><pre>{JSON.stringify({ exogenous_parameters: riskScenarioArtifact.exogenous_parameters, emergency_events: riskScenarioArtifact.emergency_events.slice(0, 20) }, null, 2)}</pre></details><button onClick={() => downloadEvidence('risk-scenario-set.json', riskScenarioArtifact)}>下载场景集</button><button onClick={() => setRiskScenarioArtifact(undefined)}>关闭证据</button></div></article>}
     {capacity && <div className="capacity-table-wrap"><div className="capacity-reference"><b>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '相对当前 V · 尾部追加' : '相对同算法重算基线'}</b><span>{capacity.reference_mode === 'SELECTED_PLAN_DELTA' ? '保留现有 assignment，仅在路线尾部追加；这不是完整插入优化。' : '基准和选项使用相同贪心政策。'}{analysisNumbers.capacity ? ` · A${String(analysisNumbers.capacity).padStart(3, '0')}` : ''} · {capacity.analysis_horizon.days} 个工作日</span></div><table className="capacity-table"><thead><tr><th>容量方案</th><th>可执行性</th><th>完成率改善</th><th>SLA 改善</th><th>周期总影响</th><th>固定成本口径</th><th>证据</th></tr></thead><tbody>{capacity.options.map(item => <tr key={item.option_id} className={item.feasible ? '' : 'capacity-invalid'}><td><b>{item.name}</b><small>{item.assumption}</small></td><td>{item.feasible ? '可执行' : item.option_applicable ? '不可执行' : '不适用'}{item.violations.length ? <details><summary>{item.violations.length} 项违规</summary><ul>{item.violations.map((violation, index) => <li key={`${violation.code}-${index}`}>{violation.message}</li>)}</ul></details> : <small>完整约束校验通过</small>}</td><td>{pp(item.completion_improvement_percentage_points)}</td><td>{pp(item.sla_improvement_percentage_points)}</td><td>{item.horizon_total_impact_cents == null ? '—' : money(item.horizon_total_impact_cents)}</td><td>{cadenceLabel[item.fixed_cost_cadence]} {money(item.fixed_capacity_cost_cents)}<small>{item.cost_units_per_day} {unitLabel[item.cost_unit_type]}</small><small>{item.economic_impact_offset_days == null ? '无可计算经济影响抵消点' : `${item.economic_impact_offset_days} 日抵消经济影响`}</small></td><td><button disabled={!item.artifact_id} onClick={() => item.artifact_id && showCapacityArtifact(item.artifact_id)}>查看证据</button></td></tr>)}</tbody></table><p className="decision-note">不可执行方案只保留诊断路线与违规，不展示正式收益；经济影响抵消天数包含模拟损失改善，不等同于现金回本。</p></div>}
-    {capacityArtifact && <article className="tradeoff-card capacity-evidence" aria-live="polite"><ShieldCheck size={20} /><div><h2>{capacityArtifact.option_id} 反事实证据</h2><p>完整性：{capacityArtifact.integrity_status} · 指纹 {capacityArtifact.artifact_hash.slice(0, 12)}… · 内部分配 {capacityArtifact.counterfactual_kpis?.internal_assignment_count ?? '—'} · 外部承接 {capacityArtifact.counterfactual_kpis?.external_assignment_count ?? 0} · 未服务 {capacityArtifact.counterfactual_kpis?.unserved_count ?? '—'}</p>{capacityArtifact.external_assignments.length > 0 && <details><summary>外部承接清单（{capacityArtifact.external_assignments.length}）</summary><ul>{capacityArtifact.external_assignments.map(item => <li key={item.work_order_id}>{item.work_order_id} · {item.provider_id} · {item.assumed_on_time ? '假设 SLA 内完成' : '未承诺准时'}</li>)}</ul></details>}<button onClick={() => setCapacityArtifact(undefined)}>关闭证据</button></div></article>}
+    {capacityArtifact && <article className="tradeoff-card capacity-evidence" aria-live="polite"><ShieldCheck size={20} /><div><h2>{capacityArtifact.option_id} 反事实证据</h2><p>完整性：{capacityArtifact.integrity_status} · 指纹 {capacityArtifact.artifact_hash.slice(0, 12)}… · 内部分配 {capacityArtifact.counterfactual_kpis?.internal_assignment_count ?? '—'} · 外部承接 {capacityArtifact.counterfactual_kpis?.external_assignment_count ?? 0} · 未服务 {capacityArtifact.counterfactual_kpis?.unserved_count ?? '—'}</p>{capacityArtifact.external_assignments.length > 0 && <><p className="external-assumption-warning"><b>供应商容量未验证</b>承接数量和 SLA 仅是测算假设；没有供应商确认的开始、完成时间，不能作为现场承诺。</p><details><summary>外部承接清单（{capacityArtifact.external_assignments.length}）</summary><ul>{capacityArtifact.external_assignments.map(item => <li key={item.work_order_id}>{item.work_order_id} · {item.provider_id} · {item.capacity_verified ? '容量已验证' : '容量未验证'} · {item.assumed_on_time ? '假设 SLA 内完成' : '未承诺准时'}</li>)}</ul></details></>}<button onClick={() => setCapacityArtifact(undefined)}>关闭证据</button></div></article>}
   </section>
 }
 

@@ -1,52 +1,53 @@
 # FieldFlow Local 任务记录
 
-更新时间：2026-08-24
+更新时间：2026-08-25
 
 ## 本轮目标
 
-逐条复核新版 `pro-plan.md`，完成 v0.5.4 的 FF-1101～FF-1109。能在现有单机架构内闭环的建议直接实现；需要新运行时或新领域数据的 M1～M4 项保留到对应版本，不添加无法工作的占位类型。
+逐条复核 `pro-plan.md` 的 P0/P1/P2 和 FF-1201～FF-1283。v0.5.5 必须完成决策证据与语义正确性的 M0 门禁；能在现有本地单机契约内安全完成的高优先级项一并修复。需要新 worker、业务实体、外部数据、许可证或仓库治理决策的项目留下具体边界，不创建占位实现。
 
-## 第一轮：发布上下文、外部覆盖与共同场景
+## 第一轮：证明链和失败关闭
 
-- [x] replan V 保存 `PublicationPlanningContext`：每位技师的 route entry、可用时间、返回点、发布执行水位、来源方案和冻结分配身份。
-- [x] 发布清单绑定场景快照、正式排程、PlanningContext 和发布验证 Artifact；上下文篡改会阻止分析。
-- [x] 风险从历史 route entry 开始；selected-plan 容量复核使用同一入口；replan 的受控重算稳定返回 `REPLAN_CONTROLLED_REOPTIMIZATION_NOT_SUPPORTED`。
-- [x] 旧 replan 仅保留带警告的成本分析，容量和风险返回 `REPLAN_ANALYSIS_CONTEXT_NOT_AVAILABLE`。
-- [x] 外包反事实增加 `ExternalAssignment`、逐工单 disposition、外部 SLA 假设和统一 KPI；Formal result 绑定 Artifact 哈希。
-- [x] 共同随机场景先于计划生成，突发目标不依赖已用路线，并冻结事件时间、位置、时长和技能；新增配对风险比较接口及场景集 Artifact。
+- [x] Schema v18 为 Plan、A、Artifact 增加不可降级的关系型证明要求；旧数据显式迁移为 Legacy。
+- [x] POST 重放、GET、列表、同步兼容接口、retry、rerun 和风险比较统一使用校验读取路径。
+- [x] 新增 input/result/failure/runtime manifest，绑定请求、政策、上下文、快照、排程、旅行模型、依赖环境和错误。
+- [x] 损坏或缺证据的 required 记录进入 `FAILED`，不再向调用方返回 result。
+- [x] 修复旧唯一约束迁移丢失 Decision Artifact 的路径，并增加真实 v14 Artifact 保全样本。
+- [x] 损坏 JSON 使用 `json_valid` 隔离、quarantine 和稳定 409，不再静默成为可信记录。
 
-## 第二轮：重试、证明链和成本来源
+## 第二轮：重排、风险和命令恢复
 
-- [x] 精确 retry 校验原 build、发布上下文、旅行模型、排程和请求；运行时漂移返回稳定冲突并提示 current rerun。
-- [x] current rerun 创建新的 logical analysis 并保存 `supersedes_analysis_id`，不冒充 retry。
-- [x] Schema v17 增加 `(logical_analysis_id, attempt_number)` 唯一表；attempt 在 `BEGIN IMMEDIATE` 事务内分配，重试幂等键合并双击。
-- [x] A 终态保存 result hash、Artifact manifest 和 analysis manifest；读取时检测结果篡改、Artifact 篡改或缺失，旧 A 标记 `LEGACY_UNATTESTED`。
-- [x] 发布时保存 Candidate、PlanningContext、事务复核报告、验证政策和正式排程哈希；分析、报告和历史激活统一验证。
-- [x] 新增技师成本显式区分 `WAGE_ONLY`、`FIXED_ONLY`、`WAGE_PLUS_FIXED`；外包费用只从成本政策或容量政策二选一。
+- [x] 普通方案统一使用完整冻结范围；重排成本、容量、风险统一使用发布时剩余范围和同一排程签名。
+- [x] 容量尾部追加在空未来路线下仍使用 route entry 的位置、可用时间和返回点。
+- [x] 风险事件先独立生成再选择承接技师；空闲技师计算出发、服务、返程和加班。
+- [x] 缺勤/突发“发生”与“造成损害”分开，保存 trial 证据；配对比较持久化差值区间和 win/tie/loss。
+- [x] exact retry 与 current rerun 都使用持久幂等命令协议；修复命令已预留但 A 未绑定时重启卡死。
+- [x] 人工改派锁使用引用计数回收；启动只对账所属分析命名空间。
 
-## 第三轮：API、界面和边界审计
+## 第三轮：数据语义、界面和工程门禁
 
-- [x] deprecated 同步分析接口内部创建/复用 A，不再绕过审计。
-- [x] 前端 `ApiError` 保留 status、code 和 details；RUNNING A 自动轮询，不再把 202 当失败终态。
-- [x] 容量表可读取 Artifact，展示完整性、内部/外部/未服务计数和外部承接清单。
-- [x] 补充 route-entry 历史一致性、受控重算拒绝、外包 Artifact、计划无关随机事件、配对比较、并发 retry、运行时漂移、结果/Artifact 篡改、Legacy 证明和成本来源测试。
-- [x] 额外发现并修正风险仿真中突发事件只在班次起点加固定延迟的简化：现在按冻结事件时间和位置插入行程与服务时长。
-- [x] `make verify` 除本机 Chromium SIGTRAP 外全部通过；API Playwright 1 项通过，三轮 auto-review 记录已更新。核心提交 `9d4f613` 的 GitHub Actions `32742927633` 已由 Linux Playwright 补证。
+- [x] 公共实验评分保存完整政策快照；公平 KPI 增加归一化最小/最大负载。
+- [x] Booking ID、客户窗口迟到和相对计划偏差分别保存；旧字段保留读取兼容。
+- [x] 方案名称迁入 `plan_metadata`；`plan_applicability` 成为当前方案权威并同步场景缓存。
+- [x] 跨业务快照比较不再返回误导性 delta；哈希规范增加版本和 Unicode NFC。
+- [x] 外包证据明确容量、起止时间和 SLA 未验证，界面不把测算假设显示为承诺。
+- [x] 运营复盘增加 Plan/A 完整性、RuntimeManifest、发布上下文、场景集和下载入口。
+- [x] 加入 ESLint/React Hooks、局部 strict Pyright、85% 覆盖门槛、Python 依赖一致性检查和固定 SHA 的 GitHub Actions。
+- [x] `docs/pro-plan-v0.5.4-assessment.md` 逐项记录完成、部分完成、反驳和所有者决策。
 
-## 经复核不在 v0.5.4 实现
+## 必须保持为后续范围
 
-- M1 的持久 Job Queue、子进程硬取消、Lease、完整依赖注入、三类 D 修订、严格不可变展示元数据、Location/Depot 实体、显式迁移 CLI 和数据生命周期需要运行时或存储契约升级。
-- M2 的 Booking、工单收件箱、技师端、资产、库存、通知和 Crew 需要新的业务实体，不能用现有 assignment 伪装。
-- M3/M4 的执行感知预测、多日模型、正式 Benchmark、许可证和分支治理按路线图保留；许可证及仓库治理必须由仓库所有者选择。
+- FF-1220～FF-1224、FF-1228：持久 Job Queue、Outbox、独立求解子进程、硬取消、完整依赖注入和运维 CLI 需要运行架构升级。
+- FF-1240～FF-1250：收件箱、完整 Booking、技师端、资产、周期维护、库存、通知和导入导出需要新的业务实体与数据来源。
+- FF-1260～FF-1266：incurred/实时 remaining、多日、组合容量和校准风险模型需要执行历史或模型版本升级。
+- FF-1280～FF-1283：正式 Benchmark、许可证、治理、单一锁工具和发布材料分别需要独立验证或仓库所有者决定。
 
-## 当前验证
+## 验证状态
 
-```text
-Ruff / Pyright                     通过
-决策测试                           59 passed
-后端完整测试                       188 passed；coverage 90.10%
-React 组件                         10 passed
-TypeScript / 生产构建              通过
-完整 make verify                   lint/audit/test/build/demo/benchmark 通过；本机页面 Chromium SIGTRAP
-GitHub Actions 32742927633         python-compat / fieldflow 全部 success
-```
+- [x] P0/P1 定向故障注入和迁移测试：通过；迁移触发器与 WAL 初始化回归已发现并修复。
+- [x] React 组件 10 项、ESLint、TypeScript 和生产构建：通过。
+- [x] 后端完整测试：203 passed；coverage 89.84%，85% 门槛通过。
+- [x] Ruff、Pyright、ESLint、React Hooks、TypeScript、OpenAPI、依赖一致性与 Python/npm 审计：通过。
+- [x] React 10 项、生产构建、Demo、Benchmark 和 Playwright API 主流程：通过。
+- [ ] Playwright 页面 4 项：本机 Chromium/Google Chrome 均在页面测试启动时被 macOS 以 SIGTRAP/SIGABRT 终止，未进入断言；等待 GitHub Linux CI 补证。
+- [ ] GitHub Actions：提交后确认最新工作流通过。

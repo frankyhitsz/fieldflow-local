@@ -1399,7 +1399,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
