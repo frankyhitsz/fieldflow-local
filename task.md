@@ -35,7 +35,7 @@
 - [x] React 组件 10 项、ESLint、TypeScript 和生产构建第一轮：通过。
 - [x] 第二轮：`make lint`、89.53% 覆盖率、组件、构建、Demo、Benchmark 和依赖审计通过；修复 benchmark 仍构造旧式 Plan 的回归。
 - [x] 第三轮：关系型 A 身份复核发现并补齐 started_at/Plan/type 交叉验证；Playwright API lifecycle 通过。本机 Chromium/Chrome 页面进程受 SIGTRAP/SIGABRT 限制，完整 5 项由 GitHub Linux CI 复核。
-- [ ] GitHub Actions：推送后确认 Python 3.11、完整 fieldflow 和 Playwright 均通过。
+- [x] GitHub Actions #38：Python 3.11 与完整 fieldflow 作业通过；Linux Playwright 5/5 通过。
 
 ## 逐条裁决边界
 
