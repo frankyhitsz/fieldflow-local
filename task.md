@@ -33,7 +33,7 @@
 - [x] React 组件 10 项、ESLint、TypeScript、生产构建通过。
 - [x] Demo、Benchmark、pip-audit、npm production audit 通过；Playwright API lifecycle 通过。
 - [x] 独立缺陷审计后修复严格 trial 类型、前端范围指标 mock、inactive 适用性投影和兼容锁定语义；`make verify` 除本机 Chromium 启动 SIGTRAP 外均通过，4 个页面用例未进入测试代码，交由 Linux CI 复核。
-- [ ] 提交并推送 `main`，等待 GitHub Actions 全部通过。
+- [x] 提交 `530754e` 并推送 `main`；GitHub Actions #40 的 Python 3.11 和完整 fieldflow 作业均通过，Linux Playwright 5/5 通过。
 
 ## 裁决边界
 
