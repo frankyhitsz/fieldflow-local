@@ -71,4 +71,4 @@ P1-10、P1-16 至 P1-20 的共同前置条件是持久运行时或维护工具�
 - FF-1609：零路线完整诊断不再被空候选规则误杀。
 - FF-1610：状态机测试保留，定向 mutation smoke 扩展到 8 个关键不变量。
 
-最终测试数量和 GitHub Actions 链接在 `task.md` 通过后更新；未通过的门禁不会写成完成。
+最终验收由 [GitHub Actions #48](https://github.com/frankyhitsz/fieldflow-local/actions/runs/32850088559) 完成：Python 3.11 兼容任务与 Python 3.12 完整任务均通过；后端 254 项、覆盖率 89.74%，定向 mutation 8/8、React 14 项、Playwright 5/5，静态检查、依赖审计、构建、Demo 和 Benchmark 同步通过。

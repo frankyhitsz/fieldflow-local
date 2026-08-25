@@ -30,7 +30,7 @@
 - [x] 增加完整 Python 传递依赖锁，决策代码指纹缩小到实际决策模块，旧 v1 CAS 写接口声明 2027-03-31 Sunset。
 - [x] GitHub 的 Python 3.11 门禁发现 `numpy==2.5.2` 只支持 Python 3.12+；锁文件收敛到 3.11–3.13 共用的 `numpy==2.4.6`，并通过目标平台解析、全新 Python 3.13 环境安装、`pip check` 和 254 项后端测试。
 - [x] Mutation smoke 从 4 个扩展为 8 个定向 mutant，新增执行事件、活动 V CAS、修订证明、零随机投影、唯一计数和当前需求界面回归。
-- [ ] 完成最终 lint、类型检查、依赖审计、全量后端/前端/E2E、Demo、Benchmark 和 GitHub Actions 验证。
+- [x] 完成最终 lint、类型检查、依赖审计、全量后端/前端/E2E、Demo、Benchmark 和 GitHub Actions 验证。GitHub Actions #48 的 Python 3.11 与完整 `fieldflow` job 均通过：后端 254 项、覆盖率 89.74%，mutation 8/8、React 14 项、Playwright 5/5。
 
 逐项裁决见 `docs/pro-plan-v0.5.9-assessment.md`。
 
