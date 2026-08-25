@@ -4,6 +4,7 @@ __pycache__/
 .hypothesis/
 .coverage
 *.pyc
+*.egg-info/
 *.db
 node_modules/
 dist/

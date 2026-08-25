@@ -37,6 +37,7 @@
 - [x] Python 依赖改为 `pyproject.toml` 单一来源，安装与审计不再读取第二份清单。
 - [x] 独立审计修复事件后仍读取服务中未来时长、v20 坏 JSON 迁移、编辑请求携带只读字段、Demo 突发单旧 payload、新增容量误标陈旧、执行事件消费门禁和依赖审计范围。
 - [x] 完整后端 243 项通过，覆盖率 89.75%；React 13 项、构建、Demo、Benchmark、静态检查、OpenAPI/生成类型、依赖审计和 4/4 mutation smoke 通过。
+- [x] GitHub Actions #42 暴露干净 editable install 的 setuptools 顶层包误发现；`pyproject.toml` 现明确只打包 `backend`，并用全新虚拟环境验证安装元数据。
 - [ ] Playwright 页面流程与最终 `make verify`：本机 macOS 浏览器进程在进入页面测试前被环境以 SIGTRAP/SIGABRT 终止；API lifecycle 已通过，待 GitHub Linux CI 完成页面断言。
 - [x] 完成 v0.5.8 对 P0/P1/P2 的逐项裁决文档；未把新领域模型、持久任务或仓库治理写成已完成。
 - [x] 三轮独立审计记录已写入本地 `review-stage`；该目录按项目约定不提交。
