@@ -65,14 +65,21 @@ function SolverBadge({ schedule }: { schedule?: Schedule }) {
   return <span className={`solver-badge ${statusClass}`} title={schedule.solver_note}><span />{solverStatusLabel[schedule.solver_status]} · {schedule.runtime_ms} ms</span>
 }
 
-function KpiStrip({ schedule, baseline }: { schedule?: Schedule; baseline?: Schedule }) {
+function KpiStrip({ scenario, schedule, baseline }: { scenario: Scenario; schedule?: Schedule; baseline?: Schedule }) {
   const k = schedule?.kpis
+  const assignedIds = new Set(schedule?.assignments.map(item => item.work_order_id))
+  const publishedUnassignedIds = new Set(schedule?.unassigned.map(item => item.work_order_id))
+  const currentDemand = scenario.work_orders.filter(item => item.status !== 'completed')
+  const currentAssigned = currentDemand.filter(item => assignedIds.has(item.id)).length
+  const uncovered = currentDemand.filter(item => !assignedIds.has(item.id) && !publishedUnassignedIds.has(item.id))
+  const currentUnserved = currentDemand.length - currentAssigned
+  const currentHighPriorityMissed = currentDemand.filter(item => !assignedIds.has(item.id) && ['urgent', 'high'].includes(item.priority)).length
   const metrics = [
-    { label: '计划覆盖率', value: k ? pct(k.completion_rate) : '—', sub: k ? `${schedule!.assignments.length} / ${schedule!.assignments.length + k.unassigned_count} 单已排入计划` : '尚未排程', icon: Check },
-    { label: '计划 SLA 达成率', value: k ? pct(k.committed_on_time_rate) : '—', sub: k ? `已排工单计划按时率 ${pct(k.assigned_on_time_rate)}` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count || !!k?.unassigned_count },
+    { label: '当前需求已排率', value: k && currentDemand.length ? pct(currentAssigned / currentDemand.length) : k ? '100%' : '—', sub: k ? uncovered.length ? `${uncovered.length} 单新增需求尚未进入 V${String(schedule!.version).padStart(3, '0')}` : `${currentAssigned} / ${currentDemand.length} 单已排入当前路线` : '尚未排程', icon: Check, warn: currentUnserved > 0 },
+    { label: '冻结方案 SLA', value: k ? pct(k.committed_on_time_rate) : '—', sub: k ? `仅对应 V${String(schedule!.version).padStart(3, '0')} 发布时需求；已排工单 ${pct(k.assigned_on_time_rate)}` : '尚未计算', icon: Gauge, warn: !!k?.sla_late_count || currentUnserved > 0 },
     { label: '总行程', value: k ? `${k.total_travel_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_travel_minutes - baseline.kpis.total_travel_minutes : null, icon: Route },
     { label: '总加班', value: k ? `${k.total_overtime_minutes}` : '—', unit: '分钟', delta: baseline && schedule && schedule.id !== baseline.id ? k!.total_overtime_minutes - baseline.kpis.total_overtime_minutes : null, icon: Clock3 },
-    { label: '未分配', value: k ? `${k.unassigned_count}` : '—', unit: '工单', sub: k ? `${k.high_priority_missed} 单高优先级` : '尚未计算', icon: AlertTriangle, warn: !!k?.unassigned_count },
+    { label: '当前待排', value: k ? `${currentUnserved}` : '—', unit: '工单', sub: k ? `${currentHighPriorityMissed} 单高优先级${uncovered.length ? ` · ${uncovered.length} 单未被当前 V 覆盖` : ''}` : '尚未计算', icon: AlertTriangle, warn: currentUnserved > 0 },
     { label: schedule?.kind === 'replan' ? '重排稳定率' : '占用利用率', value: k ? (schedule?.kind === 'replan' && k.stability_rate != null ? pct(k.stability_rate) : pct(k.average_occupied_utilization)) : '—', sub: schedule?.kind === 'replan' ? `原技师 ${k?.same_technician_rate == null ? '—' : pct(k.same_technician_rate)}` : '行程 + 等待 + 服务 ÷ 可用时间', icon: TimerReset },
   ]
   return <section className="kpi-strip" aria-label="关键业务指标">
@@ -88,12 +95,13 @@ function OrderQueue({ scenario, schedule, selectedId, onSelect, onAdd }: { scena
   const [tab, setTab] = useState<'risk' | 'all'>('risk')
   const assignmentMap = new Map(schedule?.assignments.map(a => [a.work_order_id, a]))
   const unassignedMap = new Map(schedule?.unassigned.map(u => [u.work_order_id, u]))
+  const uncovered = new Set(schedule ? scenario.work_orders.filter(order => order.status !== 'completed' && !assignmentMap.has(order.id) && !unassignedMap.has(order.id)).map(order => order.id) : [])
   const ranked = [...scenario.work_orders].sort((a, b) => {
-    const au = unassignedMap.has(a.id) ? 0 : assignmentMap.get(a.id)?.sla_late_minutes ? 1 : 2
-    const bu = unassignedMap.has(b.id) ? 0 : assignmentMap.get(b.id)?.sla_late_minutes ? 1 : 2
+    const au = uncovered.has(a.id) ? 0 : unassignedMap.has(a.id) ? 1 : assignmentMap.get(a.id)?.sla_late_minutes ? 2 : 3
+    const bu = uncovered.has(b.id) ? 0 : unassignedMap.has(b.id) ? 1 : assignmentMap.get(b.id)?.sla_late_minutes ? 2 : 3
     return au - bu || a.sla_deadline - b.sla_deadline
   })
-  const visible = tab === 'all' || !schedule ? ranked : ranked.filter(order => unassignedMap.has(order.id) || !!assignmentMap.get(order.id)?.sla_late_minutes)
+  const visible = tab === 'all' || !schedule ? ranked : ranked.filter(order => uncovered.has(order.id) || unassignedMap.has(order.id) || !!assignmentMap.get(order.id)?.sla_late_minutes)
   return <section className="queue panel">
     <div className="panel-heading"><div><span className="eyebrow">WORK ORDERS</span><h2>工单队列</h2></div><div className="heading-actions"><span className="count">{scenario.work_orders.length}</span><button className="mini-add" onClick={onAdd} aria-label="新增工单"><Plus size={13} /></button></div></div>
     <div className="queue-tabs"><button className={tab === 'risk' ? 'active' : ''} onClick={() => setTab('risk')}>风险优先</button><button className={tab === 'all' ? 'active' : ''} onClick={() => setTab('all')}>全部</button></div>
@@ -101,10 +109,11 @@ function OrderQueue({ scenario, schedule, selectedId, onSelect, onAdd }: { scena
       {visible.map(order => {
         const assignment = assignmentMap.get(order.id)
         const unassigned = unassignedMap.get(order.id)
-        return <button className={`order-card ${selectedId === order.id ? 'selected' : ''} ${unassigned ? 'unassigned' : ''}`} key={order.id} onClick={() => onSelect(order.id)}>
+        const isUncovered = uncovered.has(order.id)
+        return <button className={`order-card ${selectedId === order.id ? 'selected' : ''} ${unassigned || isUncovered ? 'unassigned' : ''}`} key={order.id} onClick={() => onSelect(order.id)}>
           <span className={`priority ${order.priority}`}>{priorityLabel[order.priority]}</span>
           <div className="order-main"><div className="order-id">{order.id}{order.is_emergency && <span className="emergency-tag">突发</span>}{order.vip && <span className="vip">VIP</span>}</div><strong>{order.customer_name}</strong><small>{order.title}</small></div>
-          <div className="order-meta"><span><Clock3 size={12} />{hhmm(order.window_start)}–{hhmm(order.window_end)}</span><span className={unassigned ? 'danger' : assignment?.sla_late_minutes ? 'danger' : ''}>{unassigned ? '待处理' : assignment ? `${hhmm(assignment.start_time)} 开始` : '未排程'}</span></div>
+          <div className="order-meta"><span><Clock3 size={12} />{hhmm(order.window_start)}–{hhmm(order.window_end)}</span><span className={unassigned || isUncovered ? 'danger' : assignment?.sla_late_minutes ? 'danger' : ''}>{isUncovered ? '新增未纳入当前方案' : unassigned ? '待处理' : assignment ? `${hhmm(assignment.start_time)} 开始` : '未排程'}</span></div>
         </button>
       })}
       {!visible.length && <div className="queue-empty"><Check size={18} /><strong>当前没有风险工单</strong><span>所有已分配工单均满足 SLA。</span></div>}
@@ -115,7 +124,8 @@ function OrderQueue({ scenario, schedule, selectedId, onSelect, onAdd }: { scena
 function RouteMap({ scenario, schedule, selectedId, onSelect }: { scenario: Scenario; schedule?: Schedule; selectedId?: string; onSelect: (id: string) => void }) {
   const orderMap = new Map(scenario.work_orders.map(o => [o.id, o]))
   const assignedMap = new Map(schedule?.assignments.map(a => [a.work_order_id, a]))
-  const unassigned = new Set(schedule?.unassigned.map(u => u.work_order_id))
+  const publishedUnassigned = new Set(schedule?.unassigned.map(u => u.work_order_id))
+  const unassigned = new Set(scenario.work_orders.filter(order => order.status !== 'completed' && (!assignedMap.has(order.id) || publishedUnassigned.has(order.id))).map(order => order.id))
   const routes = scenario.technicians.map(tech => ({
     tech,
     assignments: (schedule?.assignments.filter(a => a.technician_id === tech.id && orderMap.has(a.work_order_id)) || []).sort((a, b) => a.sequence - b.sequence),
@@ -524,12 +534,12 @@ export default function App() {
     </section>
     {!schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务数据已修改，现有方案不再适用</strong><span>生成基线或推荐方案后再开始派单。</span></div></div>}
     {partialCoverage && schedule && <div className="stale-banner partial"><AlertTriangle size={16} /><div><strong>{uncoveredEmergency ? '紧急需求已保存，最后发布方案尚未覆盖' : '新增需求尚未进入最后发布方案'}</strong><span>V{String(schedule.version).padStart(3, '0')} 的原有承诺仍可查看；当前有 {uncoveredDemand.length} 张新工单待排，请尽快局部重排。</span></div></div>}
-    {routeInvalidated && schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务变更影响了已发布路线</strong><span>V{String(schedule.version).padStart(3, '0')} 仅保留用于核对；请先局部重排再继续派单。</span></div></div>}
+      {routeInvalidated && schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务变更影响了部分已发布安排</strong><span>已标记的失效工单暂停开工；其他仍通过校验的承诺可以继续执行。局部重排可恢复完整路线。</span></div></div>}
     {reoptimizationAvailable && !partialCoverage && schedule && <div className="stale-banner partial"><WandSparkles size={16} /><div><strong>新增技师容量可用于优化</strong><span>现有路线仍可执行；重新优化后才能把新增容量纳入方案和指标。</span></div></div>}
     {metricsOutdated && !partialCoverage && !routeInvalidated && !reoptimizationAvailable && schedule && <div className="stale-banner partial"><CalendarDays size={16} /><div><strong>现有路线仍可执行，展示指标已过期</strong><span>业务目标、成本或未分配需求发生变化；请重新优化以更新指标。</span></div></div>}
     {executionProgress && <div className="stale-banner partial"><Clock3 size={16} /><div><strong>现场执行状态已更新</strong><span>V{String(schedule.version).padStart(3, '0')} 仍是当前执行依据；局部重排会保留服务中的安排，并排除已完成工单。</span></div></div>}
     {!displayingActivePlan && !executionProgress && schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
-    <KpiStrip schedule={schedule} baseline={baseline} />
+        <KpiStrip scenario={shownScenario} schedule={schedule} baseline={baseline} />
     <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
     <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / {skillCount} 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
   </>

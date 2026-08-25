@@ -91,6 +91,7 @@ from .models import (
     StrategyProfile,
     StrategyProfileCreate,
     Technician,
+    TechnicianCreate,
     TechnicianUpdate,
     WorkOrder,
     WorkOrderCreate,
@@ -611,6 +612,7 @@ def start_schedule_run(
     started_at: str | None = None,
 ) -> ScheduleRun:
     requested_ms = int(round(requested_time_limit_seconds * 1000))
+    active_plan = require_store().active_plan_version(scenario.id)
     run = ScheduleRun(
         id=run_id or f"RUN-{uuid.uuid4().hex[:12]}",
         scenario_id=scenario.id,
@@ -619,6 +621,7 @@ def start_schedule_run(
         scenario_snapshot_hash=content_hash(scenario),
         source_plan_version_id=source.id if source else None,
         source_plan_snapshot_hash=source.scenario_snapshot_hash if source else None,
+        expected_active_plan_version_id=active_plan.id if active_plan else None,
         solver_name=solver_name,
         solver_version="pending",
         solver_config_hash=solver_config_hash or content_hash(scenario.solver_config),
@@ -785,6 +788,7 @@ def publish_selected(
         scenario_revision=scenario.revision,
         scenario_snapshot_hash=content_hash(scenario),
         source_plan_version_id=source.id if source else None,
+        expected_active_plan_version_id=run.expected_active_plan_version_id,
         solver_config_hash=result.solver_config_hash,
         solver_policy_fingerprint=result.solver_policy.fingerprint if result.solver_policy else "",
         schedule=result,
@@ -1153,7 +1157,7 @@ def delete_work_order(
 @router.post("/api/v2/scenarios/{scenario_id}/technicians", response_model=ScheduleScenario)
 def create_technician(
     scenario_id: str,
-    technician: Technician,
+    technician: TechnicianCreate,
     http_request: Request,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ScheduleScenario:
@@ -1161,7 +1165,7 @@ def create_technician(
     validate_if_match_revision(scenario, if_match, required=http_request.url.path.startswith("/api/v2/"))
     if any(item.id == technician.id for item in scenario.technicians):
         raise HTTPException(409, f"技师 {technician.id} 已存在")
-    scenario.technicians.append(technician)
+    scenario.technicians.append(Technician.model_validate(technician.model_dump(mode="python")))
     return save_scenario_change(scenario, f"新增技师 {technician.id}", impact=FieldImpact.capacity_added)
 
 
@@ -3331,25 +3335,45 @@ def schedule_change_rows(
 ) -> list[dict[str, str | int | None]]:
     before_by_id = {item.work_order_id: item for item in before.assignments}
     after_by_id = {item.work_order_id: item for item in after.assignments}
+    before_unassigned = {item.work_order_id: item.reason.value for item in before.unassigned}
+    after_unassigned = {item.work_order_id: item.reason.value for item in after.unassigned}
     changed: list[dict[str, str | int | None]] = []
-    for order_id in sorted(set(before_by_id) | set(after_by_id)):
+    for order_id in sorted(set(before_by_id) | set(after_by_id) | set(before_unassigned) | set(after_unassigned)):
         old = before_by_id.get(order_id)
         new = after_by_id.get(order_id)
-        if (
-            not old
-            or not new
-            or old.technician_id != new.technician_id
-            or old.sequence != new.sequence
-            or old.start_time != new.start_time
-        ):
+        old_values = {
+            "disposition": "ASSIGNED" if old else f"UNASSIGNED:{before_unassigned.get(order_id, 'MISSING')}",
+            "technician": old.technician_id if old else None,
+            "sequence": old.sequence if old else None,
+            "arrival": old.arrival_time if old else None,
+            "start": old.start_time if old else None,
+            "finish": old.finish_time if old else None,
+            "travel": old.travel_minutes if old else None,
+            "locked": int(old.locked) if old else None,
+            "source_sequence": old.source_sequence if old else None,
+            "source_assignment_hash": old.source_assignment_hash if old else None,
+        }
+        new_values = {
+            "disposition": "ASSIGNED" if new else f"UNASSIGNED:{after_unassigned.get(order_id, 'MISSING')}",
+            "technician": new.technician_id if new else None,
+            "sequence": new.sequence if new else None,
+            "arrival": new.arrival_time if new else None,
+            "start": new.start_time if new else None,
+            "finish": new.finish_time if new else None,
+            "travel": new.travel_minutes if new else None,
+            "locked": int(new.locked) if new else None,
+            "source_sequence": new.source_sequence if new else None,
+            "source_assignment_hash": new.source_assignment_hash if new else None,
+        }
+        changed_fields = [field for field in old_values if old_values[field] != new_values[field]]
+        if changed_fields:
             changed.append(
                 {
                     "work_order_id": order_id,
-                    "before_technician": old.technician_id if old else None,
-                    "after_technician": new.technician_id if new else None,
-                    "before_start": old.start_time if old else None,
-                    "after_start": new.start_time if new else None,
-                    "reason": "技师、顺序或到场时间发生变化" if old and new else "工单进入或离开可执行计划",
+                    "changed_fields": ",".join(changed_fields),
+                    **{f"before_{field}": value for field, value in old_values.items()},
+                    **{f"after_{field}": value for field, value in new_values.items()},
+                    "reason": "、".join(changed_fields) + " 发生变化",
                 }
             )
     return changed
@@ -3432,6 +3456,7 @@ def build_rollback_preview(
         ]
         if current_plan
         else [],
+        plan_changes=schedule_change_rows(current_plan.selected, source.selected) if current_plan else [],
         added_work_orders=added,
         removed_work_orders=removed,
         modified_work_orders=modified,
@@ -3830,6 +3855,7 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         scenario_revision=restored.revision,
         scenario_snapshot_hash=content_hash(restored),
         source_plan_version_id=source.id,
+        expected_active_plan_version_id=run.expected_active_plan_version_id,
         solver_config_hash=selected.solver_config_hash,
         solver_policy_fingerprint=selected.solver_policy.fingerprint if selected.solver_policy else "",
         schedule=selected,
@@ -3922,6 +3948,9 @@ def build_comparison(
         else []
     )
     b, a = before.kpis, after.kpis
+    before_policy = before.solver_policy.fingerprint if before.solver_policy else None
+    after_policy = after.solver_policy.fingerprint if after.solver_policy else None
+    same_objective_policy = bool(before_policy and before_policy == after_policy)
     comparable_delta = {
         "sla_late_count": a.sla_late_count - b.sla_late_count,
         "travel_minutes": a.total_travel_minutes - b.total_travel_minutes,
@@ -3934,9 +3963,13 @@ def build_comparison(
         scenario_id=scenario_id,
         before=before,
         after=after,
+        before_schedule_id=before.id,
+        after_schedule_id=after.id,
+        before_source_schedule_id=before.source_schedule_id,
+        after_source_schedule_id=after.source_schedule_id,
         delta={
             "objective": round(after.objective - before.objective, 2)
-            if same_snapshot and after.strategy == before.strategy
+            if same_snapshot and same_objective_policy
             else None,
             **(
                 {key: value for key, value in comparable_delta.items()}
@@ -3946,6 +3979,12 @@ def build_comparison(
         },
         changed_orders=changed,
         comparable=same_snapshot,
+        raw_objective_comparable=same_snapshot and same_objective_policy,
+        raw_objective_comparison_reason=(
+            "同一数据快照和求解政策，可比较原始目标值"
+            if same_snapshot and same_objective_policy
+            else "原始目标值只在同一数据快照和完全相同的求解政策下可比"
+        ),
         same_scenario_snapshot=same_snapshot,
         common_work_order_count=len(set(before_orders) & set(after_orders)),
         added_work_orders=added,
@@ -4188,6 +4227,7 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                     scenario_id=scenario.id,
                     scenario_revision=scenario.revision,
                     scenario_snapshot_hash=content_hash(scenario),
+                    expected_active_plan_version_id=run.expected_active_plan_version_id,
                     solver_config_hash=result.solver_config_hash,
                     schedule=result,
                     solver_policy_fingerprint=result.solver_policy.fingerprint if result.solver_policy else "",
@@ -4530,6 +4570,7 @@ def report(scenario_id: str, schedule_id: str | None = None) -> HTMLResponse:
 
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 ALLOWED_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8000", "http://127.0.0.1:8000"}
+LEGACY_CAS_WRITE = re.compile(r"^/api/scenarios/[^/]+/(?:work-orders(?:/[^/]+)?|technicians(?:/[^/]+)?|locks|reset)$")
 
 
 def browser_origin_allowed(
@@ -4605,7 +4646,12 @@ def create_app(
             and not browser_origin_allowed(request, origin, configured_origins)
         ):
             return Response("不允许的请求来源", status_code=403)
-        return await call_next(request)
+        response = await call_next(request)
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and LEGACY_CAS_WRITE.fullmatch(request.url.path):
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "Wed, 31 Mar 2027 00:00:00 GMT"
+            response.headers["Link"] = f'</api/v2{request.url.path.removeprefix("/api")}>; rel="successor-version"'
+        return response
 
     application.include_router(router)
     if FRONTEND_DIST.exists():

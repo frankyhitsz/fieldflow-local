@@ -67,7 +67,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 _INTEGRITY_RANK = {
     AnalysisIntegrityStatus.failed: 0,
@@ -187,6 +187,27 @@ class DecisionAnalysisIntegrityError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+_EXECUTION_EVENT_TRUST_FIELDS = {
+    "event_content_hash",
+    "self_integrity",
+    "source_plan_integrity",
+    "effective_integrity",
+}
+
+
+def _execution_event_content_hash(event: WorkOrderExecutionEvent) -> str:
+    return content_hash(event.model_dump(exclude=_EXECUTION_EVENT_TRUST_FIELDS, mode="json"))
+
+
+def _scenario_revision_hash(revision: ScenarioRevision) -> str:
+    return content_hash(
+        revision.model_dump(
+            exclude={"revision_hash", "self_integrity", "effective_integrity"},
+            mode="json",
+        )
+    )
 
 
 def _parse_decision_artifact(payload: object) -> DecisionAnalysisArtifact:
@@ -776,9 +797,7 @@ class Store:
                         event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"])
                     except (TypeError, ValueError):
                         continue
-                    event.event_content_hash = content_hash(
-                        event.model_dump(exclude={"event_content_hash"}, mode="json")
-                    )
+                    event.event_content_hash = _execution_event_content_hash(event)
                     con.execute(
                         """
                         UPDATE work_order_execution_events
@@ -796,6 +815,45 @@ class Store:
                             event_row["rowid"],
                         ),
                     )
+            if version < 22:
+                for scenario_row in con.execute(
+                    "SELECT DISTINCT scenario_id FROM scenario_revisions ORDER BY scenario_id"
+                ).fetchall():
+                    previous_hash: str | None = None
+                    revision_rows = con.execute(
+                        "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
+                        (scenario_row["scenario_id"],),
+                    ).fetchall()
+                    for revision_row in revision_rows:
+                        try:
+                            revision = ScenarioRevision.model_validate_json(revision_row["payload"])
+                            relation_valid = (
+                                revision.id == revision_row["id"]
+                                and revision.scenario_id == revision_row["scenario_id"]
+                                and revision.number == revision_row["number"]
+                                and revision.reason == revision_row["reason"]
+                                and revision.created_at == revision_row["created_at"]
+                            )
+                            if not relation_valid:
+                                raise ValueError("scenario revision identity mismatch")
+                        except (TypeError, ValueError):
+                            self._record_read_isolation(
+                                con,
+                                "scenario_revisions",
+                                str(revision_row["id"]),
+                                str(revision_row["payload"]),
+                                "v22 migration: malformed revision identity",
+                            )
+                            previous_hash = None
+                            continue
+                        revision.scenario_snapshot_hash = content_hash(revision.scenario)
+                        revision.previous_revision_hash = previous_hash
+                        revision.revision_hash = _scenario_revision_hash(revision)
+                        con.execute(
+                            "UPDATE scenario_revisions SET payload=? WHERE id=?",
+                            (revision.model_dump_json(), revision.id),
+                        )
+                        previous_hash = revision.revision_hash
             command_columns = {row[1] for row in con.execute("PRAGMA table_info(command_keys)")}
             if "publication_key" not in command_columns:
                 con.execute("ALTER TABLE command_keys ADD COLUMN publication_key TEXT")
@@ -1495,6 +1553,7 @@ class Store:
                     )
         self.seed_fixtures()
         self.seed_profiles()
+        self._scan_revision_integrity()
         self._scan_execution_status_integrity()
 
     def seed_fixtures(self) -> None:
@@ -1522,13 +1581,22 @@ class Store:
                     scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
                 except (TypeError, ValueError):
                     continue
-                event_actions = {
-                    (str(row["work_order_id"]), str(row["action"]))
-                    for row in con.execute(
-                        "SELECT work_order_id, action FROM work_order_execution_events WHERE scenario_id=?",
-                        (scenario.id,),
-                    ).fetchall()
-                }
+                event_actions: set[tuple[str, str]] = set()
+                for event_row in con.execute(
+                    "SELECT * FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
+                    (scenario.id,),
+                ).fetchall():
+                    try:
+                        event = self._load_execution_event_row(con, event_row)
+                        event_actions.add((event.work_order_id, event.action))
+                    except DecisionAnalysisIntegrityError:
+                        self._record_read_isolation(
+                            con,
+                            "work_order_execution_events",
+                            str(event_row["id"]),
+                            str(event_row["payload"]),
+                            "startup integrity scan: invalid execution event proof",
+                        )
                 for order in scenario.work_orders:
                     missing: list[str] = []
                     if (
@@ -1557,10 +1625,54 @@ class Store:
                         reason,
                     )
 
-    @staticmethod
+    def _scan_revision_integrity(self) -> None:
+        """Record broken revision proofs without preventing unrelated scenarios from opening."""
+        with self._lock, self._connect() as con:
+            scenario_ids = [
+                str(row["scenario_id"])
+                for row in con.execute(
+                    "SELECT DISTINCT scenario_id FROM scenario_revisions ORDER BY scenario_id"
+                ).fetchall()
+            ]
+            for scenario_id in scenario_ids:
+                previous_hash: str | None = None
+                for row in con.execute(
+                    "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
+                    (scenario_id,),
+                ).fetchall():
+                    try:
+                        revision = self._load_revision_row(con, row, previous_hash)
+                    except DecisionAnalysisIntegrityError:
+                        self._record_read_isolation(
+                            con,
+                            "scenario_revisions",
+                            str(row["id"]),
+                            str(row["payload"]),
+                            "startup integrity scan: invalid revision proof",
+                        )
+                        previous_hash = None
+                        continue
+                    previous_hash = revision.revision_hash
+
+    @classmethod
     def _insert_revision(
-        con: sqlite3.Connection, scenario: ScheduleScenario, reason: str, ignore: bool = False
+        cls, con: sqlite3.Connection, scenario: ScheduleScenario, reason: str, ignore: bool = False
     ) -> ScenarioRevision:
+        if ignore:
+            existing_row = con.execute(
+                "SELECT payload FROM scenario_revisions WHERE scenario_id=? AND number=?",
+                (scenario.id, scenario.revision),
+            ).fetchone()
+            if existing_row:
+                return ScenarioRevision.model_validate_json(existing_row["payload"])
+        previous_rows = con.execute(
+            "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
+            (scenario.id,),
+        ).fetchall()
+        previous_hash: str | None = None
+        for previous_row in previous_rows:
+            previous = cls._load_revision_row(con, previous_row, previous_hash)
+            previous_hash = previous.revision_hash
         revision = ScenarioRevision(
             id=f"REV-{scenario.id}-{scenario.revision}-{uuid.uuid4().hex[:6]}",
             scenario_id=scenario.id,
@@ -1568,7 +1680,10 @@ class Store:
             reason=reason,
             scenario=scenario.model_copy(deep=True),
             created_at=_now(),
+            scenario_snapshot_hash=content_hash(scenario),
+            previous_revision_hash=previous_hash,
         )
+        revision.revision_hash = _scenario_revision_hash(revision)
         verb = "INSERT OR IGNORE" if ignore else "INSERT"
         con.execute(
             f"{verb} INTO scenario_revisions(id, scenario_id, number, reason, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1582,6 +1697,45 @@ class Store:
             ),
         )
         return revision
+
+    @classmethod
+    def _load_revision_row(
+        cls,
+        con: sqlite3.Connection,
+        row: sqlite3.Row,
+        expected_previous_hash: str | None,
+        *,
+        verify_predecessor: bool = True,
+    ) -> ScenarioRevision:
+        del cls, con
+        try:
+            revision = ScenarioRevision.model_validate_json(row["payload"])
+            relation_valid = (
+                revision.id == row["id"]
+                and revision.scenario_id == row["scenario_id"]
+                and revision.number == row["number"]
+                and revision.reason == row["reason"]
+                and revision.created_at == row["created_at"]
+            )
+            chain_valid = not verify_predecessor or revision.previous_revision_hash == expected_previous_hash
+            if (
+                not relation_valid
+                or not chain_valid
+                or revision.scenario.id != revision.scenario_id
+                or revision.scenario.revision != revision.number
+                or revision.scenario_snapshot_hash != content_hash(revision.scenario)
+                or revision.revision_hash != _scenario_revision_hash(revision)
+            ):
+                raise ValueError("scenario revision proof mismatch")
+            revision.self_integrity = AnalysisIntegrityStatus.verified
+            revision.effective_integrity = AnalysisIntegrityStatus.verified
+            return revision
+        except (KeyError, TypeError, ValueError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "业务数据修订记录完整性校验失败",
+                record_id=str(row["id"]),
+                record_type="SCENARIO_REVISION",
+            ) from error
 
     @staticmethod
     def _set_plan_applicability(
@@ -1672,7 +1826,6 @@ class Store:
                 if str(row["scenario_id"]) != plan.scenario_id:
                     raise ValueError("applicability scenario mismatch")
                 plan.active = bool(row["active"])
-                plan.coverage_status = PlanCoverageStatus(row["coverage_status"])
                 plan.applicability = PlanApplicability(
                     route_executable=bool(row["route_executable"]),
                     coverage_complete=bool(row["coverage_complete"]),
@@ -1682,8 +1835,9 @@ class Store:
                     reoptimization_opportunity=bool(row["reoptimization_opportunity"]),
                     invalid_assignment_ids=json.loads(row["invalid_assignment_ids"]),
                 )
-                if plan.coverage_status is not coverage_status_from_applicability(plan.applicability):
-                    raise ValueError("coverage projection mismatch")
+                # coverage_status is a compatibility projection for older SQL
+                # readers. The multi-axis applicability record is authoritative.
+                plan.coverage_status = coverage_status_from_applicability(plan.applicability)
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 raise DecisionAnalysisIntegrityError(
                     "方案适用性记录无法解析",
@@ -2243,14 +2397,38 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             command = con.execute(
-                "SELECT request_fingerprint, payload FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT request_fingerprint, resource_type, resource_id FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, request.idempotency_key),
             ).fetchone()
             if command:
                 if command["request_fingerprint"] != request_fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同执行请求")
-                payload = json.loads(command["payload"])
-                stored = WorkOrderExecutionResult.model_validate(payload["result"])
+                if command["resource_type"] != "execution_event" or not command["resource_id"]:
+                    raise PublicationConflict(
+                        "执行命令重放缺少可信事件引用",
+                        code="EXECUTION_REPLAY_RESOURCE_MISSING",
+                    )
+                event_row = con.execute(
+                    "SELECT * FROM work_order_execution_events WHERE id=?",
+                    (command["resource_id"],),
+                ).fetchone()
+                if not event_row:
+                    raise PublicationConflict(
+                        "执行命令引用的事件不存在",
+                        code="EXECUTION_REPLAY_EVENT_MISSING",
+                        details={"event_id": str(command["resource_id"])},
+                    )
+                stored_event = self._load_execution_event_row(con, event_row)
+                if (
+                    stored_event.scenario_id != scenario_id
+                    or stored_event.work_order_id != work_order_id
+                    or stored_event.action != action
+                    or stored_event.idempotency_key != request.idempotency_key
+                ):
+                    raise PublicationConflict(
+                        "执行命令引用了不匹配的事件",
+                        code="EXECUTION_REPLAY_IDENTITY_MISMATCH",
+                    )
                 scenario_row = con.execute(
                     "SELECT payload FROM scenarios WHERE id=?",
                     (scenario_id,),
@@ -2260,7 +2438,7 @@ class Store:
                 current_scenario = ScheduleScenario.model_validate_json(scenario_row["payload"])
                 return WorkOrderExecutionResult(
                     scenario=current_scenario,
-                    event=stored.event,
+                    event=stored_event,
                 )
 
             scenario_row = con.execute(
@@ -2482,7 +2660,7 @@ class Store:
                 estimated_remaining_minutes=(request.estimated_remaining_minutes if action == "start" else None),
                 note=request.note,
             )
-            event.event_content_hash = content_hash(event.model_dump(exclude={"event_content_hash"}, mode="json"))
+            event.event_content_hash = _execution_event_content_hash(event)
             result = WorkOrderExecutionResult(scenario=scenario, event=event)
             con.execute(
                 "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -2540,21 +2718,63 @@ class Store:
         scenario: ScheduleScenario,
         active_plan_version_id: str | None,
     ) -> ExecutionSourceContext:
-        sequence_row = con.execute(
-            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM work_order_execution_events WHERE scenario_id=?",
+        event_rows = con.execute(
+            "SELECT * FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
             (scenario.id,),
-        ).fetchone()
-        watermark = int(sequence_row["sequence"])
+        ).fetchall()
+        verified_events: list[WorkOrderExecutionEvent] = []
+        events_by_order_action: dict[tuple[str, str], WorkOrderExecutionEvent] = {}
+        for expected_sequence, event_row in enumerate(event_rows, start=1):
+            event = cls._load_execution_event_row(con, event_row)
+            if event.sequence != expected_sequence:
+                raise DecisionAnalysisIntegrityError(
+                    "执行事件水位存在断裂，不能用于重排或发布",
+                    record_id=event.id,
+                    record_type="WORK_ORDER_EXECUTION_EVENT",
+                )
+            if event.action == "complete":
+                start_event = events_by_order_action.get((event.work_order_id, "start"))
+                if (
+                    not start_event
+                    or start_event.sequence >= event.sequence
+                    or start_event.booking_id != event.booking_id
+                    or start_event.source_assignment_hash != event.source_assignment_hash
+                ):
+                    raise DecisionAnalysisIntegrityError(
+                        "完成事件缺少匹配且更早的开始事件",
+                        record_id=event.id,
+                        record_type="WORK_ORDER_EXECUTION_EVENT",
+                    )
+            events_by_order_action[(event.work_order_id, event.action)] = event
+            verified_events.append(event)
+        watermark = verified_events[-1].sequence if verified_events else 0
         plan: PlanVersion | None = None
         if active_plan_version_id:
             plan_row = con.execute(
                 "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
                 (active_plan_version_id, scenario.id),
             ).fetchone()
+            if not plan_row and verified_events:
+                raise DecisionAnalysisIntegrityError(
+                    "活动方案不存在，执行事件不能建立可信来源上下文",
+                    record_id=active_plan_version_id,
+                    record_type="PLAN_VERSION",
+                )
             if plan_row:
-                plan = cls._load_plan_row(con, plan_row)
-                if plan.effective_integrity is not AnalysisIntegrityStatus.verified:
-                    plan = None
+                loaded_plan = cls._load_plan_row(con, plan_row)
+                plan = loaded_plan if loaded_plan.effective_integrity is AnalysisIntegrityStatus.verified else None
+            if plan_row and not plan and verified_events:
+                raise DecisionAnalysisIntegrityError(
+                    "活动方案完整性校验失败，执行事件不能用于重排或发布",
+                    record_id=active_plan_version_id,
+                    record_type="PLAN_VERSION",
+                )
+        if verified_events and not plan:
+            raise DecisionAnalysisIntegrityError(
+                "存在执行事件但没有可信活动方案",
+                record_id=verified_events[-1].id,
+                record_type="WORK_ORDER_EXECUTION_EVENT",
+            )
         assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
         started_sources: list[ExecutionSourceAssignment] = []
         completed_sources: list[ExecutionSourceAssignment] = []
@@ -2564,17 +2784,13 @@ class Store:
             assignment = assignments.get(order.id)
             if order.status is WorkOrderStatus.started and (not assignment or not plan):
                 continue
-            event_row = con.execute(
-                """
-                SELECT payload FROM work_order_execution_events
-                WHERE scenario_id=? AND work_order_id=? AND action='start'
-                ORDER BY sequence DESC LIMIT 1
-                """,
-                (scenario.id, order.id),
-            ).fetchone()
-            start_event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"]) if event_row else None
+            start_event = events_by_order_action.get((order.id, "start"))
             if not start_event:
-                continue
+                raise DecisionAnalysisIntegrityError(
+                    "工单执行状态缺少可信开始事件",
+                    record_id=f"{scenario.id}:{order.id}",
+                    record_type="SCENARIO_WORK_ORDER_STATUS",
+                )
             source_plan: PlanVersion | None = None
             if start_event.plan_version_id:
                 source_plan_row = con.execute(
@@ -2620,29 +2836,35 @@ class Store:
                 + (start_event.estimated_remaining_minutes or order.service_duration),
             )
             if order.status is WorkOrderStatus.started:
+                if (order.id, "complete") in events_by_order_action:
+                    raise DecisionAnalysisIntegrityError(
+                        "服务中工单已经存在完成事件",
+                        record_id=events_by_order_action[(order.id, "complete")].id,
+                        record_type="WORK_ORDER_EXECUTION_EVENT",
+                    )
                 started_sources.append(source)
             else:
-                completion_row = con.execute(
-                    """
-                    SELECT payload FROM work_order_execution_events
-                    WHERE scenario_id=? AND work_order_id=? AND action='complete'
-                    ORDER BY sequence DESC LIMIT 1
-                    """,
-                    (scenario.id, order.id),
-                ).fetchone()
-                if completion_row:
-                    completion = WorkOrderExecutionEvent.model_validate_json(completion_row["payload"])
-                    source.projected_available_at = completion.occurred_at
+                completion = events_by_order_action.get((order.id, "complete"))
+                if not completion:
+                    raise DecisionAnalysisIntegrityError(
+                        "已完成工单缺少可信完成事件",
+                        record_id=f"{scenario.id}:{order.id}",
+                        record_type="SCENARIO_WORK_ORDER_STATUS",
+                    )
+                source.projected_available_at = completion.occurred_at
                 completed_sources.append(source)
-        event_rows = con.execute(
-            "SELECT payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
-            (scenario.id,),
-        ).fetchall()
         latest_by_technician: dict[str, WorkOrderExecutionEvent] = {}
-        for event_row in event_rows:
-            event = WorkOrderExecutionEvent.model_validate_json(event_row["payload"])
+        for event in verified_events:
             latest_by_technician[event.technician_id] = event
         orders = {item.id: item for item in scenario.work_orders}
+        for event in verified_events:
+            event_order = orders.get(event.work_order_id)
+            if not event_order or event_order.status is WorkOrderStatus.pending:
+                raise DecisionAnalysisIntegrityError(
+                    "执行事件与当前工单状态不一致",
+                    record_id=event.id,
+                    record_type="WORK_ORDER_EXECUTION_EVENT",
+                )
         projections: list[TechnicianExecutionProjection] = []
         for technician_id, event in sorted(latest_by_technician.items()):
             order = orders.get(event.work_order_id)
@@ -2739,7 +2961,7 @@ class Store:
         """Validate an execution event before it can influence another command."""
         try:
             event = WorkOrderExecutionEvent.model_validate_json(row["payload"])
-            expected_hash = content_hash(event.model_dump(exclude={"event_content_hash"}, mode="json"))
+            expected_hash = _execution_event_content_hash(event)
             relation_valid = (
                 event.id == row["id"]
                 and event.scenario_id == row["scenario_id"]
@@ -2841,11 +3063,39 @@ class Store:
             return scenario
 
     def list_revisions(self, scenario_id: str) -> list[ScenarioRevision]:
-        with self._connect() as con:
+        malformed: DecisionAnalysisIntegrityError | None = None
+        revisions: list[ScenarioRevision] = []
+        with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT payload FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario_id,)
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario_id,)
             ).fetchall()
-        return [ScenarioRevision.model_validate_json(row["payload"]) for row in rows]
+            previous_hash: str | None = None
+            expected_number: int | None = None
+            for row in rows:
+                try:
+                    revision = self._load_revision_row(con, row, previous_hash)
+                    if expected_number is not None and revision.number != expected_number:
+                        raise DecisionAnalysisIntegrityError(
+                            "业务数据修订号存在断裂",
+                            record_id=revision.id,
+                            record_type="SCENARIO_REVISION",
+                        )
+                    revisions.append(revision)
+                    previous_hash = revision.revision_hash
+                    expected_number = revision.number + 1
+                except DecisionAnalysisIntegrityError as error:
+                    self._record_read_isolation(
+                        con,
+                        "scenario_revisions",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        "read isolation: invalid scenario revision proof",
+                    )
+                    malformed = error
+                    break
+        if malformed:
+            raise malformed
+        return revisions
 
     def next_version(self, scenario_id: str) -> int:
         with self._connect() as con:
@@ -3082,6 +3332,18 @@ class Store:
                 raise PublicationConflict("求解记录与候选方案的数据谱系不一致")
             if candidate_run.source_plan_version_id != candidate.source_plan_version_id:
                 raise PublicationConflict("求解记录与候选方案的来源版本不一致")
+            if candidate_run.expected_active_plan_version_id != candidate.expected_active_plan_version_id:
+                raise PublicationConflict("求解记录与候选方案的活动版本前置条件不一致")
+            current_active_plan_id = current_row["active_plan_version_id"]
+            if candidate.expected_active_plan_version_id != current_active_plan_id:
+                raise PublicationConflict(
+                    "求解期间活动方案已变化，结果未发布，请重新运行",
+                    code="ACTIVE_PLAN_VERSION_CONFLICT",
+                    details={
+                        "expected_active_plan_version_id": candidate.expected_active_plan_version_id,
+                        "current_active_plan_version_id": current_active_plan_id,
+                    },
+                )
             if candidate_run.solver_config_hash != candidate.solver_config_hash:
                 raise PublicationConflict("求解记录与候选方案的求解配置指纹不一致")
             if candidate_run.solver_policy_fingerprint != candidate.solver_policy_fingerprint:

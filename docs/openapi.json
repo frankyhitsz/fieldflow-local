@@ -847,6 +847,16 @@
             "$ref": "#/components/schemas/CapacityDecisionStatus",
             "default": "INTERNAL_VERIFIED"
           },
+          "diagnostic_cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanCostBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "diagnostic_metrics": {
             "additionalProperties": {
               "anyOf": [
@@ -1302,8 +1312,40 @@
           "after": {
             "$ref": "#/components/schemas/ScheduleResult"
           },
+          "after_schedule_id": {
+            "default": "",
+            "title": "After Schedule Id",
+            "type": "string"
+          },
+          "after_source_schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After Source Schedule Id"
+          },
           "before": {
             "$ref": "#/components/schemas/ScheduleResult"
+          },
+          "before_schedule_id": {
+            "default": "",
+            "title": "Before Schedule Id",
+            "type": "string"
+          },
+          "before_source_schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before Source Schedule Id"
           },
           "changed_orders": {
             "items": {
@@ -1353,6 +1395,16 @@
             },
             "title": "Modified Work Orders",
             "type": "array"
+          },
+          "raw_objective_comparable": {
+            "default": false,
+            "title": "Raw Objective Comparable",
+            "type": "boolean"
+          },
+          "raw_objective_comparison_reason": {
+            "default": "",
+            "title": "Raw Objective Comparison Reason",
+            "type": "string"
           },
           "removed_work_orders": {
             "items": {
@@ -2289,6 +2341,13 @@
             "title": "Deterministic Finish By Technician",
             "type": "object"
           },
+          "deterministic_terminal_by_technician": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Deterministic Terminal By Technician",
+            "type": "object"
+          },
           "dispatch_location": {
             "anyOf": [
               {
@@ -2388,6 +2447,7 @@
           "id": {
             "maxLength": 80,
             "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
             "title": "Id",
             "type": "string"
           },
@@ -4750,11 +4810,17 @@
             "type": "number"
           },
           "emergency_failure_given_event_probability": {
-            "default": 0,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Emergency Failure Given Event Probability",
-            "type": "number"
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Failure Given Event Probability"
           },
           "emergency_incremental_late_minutes": {
             "anyOf": [
@@ -4894,6 +4960,12 @@
             "minimum": 0.0,
             "title": "Late Minutes P95",
             "type": "integer"
+          },
+          "monte_carlo_interval_method": {
+            "const": "PERCENTILE_BOOTSTRAP_V1",
+            "default": "PERCENTILE_BOOTSTRAP_V1",
+            "title": "Monte Carlo Interval Method",
+            "type": "string"
           },
           "monte_carlo_mean_ci_high": {
             "default": 0,
@@ -5175,6 +5247,19 @@
             "title": "Emergency On Time",
             "type": "boolean"
           },
+          "emergency_route_terminal_time": {
+            "anyOf": [
+              {
+                "maximum": 3240.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Route Terminal Time"
+          },
           "emergency_technician_id": {
             "anyOf": [
               {
@@ -5378,6 +5463,14 @@
               "type": "string"
             },
             "title": "Modified Work Orders",
+            "type": "array"
+          },
+          "plan_changes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Plan Changes",
             "type": "array"
           },
           "removed_work_orders": {
@@ -5655,6 +5748,17 @@
           "created_at": {
             "title": "Created At",
             "type": "string"
+          },
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
           },
           "id": {
             "title": "Id",
@@ -6202,6 +6306,17 @@
           "effective_time_limit_ms": {
             "title": "Effective Time Limit Ms",
             "type": "integer"
+          },
+          "expected_active_plan_version_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Active Plan Version Id"
           },
           "finished_at": {
             "anyOf": [
@@ -7495,6 +7610,76 @@
         "title": "TechnicianArchetype",
         "type": "object"
       },
+      "TechnicianCreate": {
+        "description": "New externally addressed technician code; stored legacy IDs remain readable.",
+        "properties": {
+          "color": {
+            "default": "#315c4b",
+            "pattern": "^#[0-9A-Fa-f]{6}$",
+            "title": "Color",
+            "type": "string"
+          },
+          "cost_per_minute_cents": {
+            "default": 100,
+            "exclusiveMinimum": 0.0,
+            "maximum": 10000.0,
+            "title": "Cost Per Minute Cents",
+            "type": "integer"
+          },
+          "id": {
+            "maxLength": 80,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "overtime_limit": {
+            "default": 60,
+            "maximum": 240.0,
+            "minimum": 0.0,
+            "title": "Overtime Limit",
+            "type": "integer"
+          },
+          "shift_end": {
+            "maximum": 1800.0,
+            "minimum": 0.0,
+            "title": "Shift End",
+            "type": "integer"
+          },
+          "shift_start": {
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Shift Start",
+            "type": "integer"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/Skill"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "start_location": {
+            "$ref": "#/components/schemas/Point"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "skills",
+          "shift_start",
+          "shift_end",
+          "start_location"
+        ],
+        "title": "TechnicianCreate",
+        "type": "object"
+      },
       "TechnicianExecutionProjection": {
         "properties": {
           "available_at": {
@@ -7997,6 +8182,7 @@
           "id": {
             "maxLength": 80,
             "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
             "title": "Id",
             "type": "string"
           },
@@ -8194,6 +8380,10 @@
             ],
             "title": "Early Start Override Reason"
           },
+          "effective_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "VERIFIED"
+          },
           "estimated_remaining_minutes": {
             "anyOf": [
               {
@@ -8278,6 +8468,10 @@
             "title": "Scenario Revision",
             "type": "integer"
           },
+          "self_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "VERIFIED"
+          },
           "sequence": {
             "default": 0,
             "minimum": 0.0,
@@ -8288,6 +8482,10 @@
             "default": "",
             "title": "Source Assignment Hash",
             "type": "string"
+          },
+          "source_plan_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "VERIFIED"
           },
           "source_sequence": {
             "default": 0,
@@ -8594,7 +8792,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.8"
+    "version": "0.5.9"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -10892,7 +11090,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Technician"
+                "$ref": "#/components/schemas/TechnicianCreate"
               }
             }
           },
@@ -11669,7 +11867,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Technician"
+                "$ref": "#/components/schemas/TechnicianCreate"
               }
             }
           },

@@ -4,7 +4,36 @@
 
 ## 本轮目标
 
-按再次变更的 `pro-plan.md` 完成 v0.5.8 Correctness Freeze。四项 P0 和当前架构内能够闭合的正确性问题直接修复；任务书已明确排到 v0.6 以后且需要新运行时或新业务实体的项目，逐项记录理由，不增加占位接口。
+按 2026-08-25 19:49 更新的 `pro-plan.md` 完成 v0.5.9 Trust Closure。发布门禁是执行事实只能经过可信读取路径、求解结果同时绑定 D 与活动 V、紧急投影与实际时间线一致、当前未覆盖需求不能被冻结 KPI 隐藏，并让数据修订历史成为可校验的恢复源。
+
+## v0.5.9 实施记录
+
+### 第一轮：信任闭包
+
+- [x] `_execution_source_context`、重排、发布复核和幂等重放统一从关系行重新加载并校验执行事件；事件水位必须连续，开始/完成事件必须属于同一 Booking 和来源 assignment。
+- [x] 执行命令重放不再读取 `command_keys.payload` 中的结果副本；事件缺失、内容被改写或来源 Plan 失效时失败关闭。
+- [x] ScheduleRun/Candidate 保存求解开始时的活动 V，发布事务同时 CAS 数据 D 和活动 V；并发旧候选不能覆盖新方案或消耗版本号。
+- [x] ScenarioRevision 增加快照哈希、前序哈希和修订哈希；reset、列表和启动扫描验证关系身份与整条证明链。
+
+### 第二轮：投影、指标和界面
+
+- [x] 修复等待客户时接应急单后漏算返回客户行程；零随机测试核对候选终点与选中响应者实际终点。
+- [x] 风险受影响工单按工单级 disposition 差异去重；零事件条件概率返回 null；单方案 Monte Carlo 区间改为确定性 percentile bootstrap。
+- [x] 风险队列、位置图和 KPI 使用当前需求 disposition；新增未覆盖需求明确标记，不再显示为冻结方案的 100% 当前覆盖。
+- [x] `route_executable=false` 的界面文案与后端安全前缀语义一致：只阻止失效 assignment，其他已验证承诺仍可执行。
+
+### 第三轮：P1 收敛与验证
+
+- [x] 比较/回滚差异覆盖 disposition、技师、顺序、到达、开始、完成、行程、锁定和来源 assignment 身份；原始 objective 仅在完整求解政策一致时比较。
+- [x] 容量正式 KPI/成本与诊断结果分栏；条件上界不再写入正式反事实字段；完整未分配 disposition 的零路线方案不再触发 `EMPTY_CANDIDATE`。
+- [x] PlanApplicability 多轴字段成为读取时唯一事实，`coverage_status` 只保留为兼容 SQL 投影；新建工单和技师 code 限制为 URL 安全字符，存量 ID 保持可读。
+- [x] 增加完整 Python 传递依赖锁，决策代码指纹缩小到实际决策模块，旧 v1 CAS 写接口声明 2027-03-31 Sunset。
+- [x] Mutation smoke 从 4 个扩展为 8 个定向 mutant，新增执行事件、活动 V CAS、修订证明、零随机投影、唯一计数和当前需求界面回归。
+- [ ] 完成最终 lint、类型检查、依赖审计、全量后端/前端/E2E、Demo、Benchmark 和 GitHub Actions 验证。
+
+逐项裁决见 `docs/pro-plan-v0.5.9-assessment.md`。
+
+## v0.5.8 历史记录
 
 ## 第一轮：确认缺陷与修复核心不变量
 

@@ -43,6 +43,8 @@ from backend.models import (
     Technician,
     TechnicianArchetype,
     TechnicianUpdate,
+    UnassignedReason,
+    UnassignedWorkOrder,
     WorkOrderStatus,
 )
 from backend.provenance import (
@@ -54,6 +56,7 @@ from backend.provenance import (
 from backend.scheduler import baseline_schedule, calculate_kpis
 from backend.storage import Store
 from backend.travel import EuclideanTravelTimeProvider
+from backend.verification import verify_schedule
 
 
 def _plan(fixture_id: str = "main") -> PlanVersion:
@@ -818,6 +821,28 @@ def test_infeasible_capacity_option_has_only_diagnostic_metrics(monkeypatch):
     assert result.marginal_cost_cents is None
     assert result.diagnostic_metrics["completion_rate"] >= 0
     assert result.verification_report == report
+    assert result.counterfactual_kpis is None
+    assert result.counterfactual_cost is None
+    assert result.diagnostic_cost is not None
+
+
+def test_zero_route_candidate_is_diagnostic_coverage_not_an_empty_candidate_error():
+    plan = _plan()
+    assert plan.scenario_snapshot is not None
+    result = plan.selected.model_copy(deep=True)
+    result.unassigned.extend(
+        UnassignedWorkOrder(
+            work_order_id=item.work_order_id,
+            reason=UnassignedReason.dropped_by_objective,
+            detail="诊断方案未分配该工单",
+        )
+        for item in result.assignments
+    )
+    result.assignments = []
+    result.kpis = calculate_kpis(plan.scenario_snapshot, result.assignments, result.unassigned)
+    report = verify_schedule(plan.scenario_snapshot, result)
+    assert report.coverage.missing_work_orders == []
+    assert "EMPTY_CANDIDATE" not in {item.code for item in report.errors}
 
 
 def test_cost_analysis_input_hash_changes_with_labor_mode():
@@ -881,7 +906,63 @@ def test_no_emergency_event_returns_not_applicable_conditional_metrics():
     assert result.emergency_completion_rate is None
     assert result.emergency_on_time_rate is None
     assert result.emergency_unserved_probability is None
+    assert result.emergency_failure_given_event_probability is None
+    assert result.monte_carlo_interval_method == "PERCENTILE_BOOTSTRAP_V1"
     assert all(not metric.emergency_event for metric in result.trial_metrics)
+
+
+def test_zero_randomness_candidate_projection_matches_selected_actual_terminal():
+    result = simulate_plan_risk(
+        _plan(),
+        RiskSimulationRequest(
+            seed=41,
+            trials=50,
+            emergency_order_basis_points=10_000,
+            technician_absence_basis_points=0,
+            customer_no_show_basis_points=0,
+            travel_delay_max_percent=0,
+            service_duration_jitter_percent=0,
+        ),
+    )
+    checked = 0
+    for metric in result.trial_metrics:
+        evidence = metric.emergency_decision_information_set
+        technician_id = metric.emergency_technician_id
+        if not evidence or not technician_id:
+            continue
+        assert metric.emergency_route_terminal_time == evidence.deterministic_terminal_by_technician[technician_id]
+        checked += 1
+    assert checked > 0
+
+
+def test_emergency_affected_orders_are_unique_not_sla_plus_unserved_double_counted():
+    plan = _plan()
+    request = RiskSimulationRequest(
+        seed=53,
+        trials=200,
+        emergency_order_basis_points=10_000,
+        technician_absence_basis_points=0,
+        customer_no_show_basis_points=0,
+        travel_delay_max_percent=100,
+        service_duration_jitter_percent=100,
+    )
+    emergency = simulate_plan_risk(plan, request)
+    baseline = simulate_plan_risk(plan, request.model_copy(update={"emergency_order_basis_points": 0}))
+    active_count = len(plan.selected.assignments)
+    overlap_found = False
+    for base_metric, emergency_metric in zip(baseline.trial_metrics, emergency.trial_metrics, strict=True):
+        old_double_count = (
+            max(
+                0,
+                round(base_metric.published_commitment_sla_rate * active_count)
+                - round(emergency_metric.published_commitment_sla_rate * active_count),
+            )
+            + emergency_metric.emergency_incremental_unserved_orders
+        )
+        if old_double_count > emergency_metric.emergency_affected_work_order_count:
+            overlap_found = True
+        assert emergency_metric.emergency_affected_work_order_count <= active_count
+    assert overlap_found
 
 
 def _assert_post_decision_draw_does_not_change_responder(monkeypatch, event_type: str) -> None:
@@ -1773,7 +1854,11 @@ def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatc
         outsourced = next(item for item in artifacts.json() if item["option_id"] == "outsource_unserved")
         option = next(item for item in body["result"]["options"] if item["option_id"] == "outsource_unserved")
         assert option["artifact_hash"] == outsourced["artifact_hash"]
-        assert len(outsourced["external_assignments"]) == outsourced["counterfactual_kpis"]["external_assignment_count"]
+        assert outsourced["counterfactual_kpis"] is None
+        assert (
+            len(outsourced["external_assignments"])
+            == outsourced["conditional_upper_bound_kpis"]["external_assignment_count"]
+        )
         assert option["decision_status"] == "EXTERNAL_CONDITIONAL"
         assert option["completion_rate"] is None
         assert outsourced["decision_status"] == "EXTERNAL_CONDITIONAL"
@@ -1783,11 +1868,12 @@ def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatc
         assert outsourced["conditional_assumptions"]
         assert outsourced["conditional_upper_bound_kpis"] == option["conditional_upper_bound_kpis"]
         assert (
-            outsourced["counterfactual_kpis"]["completion_rate"]
+            outsourced["conditional_upper_bound_kpis"]["completion_rate"]
             == option["conditional_upper_bound_kpis"]["completion_rate"]
         )
         assert (
-            len(outsourced["work_order_dispositions"]) == outsourced["counterfactual_kpis"]["active_work_order_count"]
+            len(outsourced["work_order_dispositions"])
+            == outsourced["conditional_upper_bound_kpis"]["active_work_order_count"]
         )
         with closing(sqlite3.connect(database)) as connection, connection:
             payload = json.loads(
@@ -2682,7 +2768,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -2736,7 +2822,7 @@ def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
 
 
 def test_v14_retry_schema_migration_preserves_analysis_artifacts(monkeypatch, tmp_path):

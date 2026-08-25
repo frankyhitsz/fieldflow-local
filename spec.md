@@ -6,7 +6,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 
 本轮以 `pro-plan.md` 对现有实现的审查为输入。审查结论按当前代码和可运行流程复核：能在单机架构内严谨落地的问题直接修复；需要完整异步运行时、库存或跨日模型的建议保留为后续范围，不以占位类型冒充完成。
 
-当前发布目标为 v0.5.8 Correctness Freeze：紧急响应决策不得读取未来随机结果；方案适用性必须在活动 V 的同一事务中归约；新工单只能从 pending 开始；容量成本必须由来源规则直接生成并严格对账。
+当前发布目标为 v0.5.9 Trust Closure：现场执行事实只能经过关系身份、内容哈希、来源 Plan 和 assignment 的统一可信读取门禁；每个候选同时绑定业务数据 D 和求解开始时的活动 V；历史修订、紧急投影、风险指标和当前需求 disposition 都必须在失败时关闭，不允许用冻结结果掩盖新事实。
 
 ## 当前范围
 
@@ -23,6 +23,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - 成功发布正式方案才在事务内分配下一条 `V`；内部基线、候选、失败和取消均不占号。
 - 经营分析开始前分配下一条 `A`，并记录 `RUNNING`、`COMPLETED`、`FAILED` 或 `INTERRUPTED`。相同 V、分析类型和完整输入指纹在运行中返回 202、完成后返回 200。精确 retry 复用冻结输入并在事务内分配唯一 attempt；运行环境变化时拒绝。按当前上下文重跑会创建新的 logical analysis。
 - `PlanVersion` 的冻结 payload 不保存运行时 `active`、`coverage_status` 或名称变化；Schema v21 的 `plan_applicability` 独立投影路线可执行、覆盖完整、规划/指标/商业数据是否当前、再优化机会和无效 assignment，名称、备注和标签由 `plan_metadata` 覆盖。`coverage_status` 只由多轴状态投影，不再作为第二套事实。
+- ScheduleRun 与 Candidate 保存求解开始时的活动 Plan ID。发布事务在分配 V 之前同时比较候选 D 和活动 V；任一变化都拒绝陈旧候选，失败请求不占版本号。
 
 ## 正式方案与硬承诺
 
@@ -45,6 +46,8 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - pending 分配保存 assignment-feasibility fingerprint；技能、位置、时长、时间窗、班次、锁定或行程模型变化后，失效 assignment 进入累积集合并禁止开工，其他有效承诺仍可执行。优先级、VIP、drop penalty 等目标字段会让方案提示指标过期，但不伪装成分配约束；未分配工单和未参与路线的技师不会误伤现有路线。覆盖完整性每次按“当前需求减 Plan disposition”重算，删除一张新工单不会掩盖其他未覆盖需求。
 - 网页使用 `/api/v2` 写入 WorkOrder、Technician、Lock 和 Reset，并强制携带 `If-Match: Dnnn`；缺失返回 428，过期返回结构化 409。旧 v1 写路径标记 deprecated，保留兼容。数据事务还对活动 V 做 CAS，不能把基于旧 V 的适用性投影写到刚发布的新 V。
 - 执行事件同时保存关系型身份列、来源 Plan/assignment、Booking 字符串身份和内容哈希；列表读取、完成命令和依赖前序完成事件的开始命令都先通过同一校验门禁。旧数据中没有 start/complete 事件支撑的状态会进入完整性问题清单。
+- 重排上下文、发布事务复核和执行命令重放也使用同一事件读取门禁。事件序列必须从 1 连续，complete 必须引用更早且 Booking/assignment 一致的 start；命令缓存只保存资源引用，不是可信事件副本。
+- 执行事件 API 明确返回 self/source/effective integrity。这里的 SHA-256 是内容一致性和篡改迹象检测；hash 与 payload 同处可写 SQLite，不能对抗能够重算整条证明链的恶意写入者。
 - “锁定并改派”是分阶段持久 Saga：`RESERVED → LOCK_COMMITTED → REPLAN_CREATED → PLAN_PUBLISHED → COMPLETED`。Run 标识在锁定提交时固定；应用重启后恢复同一 Run，不重复锁定、D、Run 或 V。求解失败进入 `FAILED_AFTER_LOCK`；锁定后业务上下文改变进入 `FAILED_CONTEXT_CHANGED`。两者都是不可覆盖的终态，新请求必须使用新 key。
 
 ## 时间、行程与求解
@@ -74,13 +77,15 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - “调整出发点”只表示将一名高行程技师的出发点移至需求中心，不声称新增了完整服务站点。
 - 风险默认遵循正式方案开始时刻。replan 路线从发布时 route entry 开始。随机量按 `(seed, trial, event_type, entity_id)` 派生；计划无关的场景集保存突发事件时间、位置、时长、技能和 SLA。`BETWEEN_VISITS_ONLY` 不在行驶途中改道、不抢占服务。响应策略为 `MYOPIC_EARLIEST_EMERGENCY_FINISH`：先保存事件信息集、候选、排除理由和确定性预计完成时间，选中响应者后才模拟一次未来结果；未来 no-show、服务时长和返程延误不能反向改变选择。
 - `published_commitment_sla_rate` 只度量已发布承诺，`all_demand_sla_rate` 把应急需求纳入分母。条件紧急指标返回 `emergency_event_count`；零事件时完成率、准时率、未服务率和严重度均为 null，界面显示“不适用”。另列紧急事件造成的增量迟到、加班、未服务和受影响工单。
+- 紧急受影响工单按每张原承诺工单在基线/应急时间线上的迟到或未服务 disposition 差异去重。单方案 SLA Monte Carlo 均值区间使用固定 seed 的 percentile bootstrap，不再使用正态近似。
 - 配对比较在创建子 A 前核对范围、分析时点和共同 ScenarioSet 身份。紧急完成与准时只对发生事件的 trial 计算，同时保留无条件影响；每个摘要带 conditioning event 和有效样本数，区间使用固定 seed 的配对 bootstrap。条件事件样本少于 20 时标记 `INSUFFICIENT_EVENT_TRIALS` 并不给出数值估计或区间。它绑定两个 A 的清单以及 trial、scenario-set Artifact 哈希；任一证明失效时整个业务 `result` 及兼容数值投影均为空。
 - A 的状态、开始/结束时间和 reservation manifest 同时保存在关系型列；终态触发器禁止回退。A 终态保存 input/result/failure manifest、Artifact 哈希清单和总清单哈希。完成事务会重新加载父 Plan；计算期间父证明变化时保存失败 A，不保存结果。所有读取和重放路径都会重算；父 Plan、父 A 或依赖 Artifact 失败会向下传播 `effective_integrity=FAILED`，业务 result 被移除。Schema v20 前的记录由关系列显式标记 `LEGACY_MIGRATED`，不能仅靠删除 JSON 字段降级。
 - 运营复盘初次进入只读取已有 A；用户显式点击才创建。成本与风险并行使用部分成功语义，任一失败不隐藏另一项结果。同步直接分析接口保留兼容但在 OpenAPI 标记 deprecated。
 
 ## 兼容与迁移
 
-- Schema v10 把技师浮点成本保值迁移为整数分；v11 增加命令发布键；v12 增加方案适用性投影；v13–v17 增加经营分析运行、恢复、重试和 Artifact；v18 增加不可降级证明要求、风险比较、方案元数据和损坏隔离；v19 增加 A 关系型状态机及传递信任；v20 增加多维 PlanApplicability；v21 完成旧覆盖语义回填、复合外键、枚举/JSON 约束和执行事件证明字段。
+- Schema v10 把技师浮点成本保值迁移为整数分；v11 增加命令发布键；v12 增加方案适用性投影；v13–v17 增加经营分析运行、恢复、重试和 Artifact；v18 增加不可降级证明要求、风险比较、方案元数据和损坏隔离；v19 增加 A 关系型状态机及传递信任；v20 增加多维 PlanApplicability；v21 完成旧覆盖语义回填、复合外键、枚举/JSON 约束和执行事件证明字段；v22 为 ScenarioRevision 回填并强制验证快照哈希和前向证明链。
+- Python 安装使用 `requirements.lock` 固定完整传递依赖，再以 `--no-deps` 安装本项目。决策运行时清单绑定该锁；决策代码指纹只覆盖会改变求解、验证、旅行或经营分析结果的模块。
 - v1 旧方案历史缺少完整业务快照，按已确认的产品决定先生成时间戳备份再重建，当前业务数据保留。
 - 重建前，旧 schedules、plans、artifacts、experiments 和 publication keys 会逐行复制到 quarantine ledger；列表读取遇到损坏记录时跳过坏行并登记，场景、Plan、A、Artifact、ScheduleRun、Candidate、Experiment 和执行事件的关键单项读取返回稳定完整性错误。`GET /api/integrity-issues` 只暴露记录来源和原因，不返回原始业务 payload。
 - 旧 `/schedules` 和同步经营分析接口继续兼容；同步分析接口内部也创建或复用持久 A，不再绕过审计。

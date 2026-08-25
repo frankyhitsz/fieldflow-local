@@ -21,12 +21,14 @@ from backend.verification import verify_schedule
 def _verified_candidate(store: Store, scenario, result) -> str:
     now = datetime.now(UTC).isoformat()
     suffix = uuid.uuid4().hex[:10]
+    active = store.active_plan_version(scenario.id)
     run = ScheduleRun(
         id=f"RUN-{suffix}",
         scenario_id=scenario.id,
         action="baseline",
         scenario_revision=scenario.revision,
         scenario_snapshot_hash=content_hash(scenario),
+        expected_active_plan_version_id=active.id if active else None,
         solver_name=result.solver_name,
         solver_version=result.solver_version,
         solver_config_hash=result.solver_config_hash,
@@ -45,6 +47,7 @@ def _verified_candidate(store: Store, scenario, result) -> str:
         scenario_id=scenario.id,
         scenario_revision=scenario.revision,
         scenario_snapshot_hash=content_hash(scenario),
+        expected_active_plan_version_id=run.expected_active_plan_version_id,
         solver_config_hash=result.solver_config_hash,
         solver_policy_fingerprint=result.solver_policy.fingerprint,
         schedule=result,
@@ -717,15 +720,19 @@ def test_atomic_public_version_allocation(tmp_path):
     scenario = get_fixture("main")
     results = [baseline_schedule(scenario, 0) for _ in range(4)]
     candidate_ids = [_verified_candidate(store, scenario, result) for result in results]
+
+    def publish(pair):
+        try:
+            return store.publish_plan(scenario, pair[0], "baseline", candidate_id=pair[1])
+        except PublicationConflict as error:
+            assert error.code == "ACTIVE_PLAN_VERSION_CONFLICT"
+            return None
+
     with ThreadPoolExecutor(max_workers=4) as executor:
-        plans = list(
-            executor.map(
-                lambda pair: store.publish_plan(scenario, pair[0], "baseline", candidate_id=pair[1]),
-                zip(results, candidate_ids, strict=False),
-            )
-        )
-    assert sorted(plan.number for plan in plans) == [1, 2, 3, 4]
-    assert [plan.number for plan in store.list_plan_versions("main")] == [1, 2, 3, 4]
+        outcomes = list(executor.map(publish, zip(results, candidate_ids, strict=False)))
+    plans = [item for item in outcomes if item is not None]
+    assert [plan.number for plan in plans] == [1]
+    assert [plan.number for plan in store.list_plan_versions("main")] == [1]
 
 
 def test_run_and_candidate_completion_rolls_back_as_one_transaction(tmp_path):
@@ -875,7 +882,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 22
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -890,7 +897,7 @@ def test_schema_versions_1_through_15_converge_to_current_schema(tmp_path, legac
     migrated = Store(database)
     assert migrated.get_scenario("main") is not None
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert "publication_key" in {row[1] for row in connection.execute("PRAGMA table_info(command_keys)").fetchall()}
@@ -945,7 +952,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"

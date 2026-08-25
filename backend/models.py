@@ -7,6 +7,15 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
+UrlIdentifier = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+    ),
+]
 DisplayName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 ShortLabel = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
 StrategyName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=30)]
@@ -263,6 +272,12 @@ class Technician(BaseModel):
         return self
 
 
+class TechnicianCreate(Technician):
+    """New externally addressed technician code; stored legacy IDs remain readable."""
+
+    id: UrlIdentifier
+
+
 class WorkOrder(BaseModel):
     id: Identifier
     customer_name: DisplayName
@@ -302,7 +317,7 @@ class WorkOrderCreate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: Identifier
+    id: UrlIdentifier
     customer_name: DisplayName
     title: DisplayName
     required_skills: list[Skill]
@@ -654,6 +669,11 @@ class WorkOrderExecutionEvent(BaseModel):
     estimated_remaining_minutes: int | None = Field(default=None, ge=1, le=480)
     note: str = ""
     event_content_hash: str = ""
+    # Recomputed by the trusted read path. These projections are excluded from
+    # event_content_hash so they describe the read instead of self-asserting trust.
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    source_plan_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
 
     @model_validator(mode="before")
     @classmethod
@@ -703,9 +723,15 @@ class Comparison(BaseModel):
     scenario_id: str
     before: ScheduleResult
     after: ScheduleResult
+    before_schedule_id: str = ""
+    after_schedule_id: str = ""
+    before_source_schedule_id: str | None = None
+    after_source_schedule_id: str | None = None
     delta: dict[str, float | int | None]
     changed_orders: list[dict[str, Any]]
     comparable: bool = True
+    raw_objective_comparable: bool = False
+    raw_objective_comparison_reason: str = ""
     same_scenario_snapshot: bool = True
     common_work_order_count: int = 0
     added_work_orders: list[str] = Field(default_factory=list)
@@ -721,6 +747,11 @@ class ScenarioRevision(BaseModel):
     reason: str
     scenario: ScheduleScenario
     created_at: str
+    scenario_snapshot_hash: str = ""
+    previous_revision_hash: str | None = None
+    revision_hash: str = ""
+    self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
 
 
 class ScheduleArtifact(BaseModel):
@@ -871,6 +902,7 @@ class RollbackPreview(BaseModel):
     current_plan_version_id: str | None = None
     current_plan_number: int | None = None
     changed_plan_work_orders: list[str] = Field(default_factory=list)
+    plan_changes: list[dict[str, Any]] = Field(default_factory=list)
     added_work_orders: list[str] = Field(default_factory=list)
     removed_work_orders: list[str] = Field(default_factory=list)
     modified_work_orders: list[str] = Field(default_factory=list)
@@ -1327,6 +1359,7 @@ class CapacityOptionResult(BaseModel):
     counterfactual_kpis: CapacityCounterfactualKPI | None = None
     conditional_upper_bound_kpis: CapacityCounterfactualKPI | None = None
     counterfactual_cost: PlanCostBreakdown | None = None
+    diagnostic_cost: PlanCostBreakdown | None = None
 
 
 class CapacityAnalysis(BaseModel):
@@ -1445,7 +1478,8 @@ class RiskSimulationResult(BaseModel):
     overtime_failure_probability: float = Field(default=0, ge=0, le=1)
     emergency_event_probability: float = Field(default=0, ge=0, le=1)
     emergency_caused_failure_probability: float = Field(default=0, ge=0, le=1)
-    emergency_failure_given_event_probability: float = Field(default=0, ge=0, le=1)
+    emergency_failure_given_event_probability: float | None = Field(default=None, ge=0, le=1)
+    monte_carlo_interval_method: Literal["PERCENTILE_BOOTSTRAP_V1"] = "PERCENTILE_BOOTSTRAP_V1"
     emergency_caused_window_failure_probability: float = Field(default=0, ge=0, le=1)
     emergency_caused_overtime_probability: float = Field(default=0, ge=0, le=1)
     emergency_caused_unserved_probability: float = Field(default=0, ge=0, le=1)
@@ -1690,6 +1724,7 @@ class EmergencyDecisionInformationSet(BaseModel):
     dispatch_location: Point | None = None
     deterministic_dispatch_by_technician: dict[str, int] = Field(default_factory=dict)
     deterministic_finish_by_technician: dict[str, int] = Field(default_factory=dict)
+    deterministic_terminal_by_technician: dict[str, int] = Field(default_factory=dict)
 
 
 class RiskTrialMetric(BaseModel):
@@ -1706,6 +1741,7 @@ class RiskTrialMetric(BaseModel):
     emergency_technician_id: Identifier | None = None
     emergency_dispatch_time: int | None = Field(default=None, ge=0, le=2760)
     emergency_finish_time: int | None = Field(default=None, ge=0, le=3240)
+    emergency_route_terminal_time: int | None = Field(default=None, ge=0, le=3240)
     emergency_dispatch_location: Point | None = None
     emergency_decision_information_set: EmergencyDecisionInformationSet | None = None
     emergency_incremental_late_minutes: int = Field(default=0, ge=0)
@@ -1919,6 +1955,7 @@ class ScheduleRun(BaseModel):
     scenario_snapshot_hash: str
     source_plan_version_id: str | None = None
     source_plan_snapshot_hash: str | None = None
+    expected_active_plan_version_id: str | None = None
     solver_name: str
     solver_version: str
     solver_config_hash: str
@@ -1942,6 +1979,7 @@ class ScheduleCandidate(BaseModel):
     scenario_revision: int
     scenario_snapshot_hash: str
     source_plan_version_id: str | None = None
+    expected_active_plan_version_id: str | None = None
     solver_config_hash: str
     solver_policy_fingerprint: str = ""
     schedule: ScheduleResult

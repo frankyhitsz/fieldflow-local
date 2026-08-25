@@ -11,6 +11,17 @@ from .hashing import HASH_SCHEMA_VERSION, content_hash
 from .models import DecisionAnalysisContext, DecisionInputManifest, PlanVersion, ReleaseManifest, RuntimeManifest
 
 DECISION_ALGORITHM_VERSION = "FIELD_SERVICE_DECISION_V3"
+DECISION_SOURCE_FILES = (
+    "decision.py",
+    "hashing.py",
+    "models.py",
+    "planning.py",
+    "provenance.py",
+    "scheduler.py",
+    "timeutils.py",
+    "travel.py",
+    "verification.py",
+)
 
 
 def build_plan_manifest_payload(plan: PlanVersion) -> dict[str, object]:
@@ -74,7 +85,8 @@ def decision_build_sha() -> str:
             "path": path.name,
             "content": path.read_text(encoding="utf-8"),
         }
-        for path in sorted(backend_root.glob("*.py"))
+        for name in DECISION_SOURCE_FILES
+        if (path := backend_root / name).exists()
     ]
     return f"dev-{content_hash(source)[:16]}"
 
@@ -90,7 +102,7 @@ def _package_version(name: str) -> str:
 def decision_runtime_manifest() -> RuntimeManifest:
     root = Path(__file__).resolve().parent.parent
     lock_inputs: list[dict[str, str]] = []
-    for relative in ("pyproject.toml",):
+    for relative in ("pyproject.toml", "requirements.lock"):
         path = root / relative
         if path.exists():
             lock_inputs.append({"path": relative, "content": path.read_text(encoding="utf-8")})

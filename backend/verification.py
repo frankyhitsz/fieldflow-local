@@ -94,8 +94,6 @@ def verify_schedule(
         overlapping_work_orders=overlapping,
     )
 
-    if active_ids and not result.assignments:
-        error("EMPTY_CANDIDATE", "candidate has no assignments")
     if result.scenario_id != scenario.id:
         error("SCENARIO_ID_MISMATCH", f"candidate scenario {result.scenario_id} does not match {scenario.id}")
     if result.scenario_revision != scenario.revision:

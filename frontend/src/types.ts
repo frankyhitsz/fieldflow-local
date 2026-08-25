@@ -225,7 +225,8 @@ export type RiskSimulation = AnalysisContextFields & {
   absence_disruption_probability: number; no_show_disruption_probability: number
   window_failure_probability: number; overtime_failure_probability: number; emergency_capacity_disruption_probability: number
   emergency_event_probability: number; emergency_caused_failure_probability: number
-  emergency_failure_given_event_probability: number; emergency_caused_window_failure_probability: number
+  emergency_failure_given_event_probability: number | null; emergency_caused_window_failure_probability: number
+  monte_carlo_interval_method: 'PERCENTILE_BOOTSTRAP_V1'
   emergency_caused_overtime_probability: number; emergency_caused_unserved_probability: number
   emergency_caused_sla_degradation_probability: number
   baseline_unserved_orders: number; expected_total_unserved_orders: number

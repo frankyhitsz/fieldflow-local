@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypedDict
 
 from ._version import __version__
@@ -99,6 +99,7 @@ class _RiskRouteState:
     emergency_dispatch_time: int | None = None
     emergency_finish_time: int | None = None
     emergency_dispatch_location: Point | None = None
+    work_order_late_minutes: dict[str, int | None] = field(default_factory=dict)
 
 
 class _RiskTrialOutcome(TypedDict):
@@ -114,9 +115,11 @@ class _RiskTrialOutcome(TypedDict):
     emergency_technician_id: str | None
     emergency_dispatch_time: int | None
     emergency_finish_time: int | None
+    emergency_route_terminal_time: int | None
     emergency_dispatch_location: Point | None
     emergency_decision_information_set: EmergencyDecisionInformationSet | None
     emergency_sla_failure: bool
+    work_order_late_minutes: dict[str, int | None]
 
 
 class DecisionAnalysisError(ValueError):
@@ -1659,9 +1662,10 @@ def capacity_analysis(
                 route_diff=_capacity_route_diff(base, alternative_schedule, external_ids),
                 external_assignments=external_assignments,
                 work_order_dispositions=dispositions,
-                counterfactual_kpis=counterfactual_kpis,
+                counterfactual_kpis=counterfactual_kpis if decision_valid else None,
                 conditional_upper_bound_kpis=counterfactual_kpis if external_conditional else None,
-                counterfactual_cost=alternative_cost,
+                counterfactual_cost=alternative_cost if decision_valid else None,
+                diagnostic_cost=alternative_cost,
             )
         )
     return CapacityAnalysis(
@@ -1952,10 +1956,12 @@ def simulate_plan_risk(
             if no_show:
                 state.unserved += 1
                 state.no_show_failure = True
+                state.work_order_late_minutes[order.id] = None
                 return
             late = max(0, finish - order.sla_deadline)
             state.total_late += late
             state.on_time += int(late == 0)
+            state.work_order_late_minutes[order.id] = late
             state.window_failure = state.window_failure or start > order.window_end
 
         def finish_route(state: _RiskRouteState) -> None:
@@ -2135,13 +2141,10 @@ def simulate_plan_risk(
             route = routes.get(state.technician_id, [])
             for assignment in route[state.next_assignment_index :]:
                 order = orders[assignment.work_order_id]
-                if (
-                    state.ready_assignment_index == state.next_assignment_index
-                    and assignment is route[state.next_assignment_index]
-                ):
-                    arrival = current
-                else:
-                    arrival = current + provider.minutes(location, order.location, current)
+                # This projection starts after the emergency visit. Even when the
+                # technician was waiting at the next customer before dispatch,
+                # they must travel back from the emergency location.
+                arrival = current + provider.minutes(location, order.location, current)
                 start = max(arrival, order.window_start, order.reported_at or 0)
                 if request.execution_policy is RiskExecutionPolicy.follow_published_schedule:
                     start = max(start, assignment.start_time)
@@ -2154,9 +2157,12 @@ def simulate_plan_risk(
 
         states: dict[str, _RiskRouteState] = {}
         unserved = initially_unserved
+        work_order_late_minutes: dict[str, int | None] = {}
         for technician_id in sorted(technicians):
             if technician_id in absent:
-                unserved += len(routes.get(technician_id, []))
+                absent_route = routes.get(technician_id, [])
+                unserved += len(absent_route)
+                work_order_late_minutes.update({item.work_order_id: None for item in absent_route})
                 continue
             states[technician_id] = new_state(technician_id)
 
@@ -2167,6 +2173,7 @@ def simulate_plan_risk(
             excluded: dict[str, str] = {}
             deterministic_dispatches: dict[str, int] = {}
             deterministic_finishes: dict[str, int] = {}
+            deterministic_terminals: dict[str, int] = {}
             for technician_id in sorted(technicians):
                 if technician_id in absent:
                     excluded[technician_id] = "TECHNICIAN_ABSENT"
@@ -2181,6 +2188,7 @@ def simulate_plan_risk(
                     projected_state, emergency_event
                 )
                 deterministic_finishes[technician_id] = emergency_finish
+                deterministic_terminals[technician_id] = deterministic_terminal
                 if deterministic_terminal > technician.shift_end + technician.overtime_limit:
                     excluded[technician_id] = "DETERMINISTIC_MINIMUM_RETURN_EXCEEDS_OVERTIME_LIMIT"
                     continue
@@ -2204,11 +2212,13 @@ def simulate_plan_risk(
                 dispatch_location=selected_state.emergency_dispatch_location if selected_state else None,
                 deterministic_dispatch_by_technician=deterministic_dispatches,
                 deterministic_finish_by_technician=deterministic_finishes,
+                deterministic_terminal_by_technician=deterministic_terminals,
             )
 
         for technician_id, state in states.items():
             if technician_id != emergency_target:
                 finish_route(state)
+            work_order_late_minutes.update(state.work_order_late_minutes)
 
         on_time = sum(state.on_time for state in states.values())
         total_late = sum(state.total_late for state in states.values())
@@ -2232,12 +2242,14 @@ def simulate_plan_risk(
             "emergency_technician_id": emergency_target,
             "emergency_dispatch_time": states[emergency_target].emergency_dispatch_time if emergency_target else None,
             "emergency_finish_time": states[emergency_target].emergency_finish_time if emergency_target else None,
+            "emergency_route_terminal_time": states[emergency_target].current if emergency_target else None,
             "emergency_dispatch_location": (
                 states[emergency_target].emergency_dispatch_location if emergency_target else None
             ),
             "emergency_decision_information_set": decision_information_set,
             "emergency_sla_failure": emergency_event is not None
             and (emergency_target is None or not emergency_on_time),
+            "work_order_late_minutes": work_order_late_minutes,
         }
 
     for trial in range(request.trials):
@@ -2283,8 +2295,12 @@ def simulate_plan_risk(
             0,
             int(outcome["unserved"]) - int(baseline_outcome["unserved"]),
         )
-        emergency_affected_orders = max(0, int(baseline_outcome["on_time"]) - int(outcome["on_time"])) + (
-            emergency_incremental_unserved
+        baseline_dispositions = baseline_outcome["work_order_late_minutes"]
+        emergency_dispositions = outcome["work_order_late_minutes"]
+        emergency_affected_orders = sum(
+            1
+            for work_order_id in set(baseline_dispositions) | set(emergency_dispositions)
+            if baseline_dispositions.get(work_order_id) != emergency_dispositions.get(work_order_id)
         )
         published_sla_rate = int(outcome["on_time"]) / active_count if active_count else 1.0
         all_demand_count = active_count + int(emergency_event)
@@ -2330,6 +2346,7 @@ def simulate_plan_risk(
                 emergency_technician_id=outcome["emergency_technician_id"],
                 emergency_dispatch_time=outcome["emergency_dispatch_time"],
                 emergency_finish_time=outcome["emergency_finish_time"],
+                emergency_route_terminal_time=outcome["emergency_route_terminal_time"],
                 emergency_dispatch_location=outcome["emergency_dispatch_location"],
                 emergency_decision_information_set=outcome["emergency_decision_information_set"],
                 emergency_incremental_late_minutes=emergency_incremental_late,
@@ -2348,9 +2365,15 @@ def simulate_plan_risk(
         plan, "RISK", {"request": request, "resolved_seed": seed}, context, provider
     )
     mean_sla = sum(sla_rates) / request.trials
-    standard_error = statistics.pstdev(sla_rates) / math.sqrt(request.trials)
-    ci_low = max(0.0, mean_sla - 1.96 * standard_error)
-    ci_high = min(1.0, mean_sla + 1.96 * standard_error)
+    bootstrap_means = sorted(
+        statistics.fmean(
+            sla_rates[_keyed_draw(seed, bootstrap_sample, "single_plan_bootstrap", draw, modulo=request.trials)]
+            for draw in range(request.trials)
+        )
+        for bootstrap_sample in range(2_000)
+    )
+    ci_low = bootstrap_means[int(0.025 * (len(bootstrap_means) - 1))]
+    ci_high = bootstrap_means[int(0.975 * (len(bootstrap_means) - 1))]
     disruption_probability = round(failed_trials / request.trials, 4)
     expected_total_unserved = round(sum(unserved_totals) / request.trials, 2)
     late_p50 = _percentile(late_totals, 0.5)
@@ -2441,7 +2464,7 @@ def simulate_plan_risk(
         emergency_event_probability=emergency_event_probability,
         emergency_caused_failure_probability=emergency_caused_probability,
         emergency_failure_given_event_probability=(
-            round(emergency_caused_failure_trials / emergency_event_trials, 4) if emergency_event_trials else 0
+            round(emergency_caused_failure_trials / emergency_event_trials, 4) if emergency_event_trials else None
         ),
         emergency_caused_window_failure_probability=round(
             emergency_caused_window_trials / request.trials,

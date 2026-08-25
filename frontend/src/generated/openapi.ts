@@ -149,6 +149,7 @@ export interface components {
           counterfactual_kpis?: (components['schemas']["CapacityCounterfactualKPI"]) | (null);
           daily_operating_delta_cents?: (number) | (null);
           decision_status?: components['schemas']["CapacityDecisionStatus"];
+          diagnostic_cost?: (components['schemas']["PlanCostBreakdown"]) | (null);
           diagnostic_metrics?: {
             [key: string]: (number) | (number);
           };
@@ -219,7 +220,11 @@ export interface components {
     Comparison: {
           added_work_orders?: Array<string>;
           after: components['schemas']["ScheduleResult"];
+          after_schedule_id?: string;
+          after_source_schedule_id?: (string) | (null);
           before: components['schemas']["ScheduleResult"];
+          before_schedule_id?: string;
+          before_source_schedule_id?: (string) | (null);
           changed_orders: Array<{
             [key: string]: unknown;
           }>;
@@ -230,6 +235,8 @@ export interface components {
             [key: string]: (number) | (number) | (null);
           };
           modified_work_orders?: Array<string>;
+          raw_objective_comparable?: boolean;
+          raw_objective_comparison_reason?: string;
           removed_work_orders?: Array<string>;
           same_scenario_snapshot?: boolean;
           scenario_id: string;
@@ -395,6 +402,9 @@ export interface components {
             [key: string]: number;
           };
           deterministic_finish_by_technician?: {
+            [key: string]: number;
+          };
+          deterministic_terminal_by_technician?: {
             [key: string]: number;
           };
           dispatch_location?: (components['schemas']["Point"]) | (null);
@@ -784,7 +794,7 @@ export interface components {
           emergency_dispatch_policy?: components['schemas']["EmergencyDispatchPolicy"];
           emergency_event_count?: number;
           emergency_event_probability?: number;
-          emergency_failure_given_event_probability?: number;
+          emergency_failure_given_event_probability?: (number) | (null);
           emergency_incremental_late_minutes?: (number) | (null);
           emergency_incremental_overtime_minutes?: (number) | (null);
           emergency_incremental_unserved_orders?: (number) | (null);
@@ -804,6 +814,7 @@ export interface components {
           late_minutes_p50: number;
           late_minutes_p90: number;
           late_minutes_p95: number;
+          monte_carlo_interval_method?: "PERCENTILE_BOOTSTRAP_V1";
           monte_carlo_mean_ci_high?: number;
           monte_carlo_mean_ci_low?: number;
           no_show_disruption_probability?: number;
@@ -845,6 +856,7 @@ export interface components {
           emergency_incremental_overtime_minutes?: number;
           emergency_incremental_unserved_orders?: number;
           emergency_on_time?: boolean;
+          emergency_route_terminal_time?: (number) | (null);
           emergency_technician_id?: (string) | (null);
           published_commitment_sla_rate?: number;
           sla_on_time_rate: number;
@@ -879,6 +891,9 @@ export interface components {
           expected_revision: number;
           lock_changes?: Array<string>;
           modified_work_orders?: Array<string>;
+          plan_changes?: Array<{
+            [key: string]: unknown;
+          }>;
           removed_work_orders?: Array<string>;
           scenario_id: string;
           source_version_id: string;
@@ -925,6 +940,7 @@ export interface components {
         };
     ScheduleCandidate: {
           created_at: string;
+          expected_active_plan_version_id?: (string) | (null);
           id: string;
           planning_context?: (components['schemas']["PlanningContext"]) | (null);
           planning_context_hash?: (string) | (null);
@@ -1009,6 +1025,7 @@ export interface components {
           action: "baseline" | "optimize" | "replan" | "activate" | "restore" | "reattest" | "experiment";
           candidate_id?: (string) | (null);
           effective_time_limit_ms: number;
+          expected_active_plan_version_id?: (string) | (null);
           finished_at?: (string) | (null);
           id: string;
           planning_context?: (components['schemas']["PlanningContext"]) | (null);
@@ -1223,6 +1240,17 @@ export interface components {
           skills: Array<components['schemas']["Skill"]>;
           start_location: components['schemas']["Point"];
         };
+    TechnicianCreate: {
+          color?: string;
+          cost_per_minute_cents?: number;
+          id: string;
+          name: string;
+          overtime_limit?: number;
+          shift_end: number;
+          shift_start: number;
+          skills: Array<components['schemas']["Skill"]>;
+          start_location: components['schemas']["Point"];
+        };
     TechnicianExecutionProjection: {
           available_at: number;
           effective_location: components['schemas']["Point"];
@@ -1332,6 +1360,7 @@ export interface components {
           created_at: string;
           customer_window_late_start_minutes?: number;
           early_start_override_reason?: (string) | (null);
+          effective_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           estimated_remaining_minutes?: (number) | (null);
           event_content_hash?: string;
           id: string;
@@ -1344,8 +1373,10 @@ export interface components {
           planned_start_variance_minutes?: (number) | (null);
           scenario_id: string;
           scenario_revision: number;
+          self_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           sequence?: number;
           source_assignment_hash?: string;
+          source_plan_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           source_sequence?: number;
           technician_id: string;
           work_order_id: string;

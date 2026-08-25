@@ -116,14 +116,14 @@ for order in infeasible.work_orders:
     order.required_skills = [Skill.hvac]
 infeasible_schedule = baseline_schedule(infeasible, 1)
 infeasible_report = verify_schedule(infeasible, infeasible_schedule)
-assert not infeasible_report.publishable
-assert "EMPTY_CANDIDATE" in {item.code for item in infeasible_report.errors}
+assert infeasible_report.publishable
+assert not infeasible_report.errors
 assert len(infeasible_schedule.unassigned) == len(infeasible.work_orders)
 rows.append(
     {
-        "name": "infeasible",
-        "status": "correctly-rejected",
-        "reason": "EMPTY_CANDIDATE",
+        "name": "zero-route-diagnostic",
+        "status": "verified",
+        "reason": "NO_ELIGIBLE_TECHNICIAN",
         "unassigned": len(infeasible_schedule.unassigned),
     }
 )

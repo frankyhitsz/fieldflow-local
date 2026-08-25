@@ -1442,7 +1442,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -1518,7 +1518,7 @@ def test_verifier_rejects_missing_duplicate_overlap_and_forged_kpis():
     empty = original.model_copy(deep=True)
     empty.assignments = []
     empty.unassigned = []
-    assert {"EMPTY_CANDIDATE", "MISSING_WORK_ORDER"}.issubset(_codes(verify_schedule(scenario, empty)))
+    assert "MISSING_WORK_ORDER" in _codes(verify_schedule(scenario, empty))
 
     duplicate = original.model_copy(deep=True)
     duplicate.assignments.append(duplicate.assignments[0].model_copy(deep=True))
