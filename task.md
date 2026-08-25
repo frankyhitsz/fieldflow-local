@@ -49,5 +49,5 @@
 - [x] 后端完整测试：203 passed；coverage 89.84%，85% 门槛通过。
 - [x] Ruff、Pyright、ESLint、React Hooks、TypeScript、OpenAPI、依赖一致性与 Python/npm 审计：通过。
 - [x] React 10 项、生产构建、Demo、Benchmark 和 Playwright API 主流程：通过。
-- [ ] Playwright 页面 4 项：本机 Chromium/Google Chrome 均在页面测试启动时被 macOS 以 SIGTRAP/SIGABRT 终止，未进入断言；等待 GitHub Linux CI 补证。
-- [ ] GitHub Actions：#33 捕获运营复盘旧文案断言并已修正；等待补丁提交后的完整工作流通过。
+- [x] Playwright：本机 API lifecycle 通过；本机页面浏览器受 SIGTRAP/SIGABRT 限制，GitHub Linux CI #36 补证 5/5 通过。
+- [x] GitHub Actions #36：`python-compat` 与完整 `fieldflow` 均成功。
