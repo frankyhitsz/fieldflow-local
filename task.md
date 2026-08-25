@@ -30,8 +30,8 @@
 - [x] 定向回归发现并修复：突发入库推进 D 后再加载旧适用性造成自冲突、v20 坏 JSON 在清洗前计算 v23 proof、人工改派失败终态重放遗漏 lock revision。
 - [x] 第三轮错误契约扫描继续发现 16 个直接返回字符串或缺少 code 的 409；全部改为稳定 code/message，并新增 AST 门禁覆盖所有字面量 409。
 - [x] 本地静态检查、271 项后端测试（覆盖率 88.45%）、8/8 mutation smoke、15 项 React 测试、生产构建、Demo、Benchmark 和 runtime/dev/npm 依赖审计通过；Playwright API 生命周期通过。两套本机 Chromium 均在页面启动阶段被 macOS 以 SIGTRAP/SIGABRT 终止，未出现页面断言失败。
-- [ ] 推送后由 GitHub Linux Chromium 完成 5 项页面/API E2E，并由 Python 3.11、Python 3.12 和 macOS Python 3.12 任务复核全部门禁。
-- [ ] 提交并推送 main，确认 GitHub Actions 全部通过。
+- [x] GitHub Actions #50 由 Linux Chromium 完成 5/5 页面/API E2E；Ubuntu Python 3.11、Ubuntu Python 3.12 全流程和 macOS Python 3.12 三个任务全部通过。
+- [x] 实现提交 `f9b8c40` 已推送 `main`，GitHub Actions #50 全绿。
 
 逐项裁决见 `docs/pro-plan-v0.5.10-assessment.md`。
 
