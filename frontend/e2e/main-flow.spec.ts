@@ -37,7 +37,7 @@ test('baseline, optimize, compare, arbitrary activation, and version report', as
   expect(await report.text()).toContain('FieldFlow 调度台')
 
   await page.getByRole('button', { name: '运营复盘' }).click()
-  await expect(page.getByText('事前冻结计划分析，不含实际执行')).toBeVisible()
+  await expect(page.getByText('完整冻结计划范围')).toBeVisible()
   await expect(page.getByText(/当前版本还没有经营分析/)).toBeVisible()
   const beforeAnalysis = await request.get(`/api/scenarios/${scenarioId}/plan-versions/${plans[2].id}/analysis-runs`)
   expect(await beforeAnalysis.json()).toEqual([])
