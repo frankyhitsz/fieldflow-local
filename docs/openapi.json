@@ -476,6 +476,32 @@
             "title": "Changed Inputs",
             "type": "object"
           },
+          "commercial_verification_status": {
+            "enum": [
+              "VERIFIED",
+              "UNVERIFIED",
+              "NOT_APPLICABLE"
+            ],
+            "title": "Commercial Verification Status",
+            "type": "string"
+          },
+          "conditional_assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Conditional Assumptions",
+            "type": "array"
+          },
+          "conditional_upper_bound_kpis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapacityCounterfactualKPI"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "counterfactual_kpis": {
             "anyOf": [
               {
@@ -490,6 +516,9 @@
             "title": "Created At",
             "type": "string"
           },
+          "decision_status": {
+            "$ref": "#/components/schemas/CapacityDecisionStatus"
+          },
           "effective_integrity": {
             "$ref": "#/components/schemas/AnalysisIntegrityStatus",
             "default": "LEGACY_UNATTESTED"
@@ -500,6 +529,10 @@
             },
             "title": "External Assignments",
             "type": "array"
+          },
+          "formal_result_available": {
+            "title": "Formal Result Available",
+            "type": "boolean"
           },
           "id": {
             "title": "Id",
@@ -544,6 +577,9 @@
             "$ref": "#/components/schemas/AnalysisIntegrityStatus",
             "default": "LEGACY_UNATTESTED"
           },
+          "structural_verification": {
+            "$ref": "#/components/schemas/CapacityVerificationReport"
+          },
           "verification_report": {
             "$ref": "#/components/schemas/CapacityVerificationReport"
           },
@@ -560,8 +596,12 @@
           "scenario_id",
           "analysis_run_id",
           "option_id",
+          "decision_status",
+          "formal_result_available",
           "schedule",
           "verification_report",
+          "structural_verification",
+          "commercial_verification_status",
           "created_at"
         ],
         "title": "CapacityCounterfactualArtifact",
@@ -2081,6 +2121,21 @@
         "title": "DecisionResultManifest",
         "type": "object"
       },
+      "EmergencyDispatchPolicy": {
+        "description": "When a technician may leave the published route for an emergency.",
+        "enum": [
+          "BETWEEN_VISITS_ONLY"
+        ],
+        "title": "EmergencyDispatchPolicy",
+        "type": "string"
+      },
+      "EmergencyResponderSelectionPolicy": {
+        "enum": [
+          "EARLIEST_FEASIBLE_COMPLETION"
+        ],
+        "title": "EmergencyResponderSelectionPolicy",
+        "type": "string"
+      },
       "ExecutionSourceAssignment": {
         "properties": {
           "actual_start_at": {
@@ -2736,6 +2791,50 @@
         "title": "PairedMetricSummary",
         "type": "object"
       },
+      "PlanApplicability": {
+        "description": "Independent dimensions describing whether a published plan still fits current data.",
+        "properties": {
+          "commercial_current": {
+            "default": true,
+            "title": "Commercial Current",
+            "type": "boolean"
+          },
+          "coverage_complete": {
+            "default": true,
+            "title": "Coverage Complete",
+            "type": "boolean"
+          },
+          "invalid_assignment_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Invalid Assignment Ids",
+            "type": "array"
+          },
+          "metrics_current": {
+            "default": true,
+            "title": "Metrics Current",
+            "type": "boolean"
+          },
+          "planning_current": {
+            "default": true,
+            "title": "Planning Current",
+            "type": "boolean"
+          },
+          "reoptimization_opportunity": {
+            "default": false,
+            "title": "Reoptimization Opportunity",
+            "type": "boolean"
+          },
+          "route_executable": {
+            "default": true,
+            "title": "Route Executable",
+            "type": "boolean"
+          }
+        },
+        "title": "PlanApplicability",
+        "type": "object"
+      },
       "PlanCostBreakdown": {
         "properties": {
           "cash_operating_cost_cents": {
@@ -2870,6 +2969,9 @@
             "title": "Active",
             "type": "boolean"
           },
+          "applicability": {
+            "$ref": "#/components/schemas/PlanApplicability"
+          },
           "artifacts": {
             "items": {
               "$ref": "#/components/schemas/ScheduleArtifact"
@@ -2911,6 +3013,16 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "inherited_source_solver_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SolverPolicySnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "integrity_status": {
             "$ref": "#/components/schemas/AnalysisIntegrityStatus",
@@ -2993,6 +3105,16 @@
             "title": "Published Schedule Hash",
             "type": "string"
           },
+          "reattestation_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReattestationMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "relation": {
             "default": "new",
             "enum": [
@@ -3007,6 +3129,17 @@
             ],
             "title": "Relation",
             "type": "string"
+          },
+          "replay_validation_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replay Validation Policy"
           },
           "scenario_id": {
             "title": "Scenario Id",
@@ -3027,6 +3160,10 @@
             "title": "Scenario Snapshot Hash",
             "type": "string"
           },
+          "schedule_integrity": {
+            "$ref": "#/components/schemas/AnalysisIntegrityStatus",
+            "default": "LEGACY_UNATTESTED"
+          },
           "selected": {
             "$ref": "#/components/schemas/ScheduleResult"
           },
@@ -3044,6 +3181,17 @@
               }
             ],
             "title": "Source Plan Snapshot Hash"
+          },
+          "source_solver_provenance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Solver Provenance"
           },
           "source_version_id": {
             "anyOf": [
@@ -3336,6 +3484,10 @@
             "minLength": 8,
             "title": "Idempotency Key",
             "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ReattestationMode",
+            "default": "EXACT_SNAPSHOT"
           }
         },
         "required": [
@@ -3344,6 +3496,14 @@
         ],
         "title": "ReattestPlanRequest",
         "type": "object"
+      },
+      "ReattestationMode": {
+        "enum": [
+          "EXACT_SNAPSHOT",
+          "PLANNING_EQUIVALENT"
+        ],
+        "title": "ReattestationMode",
+        "type": "string"
       },
       "ReplanRequest": {
         "properties": {
@@ -3497,6 +3657,49 @@
         "title": "RestoreRequest",
         "type": "object"
       },
+      "RiskComparisonResult": {
+        "properties": {
+          "delta": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Delta",
+            "type": "object"
+          },
+          "paired_all_demand_sla_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_disruption_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_emergency_completion_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_emergency_on_time_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_overtime_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_published_sla_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          },
+          "paired_unserved_delta": {
+            "$ref": "#/components/schemas/PairedMetricSummary"
+          }
+        },
+        "required": [
+          "paired_published_sla_delta",
+          "paired_all_demand_sla_delta",
+          "paired_emergency_completion_delta",
+          "paired_emergency_on_time_delta",
+          "paired_overtime_delta",
+          "paired_unserved_delta",
+          "paired_disruption_delta"
+        ],
+        "title": "RiskComparisonResult",
+        "type": "object"
+      },
       "RiskComparisonRun": {
         "properties": {
           "after_analysis_id": {
@@ -3611,17 +3814,85 @@
             "title": "Number",
             "type": "integer"
           },
+          "paired_all_demand_sla_delta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "paired_disruption_delta": {
-            "$ref": "#/components/schemas/PairedMetricSummary"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "paired_emergency_completion_delta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "paired_emergency_on_time_delta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "paired_overtime_delta": {
-            "$ref": "#/components/schemas/PairedMetricSummary"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "paired_sla_delta": {
-            "$ref": "#/components/schemas/PairedMetricSummary"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "paired_unserved_delta": {
-            "$ref": "#/components/schemas/PairedMetricSummary"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedMetricSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RiskComparisonResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "scenario_id": {
             "title": "Scenario Id",
@@ -3651,10 +3922,6 @@
           "after_plan_version_id",
           "scenario_set_hash",
           "trials",
-          "paired_sla_delta",
-          "paired_overtime_delta",
-          "paired_unserved_delta",
-          "paired_disruption_delta",
           "comparison_hash",
           "created_at"
         ],
@@ -3707,12 +3974,20 @@
             "title": "Customer No Show Basis Points",
             "type": "integer"
           },
+          "emergency_dispatch_policy": {
+            "$ref": "#/components/schemas/EmergencyDispatchPolicy",
+            "default": "BETWEEN_VISITS_ONLY"
+          },
           "emergency_order_basis_points": {
             "default": 1200,
             "maximum": 10000.0,
             "minimum": 0.0,
             "title": "Emergency Order Basis Points",
             "type": "integer"
+          },
+          "emergency_responder_selection_policy": {
+            "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
+            "default": "EARLIEST_FEASIBLE_COMPLETION"
           },
           "execution_policy": {
             "$ref": "#/components/schemas/RiskExecutionPolicy",
@@ -3781,12 +4056,20 @@
             "title": "Customer No Show Basis Points",
             "type": "integer"
           },
+          "emergency_dispatch_policy": {
+            "$ref": "#/components/schemas/EmergencyDispatchPolicy",
+            "default": "BETWEEN_VISITS_ONLY"
+          },
           "emergency_order_basis_points": {
             "default": 1200,
             "maximum": 10000.0,
             "minimum": 0.0,
             "title": "Emergency Order Basis Points",
             "type": "integer"
+          },
+          "emergency_responder_selection_policy": {
+            "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
+            "default": "EARLIEST_FEASIBLE_COMPLETION"
           },
           "execution_policy": {
             "$ref": "#/components/schemas/RiskExecutionPolicy",
@@ -3988,6 +4271,10 @@
             "title": "Emergency Completion Rate",
             "type": "number"
           },
+          "emergency_dispatch_policy": {
+            "$ref": "#/components/schemas/EmergencyDispatchPolicy",
+            "default": "BETWEEN_VISITS_ONLY"
+          },
           "emergency_event_probability": {
             "default": 0,
             "maximum": 1.0,
@@ -4008,6 +4295,10 @@
             "minimum": 0.0,
             "title": "Emergency On Time Rate",
             "type": "number"
+          },
+          "emergency_responder_selection_policy": {
+            "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
+            "default": "EARLIEST_FEASIBLE_COMPLETION"
           },
           "emergency_unserved_probability": {
             "default": 0,
@@ -4161,6 +4452,24 @@
             "title": "Schedule Signature",
             "type": "string"
           },
+          "scope_total_late_minutes_p50": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Scope Total Late Minutes P50",
+            "type": "integer"
+          },
+          "scope_total_late_minutes_p90": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Scope Total Late Minutes P90",
+            "type": "integer"
+          },
+          "scope_total_late_minutes_p95": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Scope Total Late Minutes P95",
+            "type": "integer"
+          },
           "seed": {
             "title": "Seed",
             "type": "integer"
@@ -4170,7 +4479,7 @@
             "type": "string"
           },
           "simulation_policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_V3",
+            "default": "FIELD_SERVICE_SIMULATION_V4",
             "title": "Simulation Policy Version",
             "type": "string"
           },
@@ -4271,10 +4580,59 @@
             "title": "Emergency Completed",
             "type": "boolean"
           },
+          "emergency_dispatch_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Point"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "emergency_dispatch_time": {
+            "anyOf": [
+              {
+                "maximum": 2760.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Dispatch Time"
+          },
+          "emergency_finish_time": {
+            "anyOf": [
+              {
+                "maximum": 3240.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Finish Time"
+          },
           "emergency_on_time": {
             "default": false,
             "title": "Emergency On Time",
             "type": "boolean"
+          },
+          "emergency_technician_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Technician Id"
           },
           "published_commitment_sla_rate": {
             "default": 0,
@@ -5722,12 +6080,20 @@
             "$ref": "#/components/schemas/AnalysisIntegrityStatus",
             "default": "LEGACY_UNATTESTED"
           },
+          "emergency_dispatch_policy": {
+            "$ref": "#/components/schemas/EmergencyDispatchPolicy",
+            "default": "BETWEEN_VISITS_ONLY"
+          },
           "emergency_events": {
             "items": {
               "$ref": "#/components/schemas/SimulationEmergencyEvent"
             },
             "title": "Emergency Events",
             "type": "array"
+          },
+          "emergency_responder_selection_policy": {
+            "$ref": "#/components/schemas/EmergencyResponderSelectionPolicy",
+            "default": "EARLIEST_FEASIBLE_COMPLETION"
           },
           "exogenous_parameters": {
             "additionalProperties": {
@@ -5754,7 +6120,7 @@
             "default": "LEGACY_UNATTESTED"
           },
           "policy_version": {
-            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V3",
+            "default": "FIELD_SERVICE_SIMULATION_SCENARIOS_V4",
             "title": "Policy Version",
             "type": "string"
           },
@@ -7584,7 +7950,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.6"
+    "version": "0.5.7"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -8205,6 +8571,22 @@
             "schema": {
               "title": "Scenario Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
             }
           }
         ],
@@ -9276,6 +9658,22 @@
               "title": "Scenario Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
           }
         ],
         "responses": {
@@ -9825,6 +10223,22 @@
               "title": "Scenario Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
           }
         ],
         "requestBody": {
@@ -9883,6 +10297,22 @@
               "title": "Technician Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
           }
         ],
         "requestBody": {
@@ -9931,6 +10361,22 @@
             "schema": {
               "title": "Scenario Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
             }
           }
         ],
@@ -9990,6 +10436,22 @@
               "title": "Work Order Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
           }
         ],
         "responses": {
@@ -10035,6 +10497,22 @@
             "schema": {
               "title": "Work Order Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
             }
           }
         ],

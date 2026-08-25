@@ -372,6 +372,26 @@ def test_malformed_plan_is_quarantined_without_blocking_history_list(monkeypatch
         assert detail.json()["detail"]["code"] == "MALFORMED_ATTESTED_RECORD"
 
 
+def test_malformed_scenario_detail_returns_structured_error_and_keeps_quarantine_evidence(monkeypatch, tmp_path):
+    database = tmp_path / "malformed-scenario-isolation.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("UPDATE scenarios SET payload='{' WHERE id='main'")
+        detail = client.get("/api/scenarios/main")
+        assert detail.status_code == 409
+        assert detail.json()["detail"]["code"] == "MALFORMED_ATTESTED_RECORD"
+        assert detail.json()["detail"]["record_type"] == "SCENARIO"
+        listed = client.get("/api/scenarios")
+        assert listed.status_code == 200
+        assert all(item["id"] != "main" for item in listed.json())
+        issues = client.get("/api/integrity-issues").json()
+        assert any(item["source_table"] == "scenarios" and item["source_id"] == "main" for item in issues)
+
+
 def test_execution_cannot_start_before_customer_window(monkeypatch, tmp_path):
     monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "early-start.db"))
     import backend.main as main_module
@@ -1422,7 +1442,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 
@@ -2498,6 +2518,129 @@ def test_replan_persists_explicit_frozen_context_and_only_warns_on_planned_depar
         assert controlled.status_code == 201
         assert controlled.json()["status"] == "FAILED"
         assert controlled.json()["error"]["code"] == "REPLAN_CONTROLLED_REOPTIMIZATION_NOT_SUPPORTED"
+
+
+def test_new_demand_preserves_existing_routes_as_partial_coverage(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "new-demand-applicability.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        order = client.get("/api/scenarios/main").json()["work_orders"][0]
+        order.update(
+            {
+                "id": "WO-NEW-DEMAND",
+                "customer_name": "新增客户",
+                "title": "新增待排需求",
+                "status": "pending",
+                "is_emergency": False,
+                "reported_at": None,
+            }
+        )
+        created = client.post("/api/scenarios/main/work-orders", json=order)
+        assert created.status_code == 200, created.text
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert active["selected"]["id"] == baseline["id"]
+        assert active["coverage_status"] == "PARTIAL_NEW_DEMAND"
+        assert active["applicability"] == {
+            "route_executable": True,
+            "coverage_complete": False,
+            "planning_current": False,
+            "metrics_current": False,
+            "commercial_current": True,
+            "reoptimization_opportunity": False,
+            "invalid_assignment_ids": [],
+        }
+
+
+def test_crud_if_match_rejects_stale_dispatcher_revision(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "crud-if-match.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        current = client.get("/api/scenarios/main").json()
+        first = client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            headers={"If-Match": "D0"},
+            json={"note": "first dispatcher"},
+        )
+        assert first.status_code == 200
+        stale = client.put(
+            "/api/scenarios/main/work-orders/WO-1022",
+            headers={"If-Match": 'W/"D0"'},
+            json={"note": "stale dispatcher"},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"] == {
+            "code": "SCENARIO_REVISION_CONFLICT",
+            "message": "业务数据已变化，请刷新后重试",
+            "expected_revision": current["revision"],
+            "current_revision": 1,
+        }
+
+
+def test_locking_published_assignment_keeps_route_executable_but_marks_planning_stale(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "compatible-lock-applicability.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        assignment = baseline["assignments"][0]
+        locked = client.post(
+            "/api/scenarios/main/lock",
+            headers={"If-Match": "D0"},
+            json={
+                "work_order_id": assignment["work_order_id"],
+                "technician_id": assignment["technician_id"],
+                "locked": True,
+            },
+        )
+        assert locked.status_code == 200, locked.text
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert active["selected"]["id"] == baseline["id"]
+        assert active["coverage_status"] == "STALE_DATA_CHANGED"
+        assert active["applicability"]["route_executable"] is True
+        assert active["applicability"]["planning_current"] is False
+        assert active["applicability"]["invalid_assignment_ids"] == []
+
+
+def test_added_technician_preserves_plan_and_marks_reoptimization_opportunity(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "added-capacity-applicability.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        technician = client.get("/api/scenarios/main").json()["technicians"][0]
+        technician.update({"id": "TECH-NEW-CAPACITY", "name": "新增容量"})
+        created = client.post("/api/scenarios/main/technicians", json=technician)
+        assert created.status_code == 200, created.text
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert active["selected"]["id"] == baseline["id"]
+        assert active["coverage_status"] == "CURRENT_AND_COMPLETE"
+        assert active["applicability"]["route_executable"] is True
+        assert active["applicability"]["coverage_complete"] is True
+        assert active["applicability"]["reoptimization_opportunity"] is True
+
+
+def test_deleting_unassigned_demand_preserves_published_routes(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "delete-unassigned-applicability.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        baseline = client.post("/api/scenarios/main/baseline").json()
+        unassigned_id = baseline["unassigned"][0]["work_order_id"]
+        deleted = client.delete(f"/api/scenarios/main/work-orders/{unassigned_id}")
+        assert deleted.status_code == 200, deleted.text
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert active["selected"]["id"] == baseline["id"]
+        assert active["applicability"]["route_executable"] is True
+        assert active["applicability"]["coverage_complete"] is True
+        assert active["applicability"]["metrics_current"] is False
 
 
 def test_failed_compound_emergency_replan_keeps_demand_and_last_plan(monkeypatch, tmp_path):

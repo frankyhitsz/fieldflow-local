@@ -58,6 +58,32 @@ def technician_planning_payload(technician: Technician) -> dict:
     }
 
 
+def scenario_assignment_feasibility_payload(
+    scenario: ScheduleScenario,
+    provider: TravelTimeProvider,
+) -> dict:
+    """Facts that can invalidate a published route, excluding labels, prices and objective weights."""
+    return {
+        "planning_date": scenario.planning_date,
+        "work_orders": [
+            {
+                **work_order_assignment_feasibility_payload(order),
+                "status": order.status.value,
+            }
+            for order in sorted(scenario.work_orders, key=lambda item: item.id)
+        ],
+        "technicians": [
+            technician_planning_payload(technician)
+            for technician in sorted(scenario.technicians, key=lambda item: item.id)
+        ],
+        "locked_assignments": [
+            item.model_dump(mode="json")
+            for item in sorted(scenario.locked_assignments, key=lambda item: (item.work_order_id, item.technician_id))
+        ],
+        "travel_model_fingerprint": provider.fingerprint,
+    }
+
+
 def assignment_source_fingerprint(assignment: ScheduleAssignment) -> str:
     """Stable identity for the promised visit, independent of future route numbering."""
     return content_hash(

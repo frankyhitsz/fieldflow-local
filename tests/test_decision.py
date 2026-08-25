@@ -32,6 +32,7 @@ from backend.models import (
     DecisionAnalysisContext,
     DecisionAnalysisScope,
     DecisionCostPolicy,
+    EmergencyDispatchPolicy,
     LaborCostMode,
     PlanVersion,
     Point,
@@ -594,6 +595,10 @@ def test_risk_simulation_is_seeded_and_percentiles_are_monotonic():
     assert first.full_day_total_late_minutes_p50 == first.late_minutes_p50
     assert first.full_day_total_late_minutes_p90 == first.late_minutes_p90
     assert first.full_day_total_late_minutes_p95 == first.late_minutes_p95
+    assert first.scope_total_late_minutes_p50 == first.late_minutes_p50
+    assert first.scope_total_late_minutes_p90 == first.late_minutes_p90
+    assert first.scope_total_late_minutes_p95 == first.late_minutes_p95
+    assert first.emergency_dispatch_policy is EmergencyDispatchPolicy.between_visits_only
     assert first.monte_carlo_mean_ci_low == first.sla_rate_ci_low
     assert first.monte_carlo_mean_ci_high == first.sla_rate_ci_high
     assert first.emergency_capacity_disruption_probability == first.emergency_caused_failure_probability
@@ -844,6 +849,43 @@ def test_emergency_demand_is_included_in_all_demand_sla_population():
     assert result.emergency_completion_rate + result.emergency_unserved_probability == pytest.approx(1)
     assert all(metric.emergency_completed or not metric.emergency_on_time for metric in result.trial_metrics)
     assert any(metric.all_demand_sla_rate != metric.published_commitment_sla_rate for metric in result.trial_metrics)
+
+
+def test_emergency_dispatch_uses_realized_travel_checkpoint_for_selection_and_execution():
+    plan = _plan()
+    assert plan.scenario_snapshot is not None
+    for technician in plan.scenario_snapshot.technicians:
+        technician.shift_end = 1600
+        technician.overtime_limit = 240
+    plan.selected.kpis = calculate_kpis(
+        plan.scenario_snapshot,
+        plan.selected.assignments,
+        plan.selected.unassigned,
+    )
+    plan.scenario_snapshot_hash = content_hash(plan.scenario_snapshot)
+    plan.selected.scenario_snapshot_hash = plan.scenario_snapshot_hash
+    _refresh_plan_attestation(plan)
+    request = RiskSimulationRequest(
+        seed=23,
+        trials=50,
+        emergency_order_basis_points=10_000,
+        technician_absence_basis_points=0,
+        customer_no_show_basis_points=0,
+        travel_delay_max_percent=100,
+        service_duration_jitter_percent=25,
+    )
+    manifest = build_simulation_scenario_set(plan.scenario_snapshot, request, 23)
+    event = next(item for item in manifest["emergency_events"] if item["trial"] == 10)
+    metric = simulate_plan_risk(plan, request).trial_metrics[10]
+    first_order = next(item for item in plan.scenario_snapshot.work_orders if item.id == "WO-1024")
+
+    assert event["event_time"] == 553
+    assert metric.emergency_technician_id == "TECH-04"
+    assert metric.emergency_dispatch_time == 561
+    assert metric.emergency_dispatch_time > event["event_time"]
+    assert metric.emergency_dispatch_location == first_order.location
+    assert metric.emergency_finish_time is not None
+    assert metric.emergency_finish_time > metric.emergency_dispatch_time
 
 
 def test_risk_simulation_respects_published_start_time_and_explicit_earliest_mode():
@@ -1135,6 +1177,44 @@ def test_failed_plan_trust_check_does_not_consume_an_analysis_number(monkeypatch
             assert connection.execute("SELECT COUNT(*) FROM decision_analysis_runs").fetchone()[0] == 0
 
 
+def test_analysis_finalization_reloads_parent_plan_and_rejects_mid_run_tampering(monkeypatch, tmp_path):
+    database = tmp_path / "analysis-parent-finalization-race.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    original = main_module.cost_analysis
+
+    def tamper_parent_after_computation(*args, **kwargs):
+        result = original(*args, **kwargs)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            plan_id, payload = connection.execute("SELECT id, payload FROM plan_versions LIMIT 1").fetchone()
+            changed = json.loads(payload)
+            changed["selected"]["solver_note"] = "tampered while A was running"
+            connection.execute(
+                "UPDATE plan_versions SET payload=? WHERE id=?",
+                (json.dumps(changed, ensure_ascii=False), plan_id),
+            )
+        return result
+
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        plan = client.get("/api/scenarios/main/plan-versions").json()[0]
+        monkeypatch.setattr(main_module, "cost_analysis", tamper_parent_after_computation)
+        response = client.post(
+            f"/api/scenarios/main/plan-versions/{plan['id']}/analysis-runs",
+            json={"analysis_type": "COST"},
+        )
+        assert response.status_code == 201, response.text
+        run = response.json()
+        assert run["status"] == "FAILED"
+        assert run["result"] is None
+        assert run["error"]["code"] == "PARENT_PLAN_CHANGED_DURING_ANALYSIS"
+        assert run["parent_plan_integrity"] == "FAILED"
+        assert run["effective_integrity"] == "FAILED"
+        assert run["artifact_manifest"] == []
+
+
 def test_legacy_plan_is_view_only_until_reattestation_creates_a_new_version(monkeypatch, tmp_path):
     database = tmp_path / "legacy-reattestation.db"
     monkeypatch.setenv("FIELDFLOW_DB", str(database))
@@ -1187,6 +1267,11 @@ def test_legacy_plan_is_view_only_until_reattestation_creates_a_new_version(monk
         assert new_plan["relation"] == "reattested_from"
         assert new_plan["source_version_id"] == legacy["id"]
         assert new_plan["effective_integrity"] == "VERIFIED"
+        assert new_plan["schedule_integrity"] == "VERIFIED"
+        assert new_plan["source_solver_provenance"] == legacy["selected"]["solver_name"]
+        assert new_plan["inherited_source_solver_policy"] is not None
+        assert new_plan["replay_validation_policy"] == "FIELD_SERVICE_REATTESTATION_V1"
+        assert new_plan["reattestation_mode"] == "EXACT_SNAPSHOT"
         assert new_plan["publication_manifest_version"] == "FIELD_SERVICE_PUBLICATION_MANIFEST_V2"
         with closing(sqlite3.connect(database)) as connection:
             assert (
@@ -1196,6 +1281,49 @@ def test_legacy_plan_is_view_only_until_reattestation_creates_a_new_version(monk
             assert connection.execute("SELECT COUNT(*) FROM decision_analysis_runs").fetchone()[0] == 0
             assert connection.execute("SELECT COUNT(*) FROM work_order_execution_events").fetchone()[0] == 0
             assert connection.execute("SELECT COUNT(*) FROM scenario_revisions").fetchone()[0] == revision_rows_before
+
+
+def test_planning_equivalent_reattestation_ignores_metadata_but_exact_mode_does_not(monkeypatch, tmp_path):
+    database = tmp_path / "planning-equivalent-reattestation.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        legacy = client.get("/api/scenarios/main/plan-versions").json()[0]
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP TRIGGER prevent_plan_attestation_change")
+            connection.execute(
+                "UPDATE plan_versions SET attestation_requirement='LEGACY_MIGRATED' WHERE id=?",
+                (legacy["id"],),
+            )
+        edited = client.put(
+            "/api/scenarios/main/work-orders/WO-1021",
+            json={"title": "只修改客户可见标题"},
+        )
+        assert edited.status_code == 200
+        exact = client.post(
+            f"/api/scenarios/main/plan-versions/{legacy['id']}/reattest",
+            json={
+                "expected_revision": 1,
+                "idempotency_key": "reattest-exact-metadata-001",
+                "mode": "EXACT_SNAPSHOT",
+            },
+        )
+        assert exact.status_code == 409
+        assert exact.json()["detail"]["code"] == "REATTESTATION_SNAPSHOT_MISMATCH"
+        equivalent = client.post(
+            f"/api/scenarios/main/plan-versions/{legacy['id']}/reattest",
+            json={
+                "expected_revision": 1,
+                "idempotency_key": "reattest-equivalent-001",
+                "mode": "PLANNING_EQUIVALENT",
+            },
+        )
+        assert equivalent.status_code == 200, equivalent.text
+        assert equivalent.json()["reattestation_mode"] == "PLANNING_EQUIVALENT"
+        assert equivalent.json()["scenario_snapshot"]["work_orders"][0]["title"] == "只修改客户可见标题"
 
 
 def test_analysis_run_request_is_discriminated_and_rejects_silent_overrides(monkeypatch, tmp_path):
@@ -1375,6 +1503,12 @@ def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatc
         assert len(outsourced["external_assignments"]) == outsourced["counterfactual_kpis"]["external_assignment_count"]
         assert option["decision_status"] == "EXTERNAL_CONDITIONAL"
         assert option["completion_rate"] is None
+        assert outsourced["decision_status"] == "EXTERNAL_CONDITIONAL"
+        assert outsourced["formal_result_available"] is False
+        assert outsourced["structural_verification"] == outsourced["verification_report"]
+        assert outsourced["commercial_verification_status"] == "UNVERIFIED"
+        assert outsourced["conditional_assumptions"]
+        assert outsourced["conditional_upper_bound_kpis"] == option["conditional_upper_bound_kpis"]
         assert (
             outsourced["counterfactual_kpis"]["completion_rate"]
             == option["conditional_upper_bound_kpis"]["completion_rate"]
@@ -1559,6 +1693,9 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
         assert body["comparison_hash"] and body["integrity_status"] == "VERIFIED"
         for field in (
             "paired_sla_delta",
+            "paired_all_demand_sla_delta",
+            "paired_emergency_completion_delta",
+            "paired_emergency_on_time_delta",
             "paired_overtime_delta",
             "paired_unserved_delta",
             "paired_disruption_delta",
@@ -1566,6 +1703,7 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
             summary = body[field]
             assert summary["win_count"] + summary["tie_count"] + summary["loss_count"] == 50
             assert summary["ci_low"] <= summary["mean_delta"] <= summary["ci_high"]
+        assert body["result"]["paired_published_sla_delta"] == body["paired_sla_delta"]
         stored = client.get(f"/api/scenarios/main/risk-comparisons/{body['id']}")
         assert stored.status_code == 200
         assert stored.json()["comparison_hash"] == body["comparison_hash"]
@@ -1584,6 +1722,26 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
         assert conflict.status_code == 409
         assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
 
+        with closing(sqlite3.connect(database)) as connection:
+            with pytest.raises(sqlite3.IntegrityError, match="attestation requirement is immutable"):
+                connection.execute(
+                    "UPDATE risk_comparison_runs SET attestation_requirement='LEGACY_MIGRATED' WHERE id=?",
+                    (body["id"],),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="LEGACY_MIGRATED is migration-only"):
+                connection.execute(
+                    """
+                    INSERT INTO risk_comparison_runs(
+                        id, scenario_id, number, comparison_hash, comparison_input_hash,
+                        attestation_requirement, payload, created_at
+                    )
+                    SELECT 'RC-forged-legacy', scenario_id, number + 100, comparison_hash || '-legacy',
+                           comparison_input_hash, 'LEGACY_MIGRATED', payload, created_at
+                    FROM risk_comparison_runs WHERE id=?
+                    """,
+                    (body["id"],),
+                )
+
         with closing(sqlite3.connect(database)) as connection, connection:
             analysis_payload = connection.execute(
                 "SELECT payload FROM decision_analysis_runs WHERE id=?", (body["before_analysis_id"],)
@@ -1597,6 +1755,9 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
         invalid_parent = client.get(f"/api/scenarios/main/risk-comparisons/{body['id']}").json()
         assert invalid_parent["effective_integrity"] == "FAILED"
         assert invalid_parent["business_result_available"] is False
+        assert invalid_parent["result"] is None
+        assert invalid_parent["paired_sla_delta"] is None
+        assert invalid_parent["delta"] == {}
 
         with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute(
@@ -1616,6 +1777,8 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
         invalid_trial = client.get(f"/api/scenarios/main/risk-comparisons/{body['id']}").json()
         assert invalid_trial["effective_integrity"] == "FAILED"
         assert invalid_trial["business_result_available"] is False
+        assert invalid_trial["result"] is None
+        assert invalid_trial["paired_unserved_delta"] is None
 
 
 def test_replan_analysis_detects_publication_route_entry_tampering(monkeypatch, tmp_path):
@@ -2199,7 +2362,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -2253,7 +2416,7 @@ def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
 
 
 def test_v14_retry_schema_migration_preserves_analysis_artifacts(monkeypatch, tmp_path):

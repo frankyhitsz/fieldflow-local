@@ -94,6 +94,11 @@ export type PlanVersion = {
   relation: 'new' | 'optimized_from' | 'replanned_from' | 'reactivated_from' | 'restored_from' | 'published_from_experiment' | 'reattested_from' | 'fresh_after_data_change'
   active: boolean; created_at: string; scenario_snapshot?: Scenario | null
   coverage_status: 'CURRENT_AND_COMPLETE' | 'PARTIAL_NEW_DEMAND' | 'STALE_DATA_CHANGED'
+  applicability: {
+    route_executable: boolean; coverage_complete: boolean; planning_current: boolean
+    metrics_current: boolean; commercial_current: boolean; reoptimization_opportunity: boolean
+    invalid_assignment_ids: string[]
+  }
   selected: Schedule
   artifacts: { id: string; role: 'baseline' | 'selected' | 'candidate'; strategy: string; schedule: Schedule }[]
   candidate_id: string | null; scenario_snapshot_hash: string; published_schedule_hash: string
@@ -103,6 +108,9 @@ export type PlanVersion = {
   publication_planning_context?: Record<string, unknown> | null
   publication_verification_artifact?: Record<string, unknown> | null
   attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'
+  schedule_integrity: IntegrityStatus; source_solver_provenance: string | null
+  inherited_source_solver_policy: Schedule['solver_policy']; replay_validation_policy: string | null
+  reattestation_mode: 'EXACT_SNAPSHOT' | 'PLANNING_EQUIVALENT' | null
   integrity_status: IntegrityStatus; self_integrity: IntegrityStatus; effective_integrity: IntegrityStatus
   source_plan_snapshot_hash: string | null
 }
@@ -209,6 +217,8 @@ export type RiskSimulation = AnalysisContextFields & {
   scenario_id: string; plan_version_id: string; plan_number: number; scenario_snapshot_hash: string
   schedule_signature: string; travel_model_fingerprint: string
   execution_policy: 'FOLLOW_PUBLISHED_SCHEDULE' | 'EARLIEST_FEASIBLE_EXECUTION'; execution_policy_version: string
+  emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'
+  emergency_responder_selection_policy: 'EARLIEST_FEASIBLE_COMPLETION'
   simulation_policy_version: string; analysis_code_version: string; simulation_input_hash: string; seed: number; trials: number
   simulation_scenario_set_hash: string
   expected_sla_on_time_rate: number; sla_rate_ci_low: number; sla_rate_ci_high: number
@@ -216,6 +226,7 @@ export type RiskSimulation = AnalysisContextFields & {
   emergency_completion_rate: number; emergency_on_time_rate: number; emergency_unserved_probability: number
   monte_carlo_mean_ci_low: number; monte_carlo_mean_ci_high: number
   full_day_total_late_minutes_p50: number; full_day_total_late_minutes_p90: number; full_day_total_late_minutes_p95: number
+  scope_total_late_minutes_p50: number; scope_total_late_minutes_p90: number; scope_total_late_minutes_p95: number
   late_minutes_p50: number; late_minutes_p90: number; late_minutes_p95: number
   expected_overtime_minutes: number; additional_disruption_probability: number
   technician_absence_event_probability: number; absence_caused_failure_probability: number
@@ -259,7 +270,12 @@ export type DecisionAnalysisRun<T = CostAnalysis | CapacityAnalysis | RiskSimula
 export type CapacityCounterfactualArtifact = {
   artifact_type: 'CAPACITY_COUNTERFACTUAL'
   id: string; scenario_id: string; analysis_run_id: string; option_id: CapacityOption['option_id']
+  decision_status: CapacityOption['decision_status']; formal_result_available: boolean
   schedule: Schedule; verification_report: { valid: boolean; violations: CapacityViolation[] }
+  structural_verification: { valid: boolean; violations: CapacityViolation[] }
+  commercial_verification_status: 'VERIFIED' | 'UNVERIFIED' | 'NOT_APPLICABLE'
+  conditional_assumptions: string[]
+  conditional_upper_bound_kpis: CapacityOption['conditional_upper_bound_kpis']
   route_diff: Record<string, unknown>[]; changed_inputs: Record<string, unknown>
   external_assignments: { work_order_id: string; provider_id: string; service_assumption: string; capacity_verified: boolean; committed_start_time: number | null; committed_finish_time: number | null; sla_commitment: 'UNVERIFIED_ASSUMPTION'; assumed_on_time: boolean; cost_cents: number }[]
   work_order_dispositions: { work_order_id: string; disposition: 'INTERNAL' | 'EXTERNAL' | 'UNSERVED'; technician_id: string | null; external_provider_id: string | null }[]
@@ -269,7 +285,7 @@ export type CapacityCounterfactualArtifact = {
 
 export type SimulationScenarioSetArtifact = {
   artifact_type: 'SIMULATION_SCENARIO_SET'; id: string; scenario_id: string; analysis_run_id: string
-  policy_version: string; keyed_random_version: string; scenario_snapshot_hash: string; seed: number; trials: number
+  policy_version: string; keyed_random_version: string; emergency_dispatch_policy: 'BETWEEN_VISITS_ONLY'; emergency_responder_selection_policy: 'EARLIEST_FEASIBLE_COMPLETION'; scenario_snapshot_hash: string; seed: number; trials: number
   technician_ids: string[]; work_order_ids: string[]; exogenous_parameters: Record<string, number>
   emergency_events: { trial: number; event_id: string; technician_id: string | null; event_time: number; location: Point; duration_minutes: number; required_skill: string; sla_deadline: number }[]
   scenario_set_hash: string; artifact_hash: string; integrity_status: IntegrityStatus; self_integrity: IntegrityStatus; parent_analysis_integrity: IntegrityStatus; effective_integrity: IntegrityStatus; attestation_requirement: 'REQUIRED' | 'LEGACY_MIGRATED'; created_at: string

@@ -365,7 +365,11 @@ export default function App() {
     ...shownScenario.work_orders.flatMap(item => item.required_skills),
   ]).size
   const activePlan = plans.find(item => item.active)
-  const partialCoverage = !historicalScenario && activePlan?.coverage_status === 'PARTIAL_NEW_DEMAND'
+  const displayingActivePlan = !historicalScenario && !!schedule && activePlan?.selected.id === schedule.id
+  const partialCoverage = displayingActivePlan && activePlan?.applicability.coverage_complete === false
+  const routeInvalidated = displayingActivePlan && activePlan?.applicability.route_executable === false
+  const reoptimizationAvailable = displayingActivePlan && activePlan?.applicability.reoptimization_opportunity === true
+  const metricsOutdated = displayingActivePlan && activePlan?.applicability.metrics_current === false
   const executionProgress = !historicalScenario && !!schedule && activePlan?.selected.id === schedule.id
     && schedule.scenario_revision !== scenario.revision
     && scenario.work_orders.some(order => order.status !== 'pending')
@@ -377,16 +381,25 @@ export default function App() {
   }
 
   const applyScenarioEdit = async (next: Scenario, message: string) => {
-    if (!next.work_orders.some(order => order.status !== 'pending')) {
-      invalidatePlan(next, message)
-      return
-    }
     const planItems = await api.planVersions(next.id)
     if (activeScenarioId.current !== next.id) return
     const active = planItems.find(item => item.active)
+    if (!active) {
+      invalidatePlan(next, message)
+      return
+    }
     setScenario(next); setPlans(planItems); setSchedule(active?.selected); setHistoricalScenario(undefined)
     setScenarios(current => current.map(item => item.id === next.id ? next : item))
-    setToast(`${message}；当前执行方案已保留，请完成服务或局部重排`)
+    const suffix = !active.applicability.route_executable
+      ? '当前路线受影响，请局部重排'
+      : !active.applicability.coverage_complete
+        ? '现有路线继续可用，新增需求尚未排入'
+        : active.applicability.reoptimization_opportunity
+          ? '现有路线继续可用，可利用新增容量重新优化'
+          : !active.applicability.metrics_current
+            ? '现有路线继续可用，指标需重新计算'
+            : '当前方案继续可用'
+    setToast(`${message}；${suffix}`)
   }
 
   const saveWorkOrder = async (order: WorkOrder, replan: boolean) => {
@@ -411,8 +424,8 @@ export default function App() {
         return
       }
       const next = workEditor?.initial
-        ? await api.updateWorkOrder(scenario.id, order.id, order)
-        : await api.createWorkOrder(scenario.id, order)
+        ? await api.updateWorkOrder(scenario.id, order.id, order, scenario.revision)
+        : await api.createWorkOrder(scenario.id, order, scenario.revision)
       if (activeScenarioId.current !== next.id) return
       setWorkEditor(undefined)
       if (replan) {
@@ -443,7 +456,7 @@ export default function App() {
   const deleteWorkOrder = async (order: WorkOrder) => {
     if (!window.confirm(`确认删除待处理工单 ${order.id}？`)) return
     setWorking('正在删除工单')
-    try { const next = await api.deleteWorkOrder(scenario.id, order.id); if (activeScenarioId.current !== next.id) return; setWorkEditor(undefined); await applyScenarioEdit(next, '工单已删除') }
+    try { const next = await api.deleteWorkOrder(scenario.id, order.id, scenario.revision); if (activeScenarioId.current !== next.id) return; setWorkEditor(undefined); await applyScenarioEdit(next, '工单已删除') }
     catch (error) { setToast(error instanceof Error ? error.message : '工单删除失败') }
     finally { setWorking(undefined) }
   }
@@ -451,7 +464,7 @@ export default function App() {
   const saveTechnician = async (tech: Technician) => {
     setWorking('正在保存技师资料')
     try {
-      const next = techEditor?.initial ? await api.updateTechnician(scenario.id, tech.id, tech) : await api.createTechnician(scenario.id, tech)
+      const next = techEditor?.initial ? await api.updateTechnician(scenario.id, tech.id, tech, scenario.revision) : await api.createTechnician(scenario.id, tech, scenario.revision)
       if (activeScenarioId.current !== next.id) return
       setTechEditor(undefined); await applyScenarioEdit(next, '技师资料已保存')
     } catch (error) { setToast(error instanceof Error ? error.message : '技师保存失败') }
@@ -504,8 +517,11 @@ export default function App() {
     </section>
     {!schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务数据已修改，现有方案不再适用</strong><span>生成基线或推荐方案后再开始派单。</span></div></div>}
     {partialCoverage && schedule && <div className="stale-banner partial"><AlertTriangle size={16} /><div><strong>突发工单已保存，最后发布方案尚未覆盖全部需求</strong><span>V{String(schedule.version).padStart(3, '0')} 仍保留原承诺；请处理未计划工单后重新重排。</span></div></div>}
+    {routeInvalidated && schedule && <div className="stale-banner"><AlertTriangle size={16} /><div><strong>业务变更影响了已发布路线</strong><span>V{String(schedule.version).padStart(3, '0')} 仅保留用于核对；请先局部重排再继续派单。</span></div></div>}
+    {reoptimizationAvailable && !partialCoverage && schedule && <div className="stale-banner partial"><WandSparkles size={16} /><div><strong>新增技师容量可用于优化</strong><span>现有路线仍可执行；重新优化后才能把新增容量纳入方案和指标。</span></div></div>}
+    {metricsOutdated && !partialCoverage && !routeInvalidated && !reoptimizationAvailable && schedule && <div className="stale-banner partial"><CalendarDays size={16} /><div><strong>现有路线仍可执行，展示指标已过期</strong><span>业务目标、成本或未分配需求发生变化；请重新优化以更新指标。</span></div></div>}
     {executionProgress && <div className="stale-banner partial"><Clock3 size={16} /><div><strong>现场执行状态已更新</strong><span>V{String(schedule.version).padStart(3, '0')} 仍是当前执行依据；局部重排会保留服务中的安排，并排除已完成工单。</span></div></div>}
-    {!partialCoverage && !executionProgress && schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
+    {!displayingActivePlan && !executionProgress && schedule && schedule.scenario_revision !== scenario.revision && <div className="stale-banner historical"><CalendarDays size={16} /><div><strong>正在查看历史方案 V{String(schedule.version).padStart(3, '0')}</strong><span>该方案使用数据 D{String(schedule.scenario_revision).padStart(3, '0')}，当前数据为 D{String(scenario.revision).padStart(3, '0')}，仅供回看。</span></div></div>}
     <KpiStrip schedule={schedule} baseline={baseline} />
     <div className="workspace"><OrderQueue scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} onAdd={() => setWorkEditor({})} /><RouteMap scenario={shownScenario} schedule={schedule} selectedId={selectedId} onSelect={setSelectedId} /><Timeline scenario={shownScenario} schedule={schedule} onSelect={setSelectedId} currentTime={replanTime} /></div>
     <footer className="statusbar"><span><span className="pulse" />行程估算已更新</span><span>业务数据 D{String(shownScenario.revision).padStart(3, '0')}</span><span>{shownScenario.work_orders.length} 工单 / {shownScenario.technicians.length} 技师 / {skillCount} 类技能</span><span className="objective">业务评分 <b>{typeof schedule?.business_score === 'number' ? schedule.business_score.toLocaleString() : '—'}</b></span></footer>
@@ -529,7 +545,7 @@ export default function App() {
       }} onReattest={async item => {
         setWorking('正在重新验证历史计划')
         try {
-          const attested = await api.reattestPlanVersion(scenario.id, item.id, scenario.revision, commandKey('reattest'))
+          const attested = await api.reattestPlanVersion(scenario.id, item.id, scenario.revision, commandKey('reattest'), 'PLANNING_EQUIVALENT')
           if (activeScenarioId.current !== scenario.id) return
           const planItems = await api.planVersions(scenario.id)
           if (activeScenarioId.current !== scenario.id) return
@@ -569,7 +585,7 @@ export default function App() {
       }} onCompare={async (before, after) => { setWorking('正在比较指定版本'); try { setComparison(await api.comparison(scenario.id, before.id, after.id)) } catch (error) { setToast(error instanceof Error ? error.message : '版本比较失败') } finally { setWorking(undefined) } }} onRename={async (item, label) => { try { const updated = await api.renamePlanVersion(scenario.id, item.id, label); setPlans(current => current.map(plan => plan.id === updated.id ? updated : plan)); setToast('方案名称已更新') } catch (error) { setToast(error instanceof Error ? error.message : '重命名失败') } }} onReset={async () => {
         if (!window.confirm('恢复初始业务数据？已有方案历史会保留。')) return
         setWorking('正在恢复初始数据')
-        try { const next = await api.resetScenario(scenario.id); invalidatePlan(next, '业务数据已恢复') }
+        try { const next = await api.resetScenario(scenario.id, scenario.revision); invalidatePlan(next, '业务数据已恢复') }
         catch (error) { setToast(error instanceof Error ? error.message : '恢复失败') }
         finally { setWorking(undefined) }
       }} />}
@@ -597,18 +613,15 @@ export default function App() {
     }} onLock={async (assignment, locked) => {
       setWorking(locked ? '正在锁定安排' : '正在解除锁定')
       try {
-        const next = await api.lock(scenario.id, assignment.work_order_id, assignment.technician_id, locked)
+        const next = await api.lock(scenario.id, assignment.work_order_id, assignment.technician_id, locked, scenario.revision)
         if (activeScenarioId.current !== next.id) return
         const planItems = await api.planVersions(next.id)
         if (activeScenarioId.current !== next.id) return
-        if (next.work_orders.some(order => order.status === 'started')) {
-          const active = planItems.find(item => item.active)
-          setScenario(next); setPlans(planItems); setSchedule(active?.selected); setHistoricalScenario(undefined)
-          setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}；当前执行方案已保留，请局部重排`)
-        } else {
-          setScenario(next); setPlans(planItems); setSchedule(undefined); setBaseline(undefined); setHistoricalScenario(undefined)
-          setToast(`${locked ? '人工锁定已生效' : '已解除人工锁定'}，请重新生成或局部重排方案`)
-        }
+        const active = planItems.find(item => item.active)
+        setScenario(next); setPlans(planItems); setSchedule(active?.selected); setHistoricalScenario(undefined)
+        setToast(active?.applicability.route_executable
+          ? `${locked ? '人工锁定已生效' : '已解除人工锁定'}；现有路线继续可用，建议重新优化更新指标`
+          : `${locked ? '人工锁定已生效' : '已解除人工锁定'}；现有路线受影响，请局部重排`)
       } catch (e) { setToast(e instanceof Error ? e.message : '锁定失败') } finally { setWorking(undefined) }
     }} />}
     {comparison && <CompareDrawer data={comparison} onClose={() => setComparison(undefined)} />}

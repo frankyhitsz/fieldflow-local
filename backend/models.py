@@ -68,6 +68,18 @@ class PlanCoverageStatus(str, Enum):
     stale_data_changed = "STALE_DATA_CHANGED"
 
 
+class PlanApplicability(BaseModel):
+    """Independent dimensions describing whether a published plan still fits current data."""
+
+    route_executable: bool = True
+    coverage_complete: bool = True
+    planning_current: bool = True
+    metrics_current: bool = True
+    commercial_current: bool = True
+    reoptimization_opportunity: bool = False
+    invalid_assignment_ids: list[str] = Field(default_factory=list)
+
+
 class DecisionAnalysisScope(str, Enum):
     frozen_full_plan = "FROZEN_FULL_PLAN"
     publication_remaining_plan = "PUBLICATION_REMAINING_PLAN"
@@ -120,6 +132,16 @@ class RiskExecutionPolicy(str, Enum):
     earliest_feasible_execution = "EARLIEST_FEASIBLE_EXECUTION"
 
 
+class EmergencyDispatchPolicy(str, Enum):
+    """When a technician may leave the published route for an emergency."""
+
+    between_visits_only = "BETWEEN_VISITS_ONLY"
+
+
+class EmergencyResponderSelectionPolicy(str, Enum):
+    earliest_feasible_completion = "EARLIEST_FEASIBLE_COMPLETION"
+
+
 class AnalysisIntegrityStatus(str, Enum):
     verified = "VERIFIED"
     failed = "FAILED"
@@ -149,13 +171,22 @@ class FieldImpact(str, Enum):
     metadata_only = "METADATA_ONLY"
     commercial_only = "COMMERCIAL_ONLY"
     planning_objective = "PLANNING_OBJECTIVE"
+    planning_constraint = "PLANNING_CONSTRAINT"
     assignment_feasibility = "ASSIGNMENT_FEASIBILITY"
+    new_demand = "NEW_DEMAND"
+    capacity_added = "CAPACITY_ADDED"
+    removed_unassigned_demand = "REMOVED_UNASSIGNED_DEMAND"
     execution = "EXECUTION"
 
 
 class AttestationRequirement(str, Enum):
     required = "REQUIRED"
     legacy_migrated = "LEGACY_MIGRATED"
+
+
+class ReattestationMode(str, Enum):
+    exact_snapshot = "EXACT_SNAPSHOT"
+    planning_equivalent = "PLANNING_EQUIVALENT"
 
 
 class CapacityCostSource(str, Enum):
@@ -723,10 +754,16 @@ class PlanVersion(BaseModel):
     publication_manifest_version: str = "FIELD_SERVICE_PUBLICATION_MANIFEST_V1"
     source_plan_snapshot_hash: str | None = None
     coverage_status: PlanCoverageStatus = PlanCoverageStatus.current_and_complete
+    applicability: PlanApplicability = Field(default_factory=PlanApplicability)
     attestation_requirement: AttestationRequirement = AttestationRequirement.required
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     effective_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    schedule_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
+    source_solver_provenance: str | None = None
+    inherited_source_solver_policy: SolverPolicySnapshot | None = None
+    replay_validation_policy: str | None = None
+    reattestation_mode: ReattestationMode | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -737,6 +774,7 @@ class PlanVersion(BaseModel):
         status = migrated.get("integrity_status", AnalysisIntegrityStatus.legacy_unattested.value)
         migrated.setdefault("self_integrity", status)
         migrated.setdefault("effective_integrity", status)
+        migrated.setdefault("schedule_integrity", status)
         return migrated
 
 
@@ -757,6 +795,7 @@ class CloneScenarioRequest(BaseModel):
 class ReattestPlanRequest(BaseModel):
     expected_revision: int = Field(ge=0)
     idempotency_key: IdempotencyKey
+    mode: ReattestationMode = ReattestationMode.exact_snapshot
 
 
 class RollbackPreview(BaseModel):
@@ -1244,6 +1283,10 @@ class RiskSimulationParameters(BaseModel):
     emergency_order_basis_points: int = Field(default=1_200, ge=0, le=10_000)
     customer_no_show_basis_points: int = Field(default=400, ge=0, le=10_000)
     execution_policy: RiskExecutionPolicy = RiskExecutionPolicy.follow_published_schedule
+    emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
+    emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
+        EmergencyResponderSelectionPolicy.earliest_feasible_completion
+    )
 
 
 class RiskSimulationRequest(RiskSimulationParameters):
@@ -1263,8 +1306,12 @@ class RiskSimulationResult(BaseModel):
     actual_execution_included: bool = False
     travel_model_fingerprint: str
     execution_policy: RiskExecutionPolicy
+    emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
+    emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
+        EmergencyResponderSelectionPolicy.earliest_feasible_completion
+    )
     execution_policy_version: str = "FIELD_SERVICE_RISK_EXECUTION_V2"
-    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V3"
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V4"
     analysis_code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
@@ -1285,6 +1332,9 @@ class RiskSimulationResult(BaseModel):
     full_day_total_late_minutes_p50: int = Field(default=0, ge=0)
     full_day_total_late_minutes_p90: int = Field(default=0, ge=0)
     full_day_total_late_minutes_p95: int = Field(default=0, ge=0)
+    scope_total_late_minutes_p50: int = Field(default=0, ge=0)
+    scope_total_late_minutes_p90: int = Field(default=0, ge=0)
+    scope_total_late_minutes_p95: int = Field(default=0, ge=0)
     late_minutes_p50: int = Field(ge=0)
     late_minutes_p90: int = Field(ge=0)
     late_minutes_p95: int = Field(ge=0)
@@ -1486,8 +1536,14 @@ class CapacityCounterfactualArtifact(BaseModel):
     scenario_id: str
     analysis_run_id: str
     option_id: CapacityOptionId
+    decision_status: CapacityDecisionStatus
+    formal_result_available: bool
     schedule: ScheduleResult
     verification_report: CapacityVerificationReport
+    structural_verification: CapacityVerificationReport
+    commercial_verification_status: Literal["VERIFIED", "UNVERIFIED", "NOT_APPLICABLE"]
+    conditional_assumptions: list[str] = Field(default_factory=list)
+    conditional_upper_bound_kpis: CapacityCounterfactualKPI | None = None
     route_diff: list[dict[str, Any]] = Field(default_factory=list)
     changed_inputs: dict[str, Any] = Field(default_factory=dict)
     external_assignments: list[ExternalAssignment] = Field(default_factory=list)
@@ -1523,6 +1579,10 @@ class RiskTrialMetric(BaseModel):
     all_demand_sla_rate: float = Field(default=0, ge=0, le=1)
     emergency_completed: bool = False
     emergency_on_time: bool = False
+    emergency_technician_id: Identifier | None = None
+    emergency_dispatch_time: int | None = Field(default=None, ge=0, le=2760)
+    emergency_finish_time: int | None = Field(default=None, ge=0, le=3240)
+    emergency_dispatch_location: Point | None = None
 
 
 class RiskTrialOutcomeArtifact(BaseModel):
@@ -1546,8 +1606,12 @@ class SimulationScenarioSetArtifact(BaseModel):
     id: str
     scenario_id: str
     analysis_run_id: str
-    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V3"
+    policy_version: str = "FIELD_SERVICE_SIMULATION_SCENARIOS_V4"
     keyed_random_version: str = "FIELD_SERVICE_KEYED_RANDOM_V1"
+    emergency_dispatch_policy: EmergencyDispatchPolicy = EmergencyDispatchPolicy.between_visits_only
+    emergency_responder_selection_policy: EmergencyResponderSelectionPolicy = (
+        EmergencyResponderSelectionPolicy.earliest_feasible_completion
+    )
     scenario_snapshot_hash: str
     seed: int
     trials: int
@@ -1577,6 +1641,17 @@ class PairedMetricSummary(BaseModel):
     loss_count: int = Field(ge=0)
 
 
+class RiskComparisonResult(BaseModel):
+    paired_published_sla_delta: PairedMetricSummary
+    paired_all_demand_sla_delta: PairedMetricSummary
+    paired_emergency_completion_delta: PairedMetricSummary
+    paired_emergency_on_time_delta: PairedMetricSummary
+    paired_overtime_delta: PairedMetricSummary
+    paired_unserved_delta: PairedMetricSummary
+    paired_disruption_delta: PairedMetricSummary
+    delta: dict[str, float] = Field(default_factory=dict)
+
+
 class RiskComparisonRun(BaseModel):
     id: str
     scenario_id: str
@@ -1598,10 +1673,15 @@ class RiskComparisonRun(BaseModel):
     before_scenario_artifact_hash: str = ""
     after_scenario_artifact_hash: str = ""
     trials: int = Field(ge=1)
-    paired_sla_delta: PairedMetricSummary
-    paired_overtime_delta: PairedMetricSummary
-    paired_unserved_delta: PairedMetricSummary
-    paired_disruption_delta: PairedMetricSummary
+    result: RiskComparisonResult | None = None
+    # Compatibility projections. They are deliberately cleared when proof closure fails.
+    paired_sla_delta: PairedMetricSummary | None = None
+    paired_all_demand_sla_delta: PairedMetricSummary | None = None
+    paired_emergency_completion_delta: PairedMetricSummary | None = None
+    paired_emergency_on_time_delta: PairedMetricSummary | None = None
+    paired_overtime_delta: PairedMetricSummary | None = None
+    paired_unserved_delta: PairedMetricSummary | None = None
+    paired_disruption_delta: PairedMetricSummary | None = None
     delta: dict[str, float] = Field(default_factory=dict)
     comparison_hash: str
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified

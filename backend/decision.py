@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import TypedDict
 
 from ._version import __version__
 from .hashing import content_hash
@@ -25,6 +28,8 @@ from .models import (
     DecisionAnalysisContext,
     DecisionAnalysisScope,
     DecisionCostPolicy,
+    EmergencyDispatchPolicy,
+    EmergencyResponderSelectionPolicy,
     ExternalAssignment,
     LaborCostMode,
     PlanCostBreakdown,
@@ -65,6 +70,48 @@ CAPACITY_NAMES: dict[CapacityOptionId, str] = {
     "outsource_unserved": "外包未服务工单",
     "relocate_one_technician_start": "将一名高行程技师的出发点移至需求中心",
 }
+
+
+@dataclass
+class _RiskRouteState:
+    """Mutable state for one technician on one Monte Carlo timeline."""
+
+    technician_id: str
+    current: int
+    location: Point
+    predecessor_id: str
+    next_assignment_index: int = 0
+    ready_assignment_index: int | None = None
+    returned: bool = False
+    on_time: int = 0
+    total_late: int = 0
+    total_overtime: int = 0
+    unserved: int = 0
+    no_show_failure: bool = False
+    window_failure: bool = False
+    overtime_failure: bool = False
+    emergency_completed: bool = False
+    emergency_on_time: bool = False
+    emergency_dispatch_time: int | None = None
+    emergency_finish_time: int | None = None
+    emergency_dispatch_location: Point | None = None
+
+
+class _RiskTrialOutcome(TypedDict):
+    on_time: int
+    total_late: int
+    total_overtime: int
+    unserved: int
+    no_show_failure: bool
+    window_failure: bool
+    overtime_failure: bool
+    emergency_completed: bool
+    emergency_on_time: bool
+    emergency_technician_id: str | None
+    emergency_dispatch_time: int | None
+    emergency_finish_time: int | None
+    emergency_dispatch_location: Point | None
+    emergency_sla_failure: bool
 
 
 class DecisionAnalysisError(ValueError):
@@ -1680,8 +1727,10 @@ def build_simulation_scenario_set(
             )
         )
     return {
-        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V3",
+        "policy_version": "FIELD_SERVICE_SIMULATION_SCENARIOS_V4",
         "keyed_random_version": "FIELD_SERVICE_KEYED_RANDOM_V1",
+        "emergency_dispatch_policy": request.emergency_dispatch_policy.value,
+        "emergency_responder_selection_policy": request.emergency_responder_selection_policy.value,
         "scenario_snapshot_hash": content_hash(scenario),
         "seed": seed,
         "trials": request.trials,
@@ -1769,166 +1818,61 @@ def simulate_plan_risk(
         trial: int,
         absent: set[str],
         emergency_event: SimulationEmergencyEvent | None,
-    ) -> dict[str, int | bool]:
-        on_time = 0
-        total_late = 0
-        total_overtime = 0
-        unserved = initially_unserved
-        no_show_failure = False
-        window_failure = False
-        overtime_failure = False
-        emergency_sla_failure = False
-        emergency_completed = False
-        emergency_target: str | None = None
+    ) -> _RiskTrialOutcome:
+        if request.emergency_dispatch_policy is not EmergencyDispatchPolicy.between_visits_only:
+            raise DecisionAnalysisError(
+                "UNSUPPORTED_EMERGENCY_DISPATCH_POLICY",
+                "当前版本只支持在两次服务之间调度紧急工单",
+            )
+        if (
+            request.emergency_responder_selection_policy
+            is not EmergencyResponderSelectionPolicy.earliest_feasible_completion
+        ):
+            raise DecisionAnalysisError(
+                "UNSUPPORTED_EMERGENCY_RESPONDER_SELECTION_POLICY",
+                "当前版本只支持按紧急服务最早可行完成时间选择响应技师",
+            )
 
-        def realized_state_at_event(
-            technician_id: str,
-            event: SimulationEmergencyEvent,
-        ) -> tuple[int, Point, str]:
+        def new_state(technician_id: str) -> _RiskRouteState:
             technician = technicians[technician_id]
             route_entry = route_entries.get(technician_id)
-            current = route_entry.available_at if route_entry else technician.shift_start
             location = route_entry.location if route_entry else technician.start_location
-            predecessor = (
-                f"ENTRY:{technician_id}:{location.x}:{location.y}" if route_entry else f"DEPOT:{technician_id}"
+            return _RiskRouteState(
+                technician_id=technician_id,
+                current=route_entry.available_at if route_entry else technician.shift_start,
+                location=location,
+                predecessor_id=(
+                    f"ENTRY:{technician_id}:{location.x}:{location.y}" if route_entry else f"DEPOT:{technician_id}"
+                ),
             )
-            for assignment in routes.get(technician_id, []):
-                if assignment.start_time > event.event_time:
-                    break
-                order = orders[assignment.work_order_id]
-                delay_percent = _keyed_draw(
-                    seed,
-                    trial,
-                    "travel",
-                    predecessor,
-                    order.id,
-                    modulo=request.travel_delay_max_percent + 1,
-                )
-                planned_travel = provider.minutes(location, order.location, current)
-                travel = (planned_travel * (100 + delay_percent) + 99) // 100
-                start = max(current + travel, order.window_start, order.reported_at or 0)
-                if request.execution_policy is RiskExecutionPolicy.follow_published_schedule:
-                    start = max(start, assignment.start_time)
-                if _keyed_draw(seed, trial, "no_show", order.id, modulo=10_000) < request.customer_no_show_basis_points:
-                    current = start + 10
-                else:
-                    jitter = request.service_duration_jitter_percent
-                    service_percent = (
-                        100
-                        - jitter
-                        + _keyed_draw(
-                            seed,
-                            trial,
-                            "service_duration",
-                            order.id,
-                            modulo=2 * jitter + 1,
-                        )
-                    )
-                    current = start + max(1, (order.service_duration * service_percent + 50) // 100)
-                location = order.location
-                predecessor = order.id
-            return current, location, predecessor
 
-        if emergency_event is not None:
-            choices: list[tuple[int, int, str]] = []
-            for technician_id, technician in sorted(technicians.items()):
-                if technician_id in absent or emergency_event.required_skill not in technician.skills:
-                    continue
-                route_entry = route_entries.get(technician_id)
-                available_at, location, predecessor = realized_state_at_event(technician_id, emergency_event)
-                depart_at = max(available_at, emergency_event.event_time)
-                planned_travel = provider.minutes(location, emergency_event.location, depart_at)
-                emergency_delay = _keyed_draw(
-                    seed,
-                    trial,
-                    "emergency_travel",
-                    predecessor,
-                    emergency_event.event_id,
-                    modulo=request.travel_delay_max_percent + 1,
-                )
-                travel = (planned_travel * (100 + emergency_delay) + 99) // 100
-                finish = depart_at + travel + emergency_event.duration_minutes
-                terminal = route_entry.return_location if route_entry else technician.start_location
-                return_finish = finish + provider.minutes(emergency_event.location, terminal, finish)
-                if return_finish <= technician.shift_end + technician.overtime_limit:
-                    choices.append((finish, travel, technician_id))
-            if choices:
-                emergency_target = min(choices)[2]
+        def order_timing(
+            state: _RiskRouteState,
+            assignment: ScheduleAssignment,
+        ) -> tuple[int, int, int, bool]:
+            order = orders[assignment.work_order_id]
+            if state.ready_assignment_index == state.next_assignment_index:
+                arrival = state.current
             else:
-                unserved += 1
-
-        for technician_id, technician in sorted(technicians.items()):
-            route = routes.get(technician_id, [])
-            technician = technicians[technician_id]
-            if technician_id in absent:
-                unserved += len(route)
-                continue
-            route_entry = route_entries.get(technician_id)
-            current = route_entry.available_at if route_entry else technician.shift_start
-            current_location = route_entry.location if route_entry else technician.start_location
-            predecessor_id = (
-                f"ENTRY:{technician_id}:{route_entry.location.x}:{route_entry.location.y}"
-                if route_entry
-                else f"DEPOT:{technician_id}"
-            )
-            emergency = emergency_event if technician_id == emergency_target else None
-            emergency_consumed = False
-
-            def apply_emergency(
-                event: SimulationEmergencyEvent | None = emergency,
-                event_technician_id: str = technician_id,
-            ) -> None:
-                nonlocal current, current_location, emergency_consumed, predecessor_id
-                nonlocal emergency_sla_failure, emergency_completed, total_late
-                assert event is not None
-                depart_at = max(current, event.event_time)
-                planned_emergency_travel = provider.minutes(current_location, event.location, depart_at)
-                emergency_delay_percent = _keyed_draw(
-                    seed,
-                    trial,
-                    "emergency_travel",
-                    predecessor_id,
-                    event.event_id,
-                    modulo=request.travel_delay_max_percent + 1,
-                )
-                emergency_travel = (planned_emergency_travel * (100 + emergency_delay_percent) + 99) // 100
-                current = depart_at + emergency_travel + event.duration_minutes
-                emergency_sla_failure = current > event.sla_deadline
-                total_late += max(0, current - event.sla_deadline)
-                emergency_completed = True
-                current_location = event.location
-                predecessor_id = f"EMERGENCY:{trial}:{event_technician_id}"
-                emergency_consumed = True
-
-            for assignment in route:
-                order = orders[assignment.work_order_id]
-                if (
-                    emergency
-                    and not emergency_consumed
-                    and (emergency.event_time <= current or assignment.start_time > emergency.event_time)
-                ):
-                    apply_emergency()
                 delay_percent = _keyed_draw(
                     seed,
                     trial,
                     "travel",
-                    predecessor_id,
+                    state.predecessor_id,
                     order.id,
                     modulo=request.travel_delay_max_percent + 1,
                 )
-                planned_travel = provider.minutes(current_location, order.location, current)
-                travel = (planned_travel * (100 + delay_percent) + 99) // 100
-                arrival = current + travel
-                start = max(arrival, order.window_start, order.reported_at or 0)
-                if request.execution_policy is RiskExecutionPolicy.follow_published_schedule:
-                    start = max(start, assignment.start_time)
-                if _keyed_draw(seed, trial, "no_show", order.id, modulo=10_000) < request.customer_no_show_basis_points:
-                    unserved += 1
-                    current = start + 10
-                    current_location = order.location
-                    predecessor_id = order.id
-                    no_show_failure = True
-                    continue
+                planned_travel = provider.minutes(state.location, order.location, state.current)
+                arrival = state.current + (planned_travel * (100 + delay_percent) + 99) // 100
+            start = max(arrival, order.window_start, order.reported_at or 0)
+            if request.execution_policy is RiskExecutionPolicy.follow_published_schedule:
+                start = max(start, assignment.start_time)
+            no_show = (
+                _keyed_draw(seed, trial, "no_show", order.id, modulo=10_000) < request.customer_no_show_basis_points
+            )
+            if no_show:
+                finish = start + 10
+            else:
                 jitter = request.service_duration_jitter_percent
                 service_percent = (
                     100
@@ -1941,35 +1885,182 @@ def simulate_plan_risk(
                         modulo=2 * jitter + 1,
                     )
                 )
-                duration = max(1, (order.service_duration * service_percent + 50) // 100)
-                finish = start + duration
-                late = max(0, finish - order.sla_deadline)
-                total_late += late
-                if late == 0:
-                    on_time += 1
-                if start > order.window_end:
-                    window_failure = True
-                current = finish
-                current_location = order.location
-                predecessor_id = order.id
-            if emergency and not emergency_consumed:
-                apply_emergency()
-            if route or emergency_consumed:
-                return_location = route_entry.return_location if route_entry else technician.start_location
-                return_minutes = provider.minutes(current_location, return_location, current)
-                delay_percent = _keyed_draw(
-                    seed,
-                    trial,
-                    "return_travel",
-                    predecessor_id,
-                    f"DEPOT:{technician_id}",
-                    modulo=request.travel_delay_max_percent + 1,
-                )
-                current += (return_minutes * (100 + delay_percent) + 99) // 100
-                overtime = max(0, current - technician.shift_end)
-                total_overtime += overtime
-                if overtime > technician.overtime_limit:
-                    overtime_failure = True
+                finish = start + max(1, (order.service_duration * service_percent + 50) // 100)
+            return arrival, start, finish, no_show
+
+        def complete_assignment(
+            state: _RiskRouteState,
+            assignment: ScheduleAssignment,
+            start: int,
+            finish: int,
+            no_show: bool,
+        ) -> None:
+            order = orders[assignment.work_order_id]
+            state.ready_assignment_index = None
+            state.current = finish
+            state.location = order.location
+            state.predecessor_id = order.id
+            state.next_assignment_index += 1
+            if no_show:
+                state.unserved += 1
+                state.no_show_failure = True
+                return
+            late = max(0, finish - order.sla_deadline)
+            state.total_late += late
+            state.on_time += int(late == 0)
+            state.window_failure = state.window_failure or start > order.window_end
+
+        def finish_route(state: _RiskRouteState) -> None:
+            route = routes.get(state.technician_id, [])
+            while state.next_assignment_index < len(route):
+                assignment = route[state.next_assignment_index]
+                _arrival, start, finish, no_show = order_timing(state, assignment)
+                complete_assignment(state, assignment, start, finish, no_show)
+            if state.returned or (not route and not state.emergency_completed):
+                return
+            technician = technicians[state.technician_id]
+            route_entry = route_entries.get(state.technician_id)
+            return_location = route_entry.return_location if route_entry else technician.start_location
+            return_minutes = provider.minutes(state.location, return_location, state.current)
+            delay_percent = _keyed_draw(
+                seed,
+                trial,
+                "return_travel",
+                state.predecessor_id,
+                f"DEPOT:{state.technician_id}",
+                modulo=request.travel_delay_max_percent + 1,
+            )
+            state.current += (return_minutes * (100 + delay_percent) + 99) // 100
+            state.location = return_location
+            state.predecessor_id = f"DEPOT:{state.technician_id}"
+            state.returned = True
+            state.total_overtime = max(0, state.current - technician.shift_end)
+            state.overtime_failure = state.total_overtime > technician.overtime_limit
+
+        def advance_to_dispatch_checkpoint(
+            state: _RiskRouteState,
+            event: SimulationEmergencyEvent,
+        ) -> None:
+            """Advance the authoritative timeline without preempting travel or service."""
+            route = routes.get(state.technician_id, [])
+            while state.next_assignment_index < len(route):
+                if event.event_time <= state.current:
+                    return
+                assignment = route[state.next_assignment_index]
+                order = orders[assignment.work_order_id]
+                arrival, start, finish, no_show = order_timing(state, assignment)
+                if event.event_time <= arrival:
+                    # No mid-travel diversion: arrive at the customer first.
+                    state.current = arrival
+                    state.location = order.location
+                    state.predecessor_id = order.id
+                    state.ready_assignment_index = state.next_assignment_index
+                    return
+                if event.event_time < start:
+                    # Waiting at the next customer is a between-visits checkpoint.
+                    state.current = event.event_time
+                    state.location = order.location
+                    state.predecessor_id = order.id
+                    state.ready_assignment_index = state.next_assignment_index
+                    return
+                complete_assignment(state, assignment, start, finish, no_show)
+                if event.event_time <= finish:
+                    # Finish an active visit before dispatching the emergency.
+                    return
+            if event.event_time <= state.current:
+                return
+            technician = technicians[state.technician_id]
+            route_entry = route_entries.get(state.technician_id)
+            return_location = route_entry.return_location if route_entry else technician.start_location
+            return_minutes = provider.minutes(state.location, return_location, state.current)
+            delay_percent = _keyed_draw(
+                seed,
+                trial,
+                "return_travel",
+                state.predecessor_id,
+                f"DEPOT:{state.technician_id}",
+                modulo=request.travel_delay_max_percent + 1,
+            )
+            return_finish = state.current + (return_minutes * (100 + delay_percent) + 99) // 100
+            route_return_finish = return_finish
+            if event.event_time <= return_finish:
+                # No mid-return diversion: reach the route terminal first.
+                state.current = return_finish
+            else:
+                state.current = event.event_time
+            state.location = return_location
+            state.predecessor_id = f"DEPOT:{state.technician_id}"
+            state.returned = True
+            state.total_overtime = max(0, route_return_finish - technician.shift_end)
+            state.overtime_failure = state.total_overtime > technician.overtime_limit
+
+        def apply_emergency(state: _RiskRouteState, event: SimulationEmergencyEvent) -> int:
+            depart_at = max(state.current, event.event_time)
+            state.emergency_dispatch_time = depart_at
+            state.emergency_dispatch_location = state.location.model_copy(deep=True)
+            planned_travel = provider.minutes(state.location, event.location, depart_at)
+            delay_percent = _keyed_draw(
+                seed,
+                trial,
+                "emergency_travel",
+                state.predecessor_id,
+                event.event_id,
+                modulo=request.travel_delay_max_percent + 1,
+            )
+            travel = (planned_travel * (100 + delay_percent) + 99) // 100
+            state.current = depart_at + travel + event.duration_minutes
+            state.emergency_finish_time = state.current
+            state.total_late += max(0, state.current - event.sla_deadline)
+            state.emergency_completed = True
+            state.emergency_on_time = state.current <= event.sla_deadline
+            state.location = event.location
+            state.predecessor_id = f"EMERGENCY:{trial}:{state.technician_id}"
+            state.ready_assignment_index = None
+            state.returned = False
+            return state.current
+
+        states: dict[str, _RiskRouteState] = {}
+        unserved = initially_unserved
+        for technician_id in sorted(technicians):
+            if technician_id in absent:
+                unserved += len(routes.get(technician_id, []))
+                continue
+            state = new_state(technician_id)
+            if emergency_event is not None:
+                advance_to_dispatch_checkpoint(state, emergency_event)
+            states[technician_id] = state
+
+        emergency_target: str | None = None
+        if emergency_event is not None:
+            choices: list[tuple[int, str, _RiskRouteState]] = []
+            for technician_id, state in states.items():
+                technician = technicians[technician_id]
+                if emergency_event.required_skill not in technician.skills:
+                    continue
+                projected = deepcopy(state)
+                emergency_finish = apply_emergency(projected, emergency_event)
+                finish_route(projected)
+                if not projected.overtime_failure:
+                    choices.append((emergency_finish, technician_id, projected))
+            if choices:
+                _finish, emergency_target, selected_state = min(choices, key=lambda item: (item[0], item[1]))
+                states[emergency_target] = selected_state
+            else:
+                unserved += 1
+
+        for technician_id, state in states.items():
+            if technician_id != emergency_target:
+                finish_route(state)
+
+        on_time = sum(state.on_time for state in states.values())
+        total_late = sum(state.total_late for state in states.values())
+        total_overtime = sum(state.total_overtime for state in states.values())
+        unserved += sum(state.unserved for state in states.values())
+        no_show_failure = any(state.no_show_failure for state in states.values())
+        window_failure = any(state.window_failure for state in states.values())
+        overtime_failure = any(state.overtime_failure for state in states.values())
+        emergency_completed = bool(emergency_target and states[emergency_target].emergency_completed)
+        emergency_on_time = bool(emergency_target and states[emergency_target].emergency_on_time)
         return {
             "on_time": on_time,
             "total_late": total_late,
@@ -1979,9 +2070,15 @@ def simulate_plan_risk(
             "window_failure": window_failure,
             "overtime_failure": overtime_failure,
             "emergency_completed": emergency_completed,
-            "emergency_on_time": emergency_completed and not emergency_sla_failure,
+            "emergency_on_time": emergency_on_time,
+            "emergency_technician_id": emergency_target,
+            "emergency_dispatch_time": states[emergency_target].emergency_dispatch_time if emergency_target else None,
+            "emergency_finish_time": states[emergency_target].emergency_finish_time if emergency_target else None,
+            "emergency_dispatch_location": (
+                states[emergency_target].emergency_dispatch_location if emergency_target else None
+            ),
             "emergency_sla_failure": emergency_event is not None
-            and (emergency_target is None or emergency_sla_failure),
+            and (emergency_target is None or not emergency_on_time),
         }
 
     for trial in range(request.trials):
@@ -2053,6 +2150,10 @@ def simulate_plan_risk(
                 all_demand_sla_rate=all_demand_sla_rate,
                 emergency_completed=bool(outcome["emergency_completed"]),
                 emergency_on_time=bool(outcome["emergency_on_time"]),
+                emergency_technician_id=outcome["emergency_technician_id"],
+                emergency_dispatch_time=outcome["emergency_dispatch_time"],
+                emergency_finish_time=outcome["emergency_finish_time"],
+                emergency_dispatch_location=outcome["emergency_dispatch_location"],
                 total_overtime_minutes=int(outcome["total_overtime"]),
                 total_unserved_orders=int(outcome["unserved"]),
                 disrupted=bool(
@@ -2095,6 +2196,8 @@ def simulate_plan_risk(
         actual_execution_included=context.actual_execution_included,
         travel_model_fingerprint=provider.fingerprint,
         execution_policy=request.execution_policy,
+        emergency_dispatch_policy=request.emergency_dispatch_policy,
+        emergency_responder_selection_policy=request.emergency_responder_selection_policy,
         analysis_code_version=__version__,
         algorithm_version=DECISION_ALGORITHM_VERSION,
         build_sha=decision_build_sha(),
@@ -2119,6 +2222,9 @@ def simulate_plan_risk(
         full_day_total_late_minutes_p50=late_p50,
         full_day_total_late_minutes_p90=late_p90,
         full_day_total_late_minutes_p95=late_p95,
+        scope_total_late_minutes_p50=late_p50,
+        scope_total_late_minutes_p90=late_p90,
+        scope_total_late_minutes_p95=late_p95,
         late_minutes_p50=late_p50,
         late_minutes_p90=late_p90,
         late_minutes_p95=late_p95,
@@ -2163,9 +2269,10 @@ def simulate_plan_risk(
             "技师缺勤会使其整条路线失效；客户不在场按 10 分钟现场处置后离开。",
             "突发事件发生概率与其实际造成窗口、加班、未服务或 SLA 恶化的概率分开列示。",
             "默认服从已发布开始时刻；只有显式 EARLIEST_FEASIBLE_EXECUTION 才按最早可行时刻执行。",
+            "紧急工单采用 BETWEEN_VISITS_ONLY：不打断服务，也不在行驶途中改道；选人和后续路线共用同一条试验时间线。",
             "已知未分配需求与新增扰动概率分开列示，不把原有缺口称为随机失效。",
             "模拟均值抽样区间只描述 Monte Carlo 均值误差，不是现实业务参数的置信区间。",
-            "迟到分位数表示每次模拟的全日总迟到分钟，不是单张工单迟到分位数。",
+            "迟到分位数表示每次模拟在本次分析范围内的总迟到分钟，不是单张工单迟到分位数。",
             "发布承诺 SLA 只覆盖原计划工单；全需求 SLA 另将每个实际发生的紧急需求计入分母。",
         ],
         trial_metrics=trial_metrics,

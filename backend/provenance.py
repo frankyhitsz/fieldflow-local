@@ -51,6 +51,13 @@ def build_plan_manifest_payload(plan: PlanVersion) -> dict[str, object]:
             ),
             "verification_report_hash": plan.publication_verification_report_hash,
             "verification_policy_version": plan.publication_verification_policy_version,
+            "schedule_integrity": plan.schedule_integrity.value,
+            "source_solver_provenance": plan.source_solver_provenance,
+            "inherited_source_solver_policy_hash": (
+                content_hash(plan.inherited_source_solver_policy) if plan.inherited_source_solver_policy else None
+            ),
+            "replay_validation_policy": plan.replay_validation_policy,
+            "reattestation_mode": plan.reattestation_mode.value if plan.reattestation_mode else None,
         },
         "artifacts": artifacts,
     }

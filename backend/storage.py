@@ -25,11 +25,13 @@ from .models import (
     ExecutionSourceAssignment,
     ExecutionSourceContext,
     FrozenBookingIdentity,
+    PlanApplicability,
     PlanCoverageStatus,
     PlanUseCase,
     PlanVersion,
     PublicationPlanningContext,
     PublicationVerificationArtifact,
+    ReattestationMode,
     RiskComparisonRun,
     RiskTrialOutcomeArtifact,
     RouteEntryContext,
@@ -58,7 +60,7 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 _INTEGRITY_RANK = {
     AnalysisIntegrityStatus.failed: 0,
@@ -564,6 +566,13 @@ class Store:
                     scenario_id TEXT NOT NULL,
                     active INTEGER NOT NULL CHECK(active IN (0, 1)),
                     coverage_status TEXT NOT NULL,
+                    route_executable INTEGER NOT NULL DEFAULT 1 CHECK(route_executable IN (0, 1)),
+                    coverage_complete INTEGER NOT NULL DEFAULT 1 CHECK(coverage_complete IN (0, 1)),
+                    planning_current INTEGER NOT NULL DEFAULT 1 CHECK(planning_current IN (0, 1)),
+                    metrics_current INTEGER NOT NULL DEFAULT 1 CHECK(metrics_current IN (0, 1)),
+                    commercial_current INTEGER NOT NULL DEFAULT 1 CHECK(commercial_current IN (0, 1)),
+                    reoptimization_opportunity INTEGER NOT NULL DEFAULT 0 CHECK(reoptimization_opportunity IN (0, 1)),
+                    invalid_assignment_ids TEXT NOT NULL DEFAULT '[]',
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
@@ -1052,6 +1061,24 @@ class Store:
                     JOIN scenarios s ON s.id=p.scenario_id
                     """
                 )
+            if version < 20:
+                existing_columns = {
+                    str(row["name"]) for row in con.execute("PRAGMA table_info(plan_applicability)").fetchall()
+                }
+                applicability_columns = {
+                    "route_executable": "INTEGER NOT NULL DEFAULT 1 CHECK(route_executable IN (0, 1))",
+                    "coverage_complete": "INTEGER NOT NULL DEFAULT 1 CHECK(coverage_complete IN (0, 1))",
+                    "planning_current": "INTEGER NOT NULL DEFAULT 1 CHECK(planning_current IN (0, 1))",
+                    "metrics_current": "INTEGER NOT NULL DEFAULT 1 CHECK(metrics_current IN (0, 1))",
+                    "commercial_current": "INTEGER NOT NULL DEFAULT 1 CHECK(commercial_current IN (0, 1))",
+                    "reoptimization_opportunity": (
+                        "INTEGER NOT NULL DEFAULT 0 CHECK(reoptimization_opportunity IN (0, 1))"
+                    ),
+                    "invalid_assignment_ids": "TEXT NOT NULL DEFAULT '[]'",
+                }
+                for column, definition in applicability_columns.items():
+                    if column not in existing_columns:
+                        con.execute(f"ALTER TABLE plan_applicability ADD COLUMN {column} {definition}")
             con.execute(
                 """
                 INSERT OR IGNORE INTO plan_metadata(plan_version_id, label, note, tags, updated_at)
@@ -1136,6 +1163,14 @@ class Store:
                 BEGIN SELECT RAISE(ABORT, 'LEGACY_MIGRATED is migration-only'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_artifact_attestation_change
                 BEFORE UPDATE OF attestation_requirement ON decision_analysis_artifacts
+                WHEN OLD.attestation_requirement<>NEW.attestation_requirement
+                BEGIN SELECT RAISE(ABORT, 'attestation requirement is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_legacy_risk_comparison_insert
+                BEFORE INSERT ON risk_comparison_runs
+                WHEN NEW.attestation_requirement='LEGACY_MIGRATED'
+                BEGIN SELECT RAISE(ABORT, 'LEGACY_MIGRATED is migration-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_risk_comparison_attestation_change
+                BEFORE UPDATE OF attestation_requirement ON risk_comparison_runs
                 WHEN OLD.attestation_requirement<>NEW.attestation_requirement
                 BEGIN SELECT RAISE(ABORT, 'attestation requirement is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS sync_active_plan_insert
@@ -1329,9 +1364,10 @@ class Store:
         *,
         active: bool | None = None,
         coverage_status: PlanCoverageStatus | None = None,
+        applicability: PlanApplicability | None = None,
     ) -> None:
         existing = con.execute(
-            "SELECT active, coverage_status FROM plan_applicability WHERE plan_version_id=?",
+            "SELECT * FROM plan_applicability WHERE plan_version_id=?",
             (plan_version_id,),
         ).fetchone()
         resolved_active = int(active if active is not None else bool(existing and existing["active"]))
@@ -1342,27 +1378,71 @@ class Store:
             if existing
             else PlanCoverageStatus.current_and_complete.value
         )
+        if applicability is None and existing:
+            applicability = PlanApplicability(
+                route_executable=bool(existing["route_executable"]),
+                coverage_complete=bool(existing["coverage_complete"]),
+                planning_current=bool(existing["planning_current"]),
+                metrics_current=bool(existing["metrics_current"]),
+                commercial_current=bool(existing["commercial_current"]),
+                reoptimization_opportunity=bool(existing["reoptimization_opportunity"]),
+                invalid_assignment_ids=json.loads(existing["invalid_assignment_ids"]),
+            )
+        applicability = applicability or PlanApplicability()
         con.execute(
             """
-            INSERT INTO plan_applicability(plan_version_id, scenario_id, active, coverage_status, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO plan_applicability(
+                plan_version_id, scenario_id, active, coverage_status,
+                route_executable, coverage_complete, planning_current, metrics_current,
+                commercial_current, reoptimization_opportunity, invalid_assignment_ids, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(plan_version_id) DO UPDATE SET
                 active=excluded.active,
                 coverage_status=excluded.coverage_status,
+                route_executable=excluded.route_executable,
+                coverage_complete=excluded.coverage_complete,
+                planning_current=excluded.planning_current,
+                metrics_current=excluded.metrics_current,
+                commercial_current=excluded.commercial_current,
+                reoptimization_opportunity=excluded.reoptimization_opportunity,
+                invalid_assignment_ids=excluded.invalid_assignment_ids,
                 updated_at=excluded.updated_at
             """,
-            (plan_version_id, scenario_id, resolved_active, resolved_coverage, _now()),
+            (
+                plan_version_id,
+                scenario_id,
+                resolved_active,
+                resolved_coverage,
+                int(applicability.route_executable),
+                int(applicability.coverage_complete),
+                int(applicability.planning_current),
+                int(applicability.metrics_current),
+                int(applicability.commercial_current),
+                int(applicability.reoptimization_opportunity),
+                json.dumps(applicability.invalid_assignment_ids, ensure_ascii=False),
+                _now(),
+            ),
         )
 
     @staticmethod
     def _overlay_plan_applicability(con: sqlite3.Connection, plan: PlanVersion) -> PlanVersion:
         row = con.execute(
-            "SELECT active, coverage_status FROM plan_applicability WHERE plan_version_id=?",
+            "SELECT * FROM plan_applicability WHERE plan_version_id=?",
             (plan.id,),
         ).fetchone()
         if row:
             plan.active = bool(row["active"])
             plan.coverage_status = PlanCoverageStatus(row["coverage_status"])
+            plan.applicability = PlanApplicability(
+                route_executable=bool(row["route_executable"]),
+                coverage_complete=bool(row["coverage_complete"]),
+                planning_current=bool(row["planning_current"]),
+                metrics_current=bool(row["metrics_current"]),
+                commercial_current=bool(row["commercial_current"]),
+                reoptimization_opportunity=bool(row["reoptimization_opportunity"]),
+                invalid_assignment_ids=json.loads(row["invalid_assignment_ids"]),
+            )
         else:
             active = con.execute(
                 "SELECT active_plan_version_id FROM scenarios WHERE id=?",
@@ -1546,9 +1626,29 @@ class Store:
         ]
 
     def get_scenario(self, scenario_id: str) -> ScheduleScenario | None:
-        with self._connect() as con:
-            row = con.execute("SELECT payload FROM scenarios WHERE id = ?", (scenario_id,)).fetchone()
-        return ScheduleScenario.model_validate_json(row["payload"]) if row else None
+        malformed: DecisionAnalysisIntegrityError | None = None
+        scenario: ScheduleScenario | None = None
+        with self._lock, self._connect() as con:
+            row = con.execute("SELECT id, payload FROM scenarios WHERE id = ?", (scenario_id,)).fetchone()
+            if row:
+                try:
+                    scenario = ScheduleScenario.model_validate_json(row["payload"])
+                except (TypeError, ValueError):
+                    self._record_read_isolation(
+                        con,
+                        "scenarios",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        "read isolation: malformed scenario payload",
+                    )
+                    malformed = DecisionAnalysisIntegrityError(
+                        "场景记录无法解析，已隔离原始证据",
+                        record_id=str(row["id"]),
+                        record_type="SCENARIO",
+                    )
+        if malformed:
+            raise malformed
+        return scenario
 
     @staticmethod
     def _legacy_upgrade_scenario(scenario: ScheduleScenario) -> ScheduleScenario:
@@ -1579,6 +1679,8 @@ class Store:
         expected_revision: int | None = None,
         preserve_active_plan: bool = False,
         mark_plan_stale: bool = True,
+        plan_coverage_status: PlanCoverageStatus | None = None,
+        plan_applicability: PlanApplicability | None = None,
     ) -> None:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -1601,13 +1703,18 @@ class Store:
                         "SELECT active_plan_version_id FROM scenarios WHERE id=?",
                         (scenario.id,),
                     ).fetchone()
-                    if mark_plan_stale and active and active["active_plan_version_id"]:
+                    if (
+                        (mark_plan_stale or plan_coverage_status or plan_applicability)
+                        and active
+                        and active["active_plan_version_id"]
+                    ):
                         self._set_plan_applicability(
                             con,
                             active["active_plan_version_id"],
                             scenario.id,
                             active=True,
-                            coverage_status=PlanCoverageStatus.stale_data_changed,
+                            coverage_status=plan_coverage_status or PlanCoverageStatus.stale_data_changed,
+                            applicability=plan_applicability,
                         )
                     con.execute(
                         "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -1624,6 +1731,7 @@ class Store:
                             scenario.id,
                             active=False,
                             coverage_status=PlanCoverageStatus.stale_data_changed,
+                            applicability=plan_applicability,
                         )
                     con.execute(
                         "UPDATE scenarios SET payload=?, active_plan_version_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -2257,12 +2365,33 @@ class Store:
             return self._execution_source_context(con, scenario, row["active_plan_version_id"])
 
     def list_execution_events(self, scenario_id: str) -> list[WorkOrderExecutionEvent]:
-        with self._connect() as con:
+        malformed: DecisionAnalysisIntegrityError | None = None
+        events: list[WorkOrderExecutionEvent] = []
+        with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
+                "SELECT id, payload FROM work_order_execution_events WHERE scenario_id=? ORDER BY sequence",
                 (scenario_id,),
             ).fetchall()
-        return [WorkOrderExecutionEvent.model_validate_json(row["payload"]) for row in rows]
+            for row in rows:
+                try:
+                    events.append(WorkOrderExecutionEvent.model_validate_json(row["payload"]))
+                except (TypeError, ValueError):
+                    self._record_read_isolation(
+                        con,
+                        "work_order_execution_events",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        "read isolation: malformed execution event payload",
+                    )
+                    malformed = DecisionAnalysisIntegrityError(
+                        "执行事件记录无法解析；为避免隐藏执行事实，本次读取已拒绝",
+                        record_id=str(row["id"]),
+                        record_type="WORK_ORDER_EXECUTION_EVENT",
+                    )
+                    break
+        if malformed:
+            raise malformed
+        return events
 
     def clone_scenario_idempotently(
         self,
@@ -2468,6 +2597,7 @@ class Store:
         experiment_id: str | None = None,
         experiment_candidate_id: str | None = None,
         publication_planning_context_override: PublicationPlanningContext | None = None,
+        reattestation_mode: ReattestationMode | None = None,
     ) -> PlanVersion:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -2722,6 +2852,15 @@ class Store:
                 integrity_status=AnalysisIntegrityStatus.verified,
                 self_integrity=AnalysisIntegrityStatus.verified,
                 effective_integrity=AnalysisIntegrityStatus.verified,
+                schedule_integrity=AnalysisIntegrityStatus.verified,
+                source_solver_provenance=(publication_source.selected.solver_name if publication_source else None),
+                inherited_source_solver_policy=(
+                    publication_source.selected.solver_policy.model_copy(deep=True)
+                    if publication_source and publication_source.selected.solver_policy
+                    else None
+                ),
+                replay_validation_policy=("FIELD_SERVICE_REATTESTATION_V1" if action == "reattest" else None),
+                reattestation_mode=reattestation_mode if action == "reattest" else None,
             )
             plan.publication_manifest_hash = content_hash(build_plan_manifest_payload(plan))
             con.execute(
@@ -2899,16 +3038,40 @@ class Store:
         return run, candidate
 
     def get_schedule_run(self, run_id: str) -> ScheduleRun | None:
-        with self._connect() as con:
-            row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (run_id,)).fetchone()
-        return ScheduleRun.model_validate_json(row["payload"]) if row else None
+        malformed: DecisionAnalysisIntegrityError | None = None
+        run: ScheduleRun | None = None
+        with self._lock, self._connect() as con:
+            row = con.execute("SELECT id, payload FROM schedule_runs WHERE id=?", (run_id,)).fetchone()
+            if row:
+                try:
+                    run = ScheduleRun.model_validate_json(row["payload"])
+                except (TypeError, ValueError):
+                    self._record_read_isolation(
+                        con, "schedule_runs", str(row["id"]), str(row["payload"]), "read isolation: malformed run"
+                    )
+                    malformed = DecisionAnalysisIntegrityError(
+                        "求解记录无法解析，已隔离原始证据",
+                        record_id=str(row["id"]),
+                        record_type="SCHEDULE_RUN",
+                    )
+        if malformed:
+            raise malformed
+        return run
 
     def list_schedule_runs(self, scenario_id: str) -> list[ScheduleRun]:
-        with self._connect() as con:
+        runs: list[ScheduleRun] = []
+        with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT payload FROM schedule_runs WHERE scenario_id=? ORDER BY created_at", (scenario_id,)
+                "SELECT id, payload FROM schedule_runs WHERE scenario_id=? ORDER BY created_at", (scenario_id,)
             ).fetchall()
-        return [ScheduleRun.model_validate_json(row["payload"]) for row in rows]
+            for row in rows:
+                try:
+                    runs.append(ScheduleRun.model_validate_json(row["payload"]))
+                except (TypeError, ValueError):
+                    self._record_read_isolation(
+                        con, "schedule_runs", str(row["id"]), str(row["payload"]), "read isolation: malformed run"
+                    )
+        return runs
 
     def save_schedule_candidate(self, candidate: ScheduleCandidate) -> ScheduleCandidate:
         with self._lock, self._connect() as con:
@@ -2932,9 +3095,29 @@ class Store:
         return candidate
 
     def get_schedule_candidate(self, candidate_id: str) -> ScheduleCandidate | None:
-        with self._connect() as con:
-            row = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
-        return ScheduleCandidate.model_validate_json(row["payload"]) if row else None
+        malformed: DecisionAnalysisIntegrityError | None = None
+        candidate: ScheduleCandidate | None = None
+        with self._lock, self._connect() as con:
+            row = con.execute("SELECT id, payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
+            if row:
+                try:
+                    candidate = ScheduleCandidate.model_validate_json(row["payload"])
+                except (TypeError, ValueError):
+                    self._record_read_isolation(
+                        con,
+                        "schedule_candidates",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        "read isolation: malformed candidate",
+                    )
+                    malformed = DecisionAnalysisIntegrityError(
+                        "候选方案记录无法解析，已隔离原始证据",
+                        record_id=str(row["id"]),
+                        record_type="SCHEDULE_CANDIDATE",
+                    )
+        if malformed:
+            raise malformed
+        return candidate
 
     def reserve_decision_analysis_run(
         self,
@@ -3046,6 +3229,32 @@ class Store:
                 raise PublicationConflict("经营分析终态与预留输入不一致")
             if row["status"] != "RUNNING":
                 return self._load_analysis_row(con, row)
+            parent_plan_integrity = AnalysisIntegrityStatus.verified
+            parent_row = con.execute(
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                "FROM plan_versions WHERE id=? AND scenario_id=?",
+                (stored.plan_version_id, stored.scenario_id),
+            ).fetchone()
+            try:
+                current_parent = self._load_plan_row(con, parent_row) if parent_row else None
+            except DecisionAnalysisIntegrityError:
+                current_parent = None
+            expected_parent_manifest = stored.input_manifest.plan_manifest_hash if stored.input_manifest else None
+            if run.status == "COMPLETED" and (
+                current_parent is None
+                or current_parent.effective_integrity is not AnalysisIntegrityStatus.verified
+                or current_parent.publication_manifest_hash != expected_parent_manifest
+            ):
+                parent_plan_integrity = AnalysisIntegrityStatus.failed
+                run.status = "FAILED"
+                run.result = None
+                run.error = {
+                    "code": "PARENT_PLAN_CHANGED_DURING_ANALYSIS",
+                    "message": "经营分析计算期间父方案证明发生变化，结果未写入",
+                    "failure_stage": "FINALIZATION",
+                }
+                run.finished_at = _now()
+                artifacts = []
             artifact_manifest: list[dict[str, str]] = []
             for artifact in artifacts or []:
                 expected_artifact_hash = content_hash(_artifact_hash_payload(artifact))
@@ -3085,8 +3294,8 @@ class Store:
             run.analysis_manifest_hash = content_hash(_analysis_manifest_payload(run))
             run.integrity_status = AnalysisIntegrityStatus.verified
             run.self_integrity = AnalysisIntegrityStatus.verified
-            run.parent_plan_integrity = AnalysisIntegrityStatus.verified
-            run.effective_integrity = AnalysisIntegrityStatus.verified
+            run.parent_plan_integrity = parent_plan_integrity
+            run.effective_integrity = _effective_integrity(run.self_integrity, parent_plan_integrity)
             con.execute(
                 """
                 UPDATE decision_analysis_runs
@@ -3568,6 +3777,8 @@ class Store:
             saved.effective_integrity = AnalysisIntegrityStatus.verified
             saved.integrity_status = AnalysisIntegrityStatus.verified
             saved.business_result_available = True
+            if saved.result is None:
+                raise PublicationConflict("风险比较缺少可证明的业务结果")
             con.execute(
                 """
                 INSERT INTO risk_comparison_runs(
@@ -3631,6 +3842,16 @@ class Store:
         )
         comparison.integrity_status = comparison.effective_integrity
         comparison.business_result_available = comparison.effective_integrity is AnalysisIntegrityStatus.verified
+        if not comparison.business_result_available:
+            comparison.result = None
+            comparison.paired_sla_delta = None
+            comparison.paired_all_demand_sla_delta = None
+            comparison.paired_emergency_completion_delta = None
+            comparison.paired_emergency_on_time_delta = None
+            comparison.paired_overtime_delta = None
+            comparison.paired_unserved_delta = None
+            comparison.paired_disruption_delta = None
+            comparison.delta = {}
         return comparison
 
     def get_risk_comparison(self, scenario_id: str, comparison_id: str) -> RiskComparisonRun | None:
@@ -3942,9 +4163,29 @@ class Store:
         return None
 
     def get_experiment(self, experiment_id: str) -> StrategyExperiment | None:
-        with self._connect() as con:
-            row = con.execute("SELECT payload FROM strategy_experiments WHERE id=?", (experiment_id,)).fetchone()
-        return StrategyExperiment.model_validate_json(row["payload"]) if row else None
+        malformed: DecisionAnalysisIntegrityError | None = None
+        experiment: StrategyExperiment | None = None
+        with self._lock, self._connect() as con:
+            row = con.execute("SELECT id, payload FROM strategy_experiments WHERE id=?", (experiment_id,)).fetchone()
+            if row:
+                try:
+                    experiment = StrategyExperiment.model_validate_json(row["payload"])
+                except (TypeError, ValueError):
+                    self._record_read_isolation(
+                        con,
+                        "strategy_experiments",
+                        str(row["id"]),
+                        str(row["payload"]),
+                        "read isolation: malformed experiment",
+                    )
+                    malformed = DecisionAnalysisIntegrityError(
+                        "策略实验记录无法解析，已隔离原始证据",
+                        record_id=str(row["id"]),
+                        record_type="STRATEGY_EXPERIMENT",
+                    )
+        if malformed:
+            raise malformed
+        return experiment
 
     def request_experiment_cancel(self, experiment_id: str) -> StrategyExperiment | None:
         """Atomically record cooperative cancellation without clobbering a terminal result."""
