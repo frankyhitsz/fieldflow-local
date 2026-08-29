@@ -47,7 +47,7 @@ Work-order status is absent from public create and update DTOs. Starting and com
 
 ## Experiments
 
-Strategy experiments use a bounded four-slot queue. Each candidate solve runs in a spawned child process with a wall-clock limit and, on Linux, an address-space limit. Cancellation terminates the active child instead of waiting for OR-Tools to return. A cancellation request cannot be overwritten by stale worker progress. A run can finish as `COMPLETED_WITH_ERRORS` when some profiles fail, and the experiment records the single candidate and plan selected for publication.
+Strategy experiments use a bounded four-slot queue. Each candidate solve runs in a spawned child process with a wall-clock limit and, on Linux, a parent-enforced resident-memory limit. Cancellation terminates the active child instead of waiting for OR-Tools to return. A cancellation request cannot be overwritten by stale worker progress. A run can finish as `COMPLETED_WITH_ERRORS` when some profiles fail, and the experiment records the single candidate and plan selected for publication.
 
 ## Decision analysis
 

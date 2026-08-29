@@ -28,7 +28,7 @@
 | P1-12 `command_keys` 缺少可信关系 | 成立 | 增加 Command Manifest、载荷哈希、关系身份校验和持久隔离。只有关系清单仍可信的终态记录可从资源引用恢复；关系被改写时拒绝。 |
 | P1-13 启动时自动迁移 | 成立 | 提供 inspect、backup、dry-run、apply、verify、restore CLI。应用启动拒绝升级旧 schema；apply 在临时副本验证后原子替换并保留备份。 |
 | P1-14 多处重复完整快照 | 部分成立 | 最大的 trial、决策和排程 Artifact 已改为内容寻址、zlib 压缩与去重 Blob，并提供导出、保留期 prune 和 vacuum。Plan/Run/Candidate 仍保留用于独立审计的自包含快照；在没有分块清单迁移方案前不删除这些证明。 |
-| P1-15 实验线程无法硬停止 OR-Tools | 成立 | 每个实验候选在 spawn 子进程求解；取消和超时会 terminate，Linux 另设 2 GiB 地址空间上限。 |
+| P1-15 实验线程无法硬停止 OR-Tools | 成立 | 每个实验候选在 spawn 子进程求解；取消和超时会 terminate。Linux 由父进程监控实际 RSS 并执行 2 GiB 硬上限，不用虚拟地址空间误判内存。 |
 | P1-16 当前链头与完整历史未分开 | 成立 | DispatchSnapshot 分别返回当前链头可用性和完整历史链状态/问题数；历史祖先损坏不会伪装成当前头损坏。 |
 | P1-17 无活动 Plan 时 Preview 使用最新历史 | 成立 | Preview、激活和恢复比较只使用真实活动 Plan；没有活动 Plan 时当前方案基准为无。 |
 | P1-18 锁无安装哈希、Pyright 范围窄 | 成立 | runtime/dev 锁包含发行文件 SHA-256，安装强制 `--require-hashes`；生成 CycloneDX SBOM，声明 Python 3.11–3.13，strict 范围扩到 7 个核心模块。 |

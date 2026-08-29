@@ -10,7 +10,19 @@ from pydantic import TypeAdapter
 
 from backend.hashing import content_hash
 from backend.models import ReplanRequest, RuntimeJobStatus, WorkOrder
+from backend.solver_worker import process_resident_memory_bytes
 from backend.storage import PublicationConflict, Store
+
+
+def test_linux_resident_memory_reader_uses_rss_not_virtual_size(tmp_path):
+    process = tmp_path / "321"
+    process.mkdir()
+    (process / "status").write_text(
+        "Name:\tfieldflow\nVmSize:\t8388608 kB\nVmRSS:\t2048 kB\n",
+        encoding="utf-8",
+    )
+    assert process_resident_memory_bytes(321, proc_root=tmp_path) == 2 * 1024 * 1024
+    assert process_resident_memory_bytes(999, proc_root=tmp_path) is None
 
 
 def test_runtime_job_lease_outbox_and_terminal_invariants(tmp_path):

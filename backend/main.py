@@ -132,7 +132,12 @@ from .scheduler import (
     replan_schedule,
     scenario_for_profile,
 )
-from .solver_worker import decision_analysis_process, parse_strategy_candidate, strategy_candidate_process
+from .solver_worker import (
+    decision_analysis_process,
+    parse_strategy_candidate,
+    process_exceeds_memory_limit,
+    strategy_candidate_process,
+)
 from .storage import (
     ActivePlanConflict,
     DecisionAnalysisIntegrityError,
@@ -3209,6 +3214,10 @@ def _run_decision_job(job_id: str) -> None:
                 process.terminate()
                 process.join(timeout=5)
                 raise TimeoutError("经营分析子进程超过硬截止时间")
+            if process_exceeds_memory_limit(process.pid):
+                process.terminate()
+                process.join(timeout=5)
+                raise MemoryError("经营分析子进程实际内存超过 2 GiB 上限")
             if not process.is_alive():
                 process.join(timeout=1)
                 raise RuntimeError(f"经营分析子进程异常退出（exit={process.exitcode}）")
@@ -5034,6 +5043,10 @@ def solve_experiment_candidate(
                 process.terminate()
                 process.join(timeout=5)
                 raise TimeoutError("求解子进程超过硬截止时间")
+            if process_exceeds_memory_limit(process.pid):
+                process.terminate()
+                process.join(timeout=5)
+                raise MemoryError("求解子进程实际内存超过 2 GiB 上限")
             if not process.is_alive():
                 process.join(timeout=1)
                 raise RuntimeError(f"求解子进程异常退出（exit={process.exitcode}）")

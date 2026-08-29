@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import multiprocessing.connection
 import os
-import sys
+from pathlib import Path
 from typing import Any
 
 from .hashing import content_hash
@@ -17,6 +17,8 @@ from .scheduler import (
 )
 from .travel import EuclideanTravelTimeProvider
 
+PROCESS_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
 
 def _apply_resource_limits(time_limit_seconds: float) -> None:
     if os.name != "posix":
@@ -26,12 +28,35 @@ def _apply_resource_limits(time_limit_seconds: float) -> None:
 
         cpu_limit = max(5, math.ceil(time_limit_seconds) + 5)
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 1))
-        if sys.platform.startswith("linux"):
-            memory_limit = 2 * 1024 * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
     except (ImportError, OSError, ValueError):
         # The parent still enforces a wall-clock deadline and can terminate us.
         return
+
+
+def process_resident_memory_bytes(pid: int, *, proc_root: Path = Path("/proc")) -> int | None:
+    """Read Linux resident memory without mistaking virtual mappings for RAM."""
+    try:
+        status = (proc_root / str(pid) / "status").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if not line.startswith("VmRSS:"):
+            continue
+        fields = line.split()
+        if len(fields) != 3 or fields[2] != "kB":
+            return None
+        try:
+            return int(fields[1]) * 1024
+        except ValueError:
+            return None
+    return None
+
+
+def process_exceeds_memory_limit(pid: int | None, *, limit_bytes: int = PROCESS_MEMORY_LIMIT_BYTES) -> bool:
+    if pid is None:
+        return False
+    resident = process_resident_memory_bytes(pid)
+    return resident is not None and resident > limit_bytes
 
 
 def solve_strategy_candidate_payload(scenario_payload: dict[str, Any], profile_payload: dict[str, Any]) -> str:
