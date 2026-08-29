@@ -39,7 +39,7 @@
 - [x] 完成三轮独立缺陷审计，并归档上一版 review state；未伪造不可用的外部 reviewer 评分。
 - [x] GitHub Actions #54 暴露 Linux `RLIMIT_AS` 会把 OR-Tools/NumPy 虚拟映射计入上限；改由父进程监控实际 RSS，保留 2 GiB 硬上限。#55 后将异步任务测试的固定轮询统一为基于单调时钟的最多 30 秒等待，消除共享 runner 启动速度造成的伪失败并保留最终诊断状态。
 - [x] GitHub Actions #56 的完整 Ubuntu 流程、Linux Playwright 5/5 和 macOS 后端均通过；Python 3.11 覆盖率运行稳定复现子进程 Store 误执行应用重启恢复、撤销父 Job 租约。恢复扫描现仅由应用 lifespan 主 Store 执行，子进程与维护 CLI 显式禁用；官方 Python 3.11.9 下 300 项覆盖率测试和 8/8 mutation 通过。
-- [ ] GitHub 推送与 Linux Playwright/完整 CI 监控。
+- [x] 实现与修复已推送 `main`；GitHub Actions #57 的 Python 3.11、完整 Ubuntu、Linux Playwright 5/5 和 macOS Python 3.12 门禁全部通过。
 
 ## v0.5.10 实施记录
 
