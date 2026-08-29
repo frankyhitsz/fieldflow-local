@@ -14,6 +14,25 @@ from backend.solver_worker import process_resident_memory_bytes
 from backend.storage import PublicationConflict, Store
 
 
+def wait_for_job_status(
+    client: TestClient,
+    job_id: str,
+    statuses: set[str],
+    *,
+    timeout_seconds: float = 30,
+) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    current: dict = {}
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/v2/scenarios/main/jobs/{job_id}")
+        assert response.status_code == 200, response.text
+        current = response.json()
+        if current["status"] in statuses:
+            return current
+        time.sleep(0.05)
+    return current
+
+
 def test_linux_resident_memory_reader_uses_rss_not_virtual_size(tmp_path):
     process = tmp_path / "321"
     process.mkdir()
@@ -96,11 +115,7 @@ def test_decision_analysis_job_is_non_blocking_durable_and_idempotent(monkeypatc
         assert created.status_code == 202, created.text
         job = created.json()
         assert job["status"] in {"QUEUED", "RUNNING"}
-        for _ in range(200):
-            current = client.get(f"/api/v2/scenarios/main/jobs/{job['id']}").json()
-            if current["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
-                break
-            time.sleep(0.025)
+        current = wait_for_job_status(client, job["id"], {"COMPLETED", "FAILED", "CANCELLED"})
         assert current["status"] == "COMPLETED", current
         run = client.get(f"/api/scenarios/main/analysis-runs/{current['result_resource_id']}")
         assert run.status_code == 200 and run.json()["status"] == "COMPLETED"
@@ -132,19 +147,11 @@ def test_running_risk_job_hard_cancel_interrupts_analysis_subprocess(monkeypatch
         )
         assert created.status_code == 202
         job_id = created.json()["id"]
-        for _ in range(200):
-            current = client.get(f"/api/v2/scenarios/main/jobs/{job_id}").json()
-            if current["status"] == "RUNNING":
-                break
-            time.sleep(0.01)
+        current = wait_for_job_status(client, job_id, {"RUNNING"}, timeout_seconds=10)
         assert current["status"] == "RUNNING"
         cancelled = client.post(f"/api/v2/scenarios/main/jobs/{job_id}/cancel")
         assert cancelled.status_code == 200
-        for _ in range(300):
-            current = client.get(f"/api/v2/scenarios/main/jobs/{job_id}").json()
-            if current["status"] == "CANCELLED":
-                break
-            time.sleep(0.01)
+        current = wait_for_job_status(client, job_id, {"CANCELLED"}, timeout_seconds=10)
         assert current["status"] == "CANCELLED", current
         with closing(sqlite3.connect(database)) as connection:
             running = connection.execute(
@@ -205,11 +212,7 @@ def test_emergency_intake_outbox_recovers_replan_after_restart(monkeypatch, tmp_
 
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
-        for _ in range(400):
-            current = client.get(f"/api/v2/scenarios/main/jobs/{job_id}").json()
-            if current["status"] in {"COMPLETED", "FAILED"}:
-                break
-            time.sleep(0.025)
+        current = wait_for_job_status(client, job_id, {"COMPLETED", "FAILED"})
         assert current["status"] == "COMPLETED", current
         plans = client.get("/api/scenarios/main/plan-versions").json()
         assert len(plans) == 2 and plans[-1]["active"] is True
@@ -255,11 +258,7 @@ def test_interrupted_analysis_job_restarts_as_next_attempt(monkeypatch, tmp_path
 
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
-        for _ in range(400):
-            current = client.get(f"/api/v2/scenarios/main/jobs/{job.id}").json()
-            if current["status"] in {"COMPLETED", "FAILED"}:
-                break
-            time.sleep(0.025)
+        current = wait_for_job_status(client, job.id, {"COMPLETED", "FAILED"})
         assert current["status"] == "COMPLETED", current
         runs = client.get(f"/api/scenarios/main/plan-versions/{plan.id}/analysis-runs").json()
         assert [item["status"] for item in runs] == ["INTERRUPTED", "COMPLETED"]

@@ -38,6 +38,7 @@
 - [x] 本地静态检查、OpenAPI/生成类型、runtime/dev/npm 审计、299 项后端测试（覆盖率 87.15%）、8/8 mutation、17 项 React、生产构建、可重复 Demo 与性能趋势通过；Playwright API 生命周期通过，后续本机 Chromium 启动被 macOS VM 资源短缺终止，未进入页面断言。
 - [x] 完成三轮独立缺陷审计，并归档上一版 review state；未伪造不可用的外部 reviewer 评分。
 - [x] GitHub Actions #54 发现 Linux `RLIMIT_AS` 把 OR-Tools/NumPy 虚拟映射当成实际内存，导致两个 Ubuntu 后端 job 失败；改由父进程监控实际 RSS，保留 2 GiB 硬上限。
+- [x] GitHub Actions #55 两个 Ubuntu job 仍在后端末段失败；将异步任务测试的 2–10 秒固定轮询统一为基于单调时钟的最多 30 秒等待，避免共享 runner 启动速度造成伪失败，并保留最终状态用于断言诊断。
 - [ ] GitHub 推送与 Linux Playwright/完整 CI 监控。
 
 ## v0.5.10 实施记录
