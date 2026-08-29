@@ -681,11 +681,12 @@ class Store:
         travel_provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
         *,
         allow_migration: bool = True,
+        recover_runtime: bool = True,
     ):
         self.path = str(path)
         self.travel_provider = travel_provider
         self._lock = threading.RLock()
-        self._init(allow_migration=allow_migration)
+        self._init(allow_migration=allow_migration, recover_runtime=recover_runtime)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -902,7 +903,7 @@ class Store:
                 previous_hash = revision.revision_hash
                 expected_number += 1
 
-    def _init(self, *, allow_migration: bool) -> None:
+    def _init(self, *, allow_migration: bool, recover_runtime: bool) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as con:
             version = int(con.execute("PRAGMA user_version").fetchone()[0])
@@ -2521,9 +2522,11 @@ class Store:
                 )
                 """
             )
-            interrupted_jobs = con.execute(
-                "SELECT * FROM runtime_jobs WHERE status IN ('RUNNING', 'CANCEL_REQUESTED')"
-            ).fetchall()
+            interrupted_jobs = (
+                con.execute("SELECT * FROM runtime_jobs WHERE status IN ('RUNNING', 'CANCEL_REQUESTED')").fetchall()
+                if recover_runtime
+                else []
+            )
             for job_row in interrupted_jobs:
                 try:
                     job = self._load_runtime_job_row(job_row)
@@ -2552,11 +2555,15 @@ class Store:
                         job.id,
                     ),
                 )
-            active_experiment_rows = con.execute(
-                "SELECT id, payload FROM strategy_experiments "
-                "WHERE json_valid(payload) AND json_extract(payload, '$.status') "
-                "IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')"
-            ).fetchall()
+            active_experiment_rows = (
+                con.execute(
+                    "SELECT id, payload FROM strategy_experiments "
+                    "WHERE json_valid(payload) AND json_extract(payload, '$.status') "
+                    "IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')"
+                ).fetchall()
+                if recover_runtime
+                else []
+            )
             for experiment_row in active_experiment_rows:
                 try:
                     experiment = StrategyExperiment.model_validate_json(experiment_row["payload"])
@@ -2581,9 +2588,11 @@ class Store:
                     "UPDATE strategy_experiments SET payload=? WHERE id=?",
                     (experiment.model_dump_json(), experiment.id),
                 )
-            interrupted = con.execute(
-                "SELECT payload FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')"
-            ).fetchall()
+            interrupted = (
+                con.execute("SELECT payload FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')").fetchall()
+                if recover_runtime
+                else []
+            )
             for row in interrupted:
                 try:
                     run = ScheduleRun.model_validate_json(row["payload"])
@@ -2596,9 +2605,11 @@ class Store:
                     "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
                     (run.status.value, run.model_dump_json(), run.id),
                 )
-            interrupted_analyses = con.execute(
-                "SELECT id, payload, attestation_requirement FROM decision_analysis_runs"
-            ).fetchall()
+            interrupted_analyses = (
+                con.execute("SELECT id, payload, attestation_requirement FROM decision_analysis_runs").fetchall()
+                if recover_runtime
+                else []
+            )
             for row in interrupted_analyses:
                 try:
                     analysis = DecisionAnalysisRun.model_validate_json(row["payload"])
@@ -2635,15 +2646,19 @@ class Store:
                         analysis.id,
                     ),
                 )
-            abandoned_commands = con.execute(
-                """
-                SELECT *
-                FROM command_keys
-                WHERE status IN ('RUNNING', 'REPLAN_RUNNING')
-                   OR (status IN ('RESERVED', 'ANALYSIS_RESERVED') AND namespace LIKE '%:analysis-%')
-                   OR (status='INTAKE_COMMITTED' AND publication_key IS NOT NULL)
-                """
-            ).fetchall()
+            abandoned_commands = (
+                con.execute(
+                    """
+                    SELECT *
+                    FROM command_keys
+                    WHERE status IN ('RUNNING', 'REPLAN_RUNNING')
+                       OR (status IN ('RESERVED', 'ANALYSIS_RESERVED') AND namespace LIKE '%:analysis-%')
+                       OR (status='INTAKE_COMMITTED' AND publication_key IS NOT NULL)
+                    """
+                ).fetchall()
+                if recover_runtime
+                else []
+            )
             for command in abandoned_commands:
                 publication = con.execute(
                     "SELECT plan_version_id FROM publication_keys WHERE key=?",
@@ -4646,7 +4661,15 @@ class Store:
                 raise KeyError(job_id)
             job = self._load_runtime_job_row(row)
             if job.status is not RuntimeJobStatus.running or job.lease_owner != worker_id:
-                raise PublicationConflict("任务租约已失效", code="JOB_LEASE_LOST")
+                raise PublicationConflict(
+                    "任务租约已失效",
+                    code="JOB_LEASE_LOST",
+                    details={
+                        "expected_worker_id": worker_id,
+                        "current_worker_id": job.lease_owner,
+                        "current_status": job.status.value,
+                    },
+                )
             now = _now()
             job.progress = max(job.progress, progress)
             job.heartbeat_at = now

@@ -3234,11 +3234,14 @@ def _run_decision_job(job_id: str) -> None:
                     message=str(error),
                     failure_stage="SUBPROCESS_RUNTIME",
                 )
+            exception_error_payload: dict[str, object] = {"type": type(error).__name__, "message": str(error)}
+            if isinstance(error, PublicationConflict):
+                exception_error_payload.update({"code": error.code, **error.details})
             require_store().finish_runtime_job(
                 job.id,
                 worker_id,
                 status=RuntimeJobStatus.failed,
-                error={"type": type(error).__name__, "message": str(error)},
+                error=exception_error_payload,
             )
         except (KeyError, PublicationConflict):
             return

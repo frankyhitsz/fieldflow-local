@@ -54,4 +54,4 @@
 
 ## 额外发现
 
-实施后的独立回归又发现并修复：Command 状态更新漏写 Manifest payload；求解终态把 solver 字段反向写回不可变输入；API handler 参数调整破坏直接调用兼容；旧 Artifact 迁移产生嵌套 Blob 引用；恢复任务序列化把未传入的活动 V 误变成显式 `null`；重启恢复 Job 遇到已中断 A 时没有创建下一 attempt；压缩 Blob 解码缺少绝对大小上限；Demo 验证复用固定临时数据库而受旧 schema 污染；SQLite CLI 与测试辅助连接只提交但没有关闭。这些问题均有回归测试，不依赖审查稿结论。
+实施后的独立回归又发现并修复：Command 状态更新漏写 Manifest payload；求解终态把 solver 字段反向写回不可变输入；API handler 参数调整破坏直接调用兼容；旧 Artifact 迁移产生嵌套 Blob 引用；恢复任务序列化把未传入的活动 V 误变成显式 `null`；重启恢复 Job 遇到已中断 A 时没有创建下一 attempt；压缩 Blob 解码缺少绝对大小上限；Demo 验证复用固定临时数据库而受旧 schema 污染；SQLite CLI 与测试辅助连接只提交但没有关闭；求解子进程新建 Store 时误执行应用重启恢复，撤销父任务租约。恢复扫描现只允许应用 lifespan 的主 Store 执行，子进程与维护 CLI 使用非恢复模式。这些问题均有回归测试，不依赖审查稿结论。

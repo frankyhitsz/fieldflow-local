@@ -44,6 +44,29 @@ def test_linux_resident_memory_reader_uses_rss_not_virtual_size(tmp_path):
     assert process_resident_memory_bytes(999, proc_root=tmp_path) is None
 
 
+def test_child_store_does_not_run_application_restart_recovery(tmp_path):
+    database = tmp_path / "child-store.db"
+    store = Store(database)
+    job, _ = store.enqueue_runtime_job(
+        job_type="RISK_ANALYSIS",
+        scenario_id="main",
+        input_payload={"plan_version_id": "PV-1"},
+        dedupe_key="child-store-recovery-proof-001",
+    )
+    claimed = store.claim_runtime_job("parent-worker", job_id=job.id, lease_seconds=120)
+    assert claimed is not None and claimed.status is RuntimeJobStatus.running
+
+    Store(database, allow_migration=False, recover_runtime=False)
+    still_running = store.get_runtime_job(job.id)
+    assert still_running is not None
+    assert still_running.status is RuntimeJobStatus.running
+    assert still_running.lease_owner == "parent-worker"
+
+    Store(database, allow_migration=False)
+    interrupted = store.get_runtime_job(job.id)
+    assert interrupted is not None and interrupted.status is RuntimeJobStatus.interrupted
+
+
 def test_runtime_job_lease_outbox_and_terminal_invariants(tmp_path):
     database = tmp_path / "jobs.db"
     store = Store(database)

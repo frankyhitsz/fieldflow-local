@@ -71,7 +71,7 @@ def timestamped_backup_path(database: Path, label: str) -> Path:
 
 def migrate_copy(source: Path, destination: Path) -> dict[str, object]:
     sqlite_backup(source, destination)
-    Store(destination)
+    Store(destination, recover_runtime=False)
     return verified(destination, require_current_schema=True)
 
 
@@ -176,7 +176,7 @@ def command_restore(database: Path, backup: Path, force: bool) -> int:
 
 def artifact_store(database: Path) -> Store:
     verified(database, require_current_schema=True)
-    return Store(database)
+    return Store(database, recover_runtime=False)
 
 
 def command_artifact_inspect(database: Path) -> int:

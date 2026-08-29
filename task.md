@@ -35,10 +35,10 @@
 - [x] v0.7/v0.8/v1 逐项裁决；完成本轮可落地的 CODEOWNERS、SBOM、性能基线、数据保留与隐私说明。未用空表冒充 Visit/库存/资产闭环，也未在缺少真实样本时声称完成风险校准。
 - [x] 第二轮全量回归修复 Command Manifest payload 漏写、Run 终态改写输入身份、handler 直接调用兼容、旧 Artifact 嵌套 Blob 和恢复任务字段存在性五项交叉缺陷。
 - [x] 第三轮重启/取消/损坏审计修复已中断 A 不生成下一 attempt、压缩 Blob 无绝对解码上限、Demo 复用旧临时数据库和 SQLite 辅助连接未关闭。
-- [x] 本地静态检查、OpenAPI/生成类型、runtime/dev/npm 审计、299 项后端测试（覆盖率 87.15%）、8/8 mutation、17 项 React、生产构建、可重复 Demo 与性能趋势通过；Playwright API 生命周期通过，后续本机 Chromium 启动被 macOS VM 资源短缺终止，未进入页面断言。
+- [x] 本地静态检查、OpenAPI/生成类型、runtime/dev/npm 审计、300 项后端测试（覆盖率 87.15%）、8/8 mutation、17 项 React、生产构建、可重复 Demo 与性能趋势通过；本机 Playwright API 生命周期通过。
 - [x] 完成三轮独立缺陷审计，并归档上一版 review state；未伪造不可用的外部 reviewer 评分。
-- [x] GitHub Actions #54 发现 Linux `RLIMIT_AS` 把 OR-Tools/NumPy 虚拟映射当成实际内存，导致两个 Ubuntu 后端 job 失败；改由父进程监控实际 RSS，保留 2 GiB 硬上限。
-- [x] GitHub Actions #55 两个 Ubuntu job 仍在后端末段失败；将异步任务测试的 2–10 秒固定轮询统一为基于单调时钟的最多 30 秒等待，避免共享 runner 启动速度造成伪失败，并保留最终状态用于断言诊断。
+- [x] GitHub Actions #54 暴露 Linux `RLIMIT_AS` 会把 OR-Tools/NumPy 虚拟映射计入上限；改由父进程监控实际 RSS，保留 2 GiB 硬上限。#55 后将异步任务测试的固定轮询统一为基于单调时钟的最多 30 秒等待，消除共享 runner 启动速度造成的伪失败并保留最终诊断状态。
+- [x] GitHub Actions #56 的完整 Ubuntu 流程、Linux Playwright 5/5 和 macOS 后端均通过；Python 3.11 覆盖率运行稳定复现子进程 Store 误执行应用重启恢复、撤销父 Job 租约。恢复扫描现仅由应用 lifespan 主 Store 执行，子进程与维护 CLI 显式禁用；官方 Python 3.11.9 下 300 项覆盖率测试和 8/8 mutation 通过。
 - [ ] GitHub 推送与 Linux Playwright/完整 CI 监控。
 
 ## v0.5.10 实施记录

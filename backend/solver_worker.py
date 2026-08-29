@@ -124,7 +124,7 @@ def decision_analysis_process(
         from .models import DecisionAnalysisRunRequest, PlanUseCase
         from .storage import Store
 
-        child_store = Store(database_path, allow_migration=False)
+        child_store = Store(database_path, allow_migration=False, recover_runtime=False)
         main_module.store = child_store
         request = main_module.TypeAdapter(DecisionAnalysisRunRequest).validate_python(request_payload)
         plan = main_module.require_plan_for_use(scenario_id, plan_version_id, PlanUseCase.analyze)
