@@ -1,6 +1,7 @@
 import type {
   CapacityAnalysis, Comparison, CostAnalysis, DecisionAnalysisRun, PlanVersion, RiskSimulation, RollbackPreview, Scenario, Schedule, Strategy, StrategyExperiment,
-  DecisionAnalysisArtifact, ExecutionEvent, ExecutionResult, ManualReassignmentResult, OperationalView, StrategyProfile, StrategyWeights, Technician, WorkOrder,
+  DecisionAnalysisArtifact, DispatchSnapshot, ExecutionEvent, ExecutionResult, ManualReassignmentResult, OperationalView, StrategyProfile, StrategyWeights, Technician, WorkOrder,
+  RuntimeJob,
 } from './types'
 
 export class ApiError extends Error {
@@ -57,6 +58,7 @@ export const api = {
   scenarios: () => request<Scenario[]>('/api/scenarios'),
   scenario: (id: string) => request<Scenario>(`/api/scenarios/${id}`),
   operationalView: (id: string) => request<OperationalView>(`/api/scenarios/${id}/operational-view`),
+  dispatchSnapshot: (id: string) => request<DispatchSnapshot>(`/api/scenarios/${id}/dispatch-snapshot`),
   resetScenario: (id: string, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${id}/reset`, { method: 'POST', headers: { 'If-Match': `D${expectedRevision}` } }),
   schedules: (id: string) => request<Schedule[]>(`/api/scenarios/${id}/schedules`),
   planVersions: (id: string) => request<PlanVersion[]>(`/api/scenarios/${id}/plan-versions`),
@@ -101,17 +103,35 @@ export const api = {
     return request<Scenario>(`/api/v2/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'PUT', headers: { 'If-Match': `D${expectedRevision}` }, body: JSON.stringify(payload) })
   },
   deleteWorkOrder: (scenarioId: string, orderId: string, expectedRevision: number) => request<Scenario>(`/api/v2/scenarios/${scenarioId}/work-orders/${orderId}`, { method: 'DELETE', headers: { 'If-Match': `D${expectedRevision}` } }),
+  cancelEmergencyIntake: (scenarioId: string, orderId: string, expectedRevision: number, idempotencyKey = `emergency-cancel-${crypto.randomUUID()}`) => request<Scenario>(`/api/v2/scenarios/${scenarioId}/emergency-intakes/${orderId}/cancel`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey }) }),
   executeWorkOrder: (scenarioId: string, orderId: string, action: 'start' | 'complete', technicianId: string, occurredAt: number, expectedRevision: number, idempotencyKey: string, options?: { earlyStartOverrideReason?: string; estimatedRemainingMinutes?: number; note?: string }) => request<ExecutionResult>(`/api/scenarios/${scenarioId}/work-orders/${orderId}/${action}`, { method: 'POST', body: JSON.stringify({ technician_id: technicianId, occurred_at: occurredAt, expected_revision: expectedRevision, idempotency_key: idempotencyKey, early_start_override_reason: options?.earlyStartOverrideReason || null, estimated_remaining_minutes: action === 'start' ? options?.estimatedRemainingMinutes ?? null : null, note: options?.note || '' }) }),
   executionEvents: (scenarioId: string) => request<ExecutionEvent[]>(`/api/scenarios/${scenarioId}/execution-events`),
   analysisRuns: (scenarioId: string, versionId: string) => request<DecisionAnalysisRun[]>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`),
-  createDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, versionId: string, analysisType: 'COST' | 'CAPACITY' | 'RISK', options?: { referenceMode?: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'; seed?: number; trials?: number; horizonDays?: number; emergencyLocationPolicy?: RiskSimulation['emergency_location_policy']; artifactDetailPolicy?: RiskSimulation['artifact_detail_policy'] }) => {
+  createDecisionAnalysisRun: async <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, versionId: string, analysisType: 'COST' | 'CAPACITY' | 'RISK', options?: { referenceMode?: 'SELECTED_PLAN_DELTA' | 'CONTROLLED_REOPTIMIZATION'; seed?: number; trials?: number; horizonDays?: number; emergencyLocationPolicy?: RiskSimulation['emergency_location_policy']; artifactDetailPolicy?: RiskSimulation['artifact_detail_policy'] }): Promise<DecisionAnalysisRun<T>> => {
     const horizon = { days: options?.horizonDays ?? 1, workdays_per_month: 22, currency: 'CNY' }
     const parameters = analysisType === 'COST'
       ? { analysis_horizon: horizon }
       : analysisType === 'CAPACITY'
         ? { reference_mode: options?.referenceMode || 'SELECTED_PLAN_DELTA', analysis_horizon: horizon }
         : { seed: options?.seed ?? null, trials: options?.trials ?? 500, emergency_location_policy: options?.emergencyLocationPolicy ?? 'ALL_FROZEN_LOCATIONS_AS_SPATIAL_PROXY', artifact_detail_policy: options?.artifactDetailPolicy ?? 'SUMMARY_ONLY' }
-    return request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-runs`, { method: 'POST', body: JSON.stringify({ analysis_type: analysisType, request: parameters }) })
+    const job = await request<RuntimeJob>(`/api/v2/scenarios/${scenarioId}/plan-versions/${versionId}/analysis-jobs`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': `analysis-${crypto.randomUUID()}` },
+      body: JSON.stringify({ analysis_type: analysisType, request: parameters }),
+    })
+    let current = job
+    for (let attempt = 0; attempt < 1_200; attempt += 1) {
+      if (current.status === 'COMPLETED' && current.result_resource_id) {
+        return request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${current.result_resource_id}`)
+      }
+      if (current.status === 'FAILED' || current.status === 'CANCELLED') {
+        const message = current.error && typeof current.error.message === 'string' ? current.error.message : '经营分析任务未完成'
+        throw new Error(message)
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 250))
+      current = await request<RuntimeJob>(`/api/v2/scenarios/${scenarioId}/jobs/${current.id}`)
+    }
+    throw new Error('经营分析任务等待超过 5 分钟，请稍后从分析记录中查看结果')
   },
   decisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}`),
   retryDecisionAnalysisRun: <T extends CostAnalysis | CapacityAnalysis | RiskSimulation>(scenarioId: string, analysisId: string, idempotencyKey = `analysis-retry-${crypto.randomUUID()}`) => request<DecisionAnalysisRun<T>>(`/api/scenarios/${scenarioId}/analysis-runs/${analysisId}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } }),

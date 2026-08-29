@@ -4,9 +4,9 @@
 
 FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场执行事实、求解候选、正式方案和经营分析分开保存；失败、重复请求或进程中断不能改写最后一份可执行方案，也不能让公开编号无故跳号。
 
-本轮以 `pro-plan.md` 对现有实现的审查为输入。审查结论按当前代码和可运行流程复核：能在单机架构内严谨落地的问题直接修复；需要完整异步运行时、库存或跨日模型的建议保留为后续范围，不以占位类型冒充完成。
+本轮以 2026-08-29 更新的 `pro-plan.md` 为审查输入。每条建议都以当前代码、SQLite 关系和可运行流程复核；合理项直接实现并验证，过度推断则记录反证。任务书中的持久运行时、现场业务闭环和决策科学扩展也进入本轮渐进交付范围，不因跨版本而自动延期，但未完成的能力不能以占位类型或文档声明冒充完成。
 
-当前发布目标为 v0.5.10 Command Trust Closure：一次规划命令使用的 Scenario、活动 Plan、来源 Plan 和执行上下文必须在同一事务内冻结；当前 Scenario 必须与修订链头一致；适用性投影必须声明它针对的 D 和快照；风险空间分布、迟到范围和条件样本口径必须显式可追溯。
+当前发布目标为 v0.5.11 Correctness Freeze：Start 与 Complete 使用各自的权威事实；紧急接收有独立 Receipt；调度读取绑定同一 D/V/E；Run、Candidate、恢复变换、命令和发布都具有可验证清单；报告明确区分冻结与当前；Risk V7 和 Capacity Artifact 能自包含地解释结果。
 
 ## 当前范围
 
@@ -34,7 +34,8 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - 锁定工单必须分配给指定技师；锁定工单缺失或未分配时，整个候选不可发布。
 - 服务中的工单必须保留来源 Booking 的技师、计划时间、来源序号和分配指纹。未来路线重新从 1 连续编号，来源序号单独保存。
 - 已完成工单保留来源和执行事件，但不进入未来排程；完成后可以继续进行第二次、第三次重排。
-- Candidate 一经保存不可修改；发布时再次核对 Run、Candidate、来源 V、场景快照、执行事件水位、求解政策和行程模型指纹。
+- ScheduleRun 创建时冻结基础与目标快照、Reservation、来源/活动 V 前置条件和求解输入清单；SQLite 触发器禁止改写输入身份和终态。Candidate 插入后不可修改，并保存排程、验证报告与关系身份清单。发布 Artifact 同时绑定 RunInput、RunResult 和 Candidate Manifest。
+- Restore 不再改写 Run 的基础 D。`RestoreTransformManifest` 证明目标快照等于“当前基础快照 + 来源 Plan 冻结快照 + 允许的场景 ID/下一 D 变换”；发布事务重新计算该变换。
 - 每个新 V 保存完整发布验证 Artifact；replan V 另存每位技师的发布时路线入口、可用时间、返回点、执行水位和冻结分配身份。经营分析不能用当前执行事实改写这份历史上下文。
 - Plan Manifest V2 绑定关系型身份、不可变头、完整血缘、Candidate、PlanningContext、VerificationArtifact 和全部 Plan Artifact。关系型 ID、场景、编号和创建时间必须与 JSON payload 一致。
 - Plan 的 `self_integrity` 与 `effective_integrity` 分开返回。除审计查看外，执行、分析、重放、克隆、恢复、比较和报告都必须通过同一使用门禁。Legacy 方案只能查看；需要重新使用时，系统从冻结快照创建带完整证明的新 V，不能原地升级旧记录。重新认证分严格快照与规划等价两种模式，并分别保存路线完整性、原求解来源、继承政策和 replay 校验政策。缺少发布上下文的旧 replan、已经开始执行的场景均在入口拒绝。
@@ -42,7 +43,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 
 ## 现场执行
 
-- 开始服务要求当前有正式方案、工单有分配、技师匹配、D 修订匹配，并携带独立的实际发生时间和幂等键。
+- 开始服务要求当前有正式方案、工单有有效分配、技师匹配、D 修订匹配，并携带独立的实际发生时间和幂等键。完成服务以已验证 Start Event 和 Booking 身份为权威；后续技师资料变化、活动 Plan 切换或撤销不能阻止已经开始的服务登记完成。
 - 公共创建命令不接受 `status`；普通和紧急新工单都由服务端建立为 `PENDING`。`STARTED` 与 `COMPLETED` 只能来自不可变执行事件。
 - 早于客户允许时间开始时必须填写授权原因；完成时间必须严格晚于实际开始时间。
 - 同一技师不能并行服务，且必须按正式路线顺序执行。前序完成后，下一段从实际完工位置和时间校验。
@@ -64,7 +65,10 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 
 ## 幂等与恢复
 
-- 紧急工单接收和重排尝试使用独立幂等记录，并显式保存重排发布键。
+- 紧急工单接收保存独立 `EmergencyIntakeReceipt`，绑定工单内容、提交 D、请求指纹和 ACTIVE/CONSUMED/CANCELLED 状态。命令重放必须重新加载 Receipt 和工单；删除使用显式取消事务。
+- 需要后台执行的任务与 Transactional Outbox 在同一事务提交。紧急接单推进 D 时一并写入 REPLAN Job；应用在求解前退出时，启动恢复器会领取同一任务并继续，不要求用户重新提交。
+- Runtime Job 保存输入清单、幂等键、租约、心跳、attempt、进度和终态资源。成本、容量、风险和策略候选在受限子进程运行；取消、墙钟超时或进程异常会终止子进程，已经预留的 A 明确进入 `INTERRUPTED`，不遗留伪运行状态。
+- `command_keys` 保存关系字段、载荷哈希和不可变 Command Manifest。坏载荷进入 quarantine；关系清单仍可信的终态命令只从资源 ID 重建，关系也损坏时失败关闭。
 - 相同键和相同请求返回同一结果；相同键对应不同请求返回 409。
 - 同一幂等求解命令在计算前原子抢占；并发重复请求不能重复运行求解器。
 - 启动时对账 `RUNNING`、`REPLAN_RUNNING` 和带发布键的 `INTAKE_COMMITTED`：已有发布结果则完成，否则转为 `FAILED_RETRYABLE`。纯接收命令没有发布键时不被误判。
@@ -81,15 +85,17 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - “调整出发点”只表示将一名高行程技师的出发点移至需求中心，不声称新增了完整服务站点。
 - 风险默认遵循正式方案开始时刻。replan 路线从发布时 route entry 开始。随机量按 `(seed, trial, event_type, entity_id)` 派生；计划无关的场景集保存突发事件时间、位置、时长、技能和 SLA。请求显式选择紧急位置来自活动需求、完整冻结地点代理或均匀服务区；尚未配置经验分布时拒绝该选项。`BETWEEN_VISITS_ONLY` 不在行驶途中改道、不抢占服务。响应策略为 `MYOPIC_EARLIEST_EMERGENCY_FINISH`：先保存事件信息集、候选、排除理由和确定性预计完成时间，选中响应者后才模拟一次未来结果；未来 no-show、服务时长和返程延误不能反向改变选择。
 - `published_commitment_sla_rate` 只度量已发布承诺，`all_demand_sla_rate` 把应急需求纳入分母。迟到分钟也分别输出 published/all-demand p50、p90、p95，并单列紧急工单迟到分布。旧 late alias 只作兼容映射。条件紧急指标返回事件和完成样本数；零事件时完成率、准时率、未服务率和严重度均为 null，界面显示“不适用”。
-- 紧急影响分别统计 disposition 改变、新增未服务、新增迟到、迟到加重及其去重并集。试验明细默认不持久化；显式 FULL_TRIAL_DETAIL 最多 1000 次，避免一次分析无限放大 SQLite。单方案 SLA Monte Carlo 均值区间使用固定 seed 的 percentile bootstrap，不再使用正态近似。
+- 紧急影响分别统计 disposition 改变、新增未服务、新增迟到、迟到加重及其去重并集。Risk V7 还保存工单级窗口违反、技师级加班突破与分钟数；紧急窗口/加班归因使用集合差和恶化集合，不再依赖全局布尔翻转。`SUMMARY_ONLY` Artifact 只保存紧凑 `PairedTrialVector`，选人证据只保留实际发生紧急事件的 trial；显式 FULL_TRIAL_DETAIL 最多 1000 次。单方案 SLA Monte Carlo 均值区间使用固定 seed 的 percentile bootstrap。
 - 配对比较在创建子 A 前核对范围、分析时点和共同 ScenarioSet 身份。紧急完成与准时只对发生事件的 trial 计算，同时保留无条件影响；每个摘要带 conditioning event 和有效样本数，区间使用固定 seed 的配对 bootstrap。条件事件样本少于 20 时标记 `INSUFFICIENT_EVENT_TRIALS` 并不给出数值估计或区间。它绑定两个 A 的清单以及 trial、scenario-set Artifact 哈希；任一证明失效时整个业务 `result` 及兼容数值投影均为空。
+- Risk Comparison 使用持久 Saga 保存 RESERVED、两个子 A 完成、比较完成和失败阶段；同一幂等键会复用已经完成且证明有效的子 A，从失败阶段继续。
 - A 的状态、开始/结束时间和 reservation manifest 同时保存在关系型列；终态触发器禁止回退。A 终态保存 input/result/failure manifest、Artifact 哈希清单和总清单哈希。完成事务会重新加载父 Plan；计算期间父证明变化时保存失败 A，不保存结果。所有读取和重放路径都会重算；父 Plan、父 A 或依赖 Artifact 失败会向下传播 `effective_integrity=FAILED`，业务 result 被移除。Schema v20 前的记录由关系列显式标记 `LEGACY_MIGRATED`，不能仅靠删除 JSON 字段降级。
 - 运营复盘初次进入只读取已有 A；用户显式点击才创建。成本与风险并行使用部分成功语义，任一失败不隐藏另一项结果。同步直接分析接口保留兼容但在 OpenAPI 标记 deprecated。
 
 ## 兼容与迁移
 
-- Schema v10 把技师浮点成本保值迁移为整数分；v11 增加命令发布键；v12 增加方案适用性投影；v13–v17 增加经营分析运行、恢复、重试和 Artifact；v18 增加不可降级证明要求、风险比较、方案元数据和损坏隔离；v19 增加 A 关系型状态机及传递信任；v20 增加多维 PlanApplicability；v21 完成旧覆盖语义回填、复合外键、枚举/JSON 约束和执行事件证明字段；v22 为 ScenarioRevision 回填快照与链证明；v23 增加 Scenario 链头、proof origin/chain status、适用性投影证明和 PlanningReservation。
-- Python 生产与开发依赖分别使用 `requirements-runtime.lock` 和 `requirements-dev.lock`。决策运行时清单 V2 只绑定生产 lock，并保存锁中每个生产 distribution 的实际安装版本；Ruff、Pytest 等工具升级不会改变精确重试身份。当前平台契约为 Linux/macOS，`uvloop` 使用平台 marker，CI 同时验证 Ubuntu 与 macOS；lock 尚不是带 wheel hash 的供应链锁，列入 v0.6。
+- Schema v10–v23 保留原有成本、方案、分析、适用性、修订链头和 PlanningReservation 演进；v24 增加 Emergency Intake Receipt；v25 增加 Run/Candidate/Command/Restore 清单；v26 增加 Runtime Job、Outbox 和 Risk Comparison Saga；v27 增加内容寻址 Artifact Blob。
+- 应用启动只初始化空数据库，不隐式升级已有 schema。`fieldflow migrate dry-run/apply/verify/restore` 在临时副本验证、备份并原子替换。大 Artifact 使用内容哈希和 zlib 压缩去重；维护命令只能清理超过保留期且没有关系引用的 Blob。
+- Python 生产与开发依赖分别使用带 SHA-256 的 `requirements-runtime.lock` 和 `requirements-dev.lock`，安装强制 `--require-hashes`。决策运行时清单 V2 只绑定生产 lock，并保存实际 distribution inventory。当前支持 Python 3.11–3.13、Linux/macOS；CI 覆盖 Ubuntu 3.11/3.12 与 macOS 3.12。`docs/sbom-runtime.cdx.json` 由锁文件确定性生成并在验证门禁检查。
 - v1 旧方案历史缺少完整业务快照，按已确认的产品决定先生成时间戳备份再重建，当前业务数据保留。
 - 重建前，旧 schedules、plans、artifacts、experiments 和 publication keys 会逐行复制到 quarantine ledger；列表读取遇到损坏记录时跳过坏行并登记，场景、Plan、A、Artifact、ScheduleRun、Candidate、Experiment 和执行事件的关键单项读取返回稳定完整性错误。`GET /api/integrity-issues` 只暴露记录来源和原因，不返回原始业务 payload。
 - 旧 `/schedules` 和同步经营分析接口继续兼容；同步分析接口内部也创建或复用持久 A，不再绕过审计。
@@ -99,7 +105,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - 在线地图、云服务、手机端技师应用、财务结算。
 - Crew 同时到场、零件库存、跨规划日排班和完整多站点库存模型。
 - 执行水位下的 incurred/remaining/actual-plus-forecast 分析；支持前必须保持拒绝门禁。
-- 独立持久 worker、进程级硬取消和三套公开业务修订号。
+- 云端多租户、在线地图和远程 SaaS 控制面。
 - 未经仓库所有者选择，擅自添加许可证或修改 GitHub 治理规则。
 
 ## 验收
@@ -110,6 +116,6 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - 决策分析绑定选中 V 的发布上下文、完整排程、行程、政策、算法和构建来源；显式事前分析允许在执行后复核，当前执行事件变化不能改变历史输入。
 - 容量中所有 `feasible` 结果通过完整反事实验证；成本周期逐项对账；风险遵循发布时间并使用准确统计标签。
 - 紧急命令中断恢复、人工改派三个持久阶段崩溃、PlanVersion payload 不变和历史稳定性谱系有回归测试。
-- Schema v1–v22 均迁移到 v23 并通过链头、完整性、Artifact 保全、关系型终态、适用性和外键检查。
+- Schema v1–v26 均可通过显式 CLI 迁移到 v27，并通过链头、完整性、Artifact Blob 保全、关系型终态、适用性和外键检查。
 - Legacy Plan 不能执行或创建 A；重新认证只生成新的 V2 方案且不修改旧 V。Plan、A、Artifact、RiskComparison 任一父依赖篡改都必须传播失败。
-- Ruff、Pyright、ESLint、React Hooks、TypeScript、依赖审计、OpenAPI 快照及生成类型、RuleBasedStateMachine、定向 mutation smoke、后端与 React 测试、生产构建、Demo、Benchmark 和 Playwright 主流程通过后才能交付。
+- Ruff、Pyright、ESLint、React Hooks、TypeScript、依赖审计、OpenAPI 快照及生成类型、RuleBasedStateMachine、安全 mutation score、后端与 React 测试、生产构建、Demo、性能趋势和 Playwright 主流程通过后才能交付。

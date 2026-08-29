@@ -59,7 +59,7 @@ def test_user_facing_copy_stays_direct_and_version_numbers_stay_consistent():
     assert "<http://127.0.0.1:8000/docs>" in readme
     assert "`fieldflow.db`" in readme
     assert "不会进入 Git" in readme
-    assert "V{result.version:03d}" in Path("backend/report.py").read_text()
+    assert "V{plan_number:03d}" in Path("backend/report.py").read_text()
 
 
 def test_application_version_has_one_checked_release_value():

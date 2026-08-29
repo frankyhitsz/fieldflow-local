@@ -32,6 +32,29 @@ export interface components {
           started_at: string;
         };
     AttestationRequirement: "REQUIRED" | "LEGACY_MIGRATED";
+    CancelEmergencyIntakeRequest: {
+          expected_revision: number;
+          idempotency_key: string;
+        };
+    CandidateManifest: {
+          candidate_id: string;
+          expected_active_plan_version_id?: (string) | (null);
+          manifest_hash?: string;
+          policy_version?: string;
+          publishable: boolean;
+          reservation_hash: string;
+          reservation_id: string;
+          restore_transform_manifest_hash?: (string) | (null);
+          run_id: string;
+          run_input_manifest_hash: string;
+          scenario_id: string;
+          scenario_revision: number;
+          scenario_snapshot_hash: string;
+          schedule_hash: string;
+          solver_policy_fingerprint: string;
+          source_plan_version_id?: (string) | (null);
+          verification_report_hash: string;
+        };
     CapacityAnalysis: {
           actual_execution_included?: boolean;
           algorithm_version?: string;
@@ -89,22 +112,28 @@ export interface components {
           artifact_hash?: string;
           artifact_type?: "CAPACITY_COUNTERFACTUAL";
           attestation_requirement?: components['schemas']["AttestationRequirement"];
+          capacity_policy_hash?: string;
           changed_inputs?: {
             [key: string]: unknown;
           };
           commercial_verification_status: "VERIFIED" | "UNVERIFIED" | "NOT_APPLICABLE";
           conditional_assumptions?: Array<string>;
           conditional_upper_bound_kpis?: (components['schemas']["CapacityCounterfactualKPI"]) | (null);
+          cost_ledger_hash?: string;
+          cost_policy_hash?: string;
           counterfactual_kpis?: (components['schemas']["CapacityCounterfactualKPI"]) | (null);
           created_at: string;
           decision_status: components['schemas']["CapacityDecisionStatus"];
+          diagnostic_cost?: (components['schemas']["PlanCostBreakdown"]) | (null);
           effective_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           external_assignments?: Array<components['schemas']["ExternalAssignment"]>;
+          formal_cost?: (components['schemas']["PlanCostBreakdown"]) | (null);
           formal_result_available: boolean;
           id: string;
           integrity_status?: components['schemas']["AnalysisIntegrityStatus"];
           option_id: "add_technician" | "add_skill" | "extend_shift" | "allow_overtime" | "outsource_unserved" | "relocate_one_technician_start";
           parent_analysis_integrity?: components['schemas']["AnalysisIntegrityStatus"];
+          reference_cost_hash?: string;
           route_diff?: Array<{
             [key: string]: unknown;
           }>;
@@ -400,6 +429,29 @@ export interface components {
           };
           sqlite_version: string;
         };
+    DispatchSnapshot: {
+          active_plan?: (components['schemas']["PlanVersion"]) | (null);
+          execution_context_hash: string;
+          execution_watermark: number;
+          latest_revision_hash: string;
+          operational_view: components['schemas']["ScenarioOperationalView"];
+          revision_head_integrity?: components['schemas']["AnalysisIntegrityStatus"];
+          revision_history_integrity?: components['schemas']["AnalysisIntegrityStatus"];
+          revision_history_issue_count?: number;
+          scenario: components['schemas']["ScheduleScenario"];
+          scenario_head_snapshot_hash: string;
+          scenario_proof_origin: components['schemas']["RevisionProofOrigin"];
+          snapshot_token: string;
+        };
+    EmergencyDecisionEvidence: {
+          emergency_dispatch_location?: (components['schemas']["Point"]) | (null);
+          emergency_dispatch_time?: (number) | (null);
+          emergency_finish_time?: (number) | (null);
+          emergency_route_terminal_time?: (number) | (null);
+          emergency_technician_id?: (string) | (null);
+          information_set?: (components['schemas']["EmergencyDecisionInformationSet"]) | (null);
+          trial: number;
+        };
     EmergencyDecisionInformationSet: {
           candidate_technician_ids?: Array<string>;
           decision_time: number;
@@ -541,8 +593,11 @@ export interface components {
     OperationalWorkOrderView: {
           assignment?: (components['schemas']["ScheduleAssignment"]) | (null);
           blocking_reason_code?: (string) | (null);
+          complete_allowed?: boolean;
+          complete_blocking_reason_code?: (string) | (null);
           disposition: components['schemas']["CurrentWorkOrderDisposition"];
           start_allowed?: boolean;
+          start_blocking_reason_code?: (string) | (null);
           work_order_id: string;
         };
     OptimizeRequest: {
@@ -563,11 +618,23 @@ export interface components {
           tie_count: number;
           win_count: number;
         };
+    PairedTrialVector: {
+          all_demand_sla_rate: number;
+          disrupted: boolean;
+          emergency_completed: boolean;
+          emergency_event: boolean;
+          emergency_on_time: boolean;
+          published_commitment_sla_rate: number;
+          total_overtime_minutes: number;
+          total_unserved_orders: number;
+          trial: number;
+        };
     PlanApplicability: {
           commercial_current?: boolean;
           coverage_complete?: boolean;
           evaluated_scenario_revision?: (number) | (null);
           evaluated_scenario_snapshot_hash?: string;
+          /** Deprecated wire name. Contains only pending assignments that are blocked from starting; started and completed work remain executable through their verified events. */
           invalid_assignment_ids?: Array<string>;
           metrics_current?: boolean;
           planning_current?: boolean;
@@ -598,6 +665,9 @@ export interface components {
           unserved_revenue_cents: number;
         };
     PlanCoverageStatus: "CURRENT_AND_COMPLETE" | "PARTIAL_NEW_DEMAND" | "STALE_DATA_CHANGED";
+    PlanPreconditionRequest: {
+          expected_active_plan_version_id?: (string) | (null);
+        };
     PlanVersion: {
           action: "baseline" | "optimize" | "replan" | "activate" | "restore" | "experiment_publish" | "reattest";
           active?: boolean;
@@ -668,6 +738,7 @@ export interface components {
         };
     PublicationVerificationArtifact: {
           artifact_hash: string;
+          candidate_manifest_hash?: string;
           candidate_snapshot: {
             [key: string]: unknown;
           };
@@ -675,6 +746,8 @@ export interface components {
             [key: string]: unknown;
           }) | (null);
           policy_version?: string;
+          run_input_manifest_hash?: string;
+          run_result_manifest_hash?: string;
           transaction_verification_report: {
             [key: string]: unknown;
           };
@@ -703,6 +776,7 @@ export interface components {
           strategy?: "balanced" | "completion" | "punctuality" | "low_travel" | "low_overtime" | "fair_workload" | "stable";
           time_limit_seconds?: (number) | (null);
         };
+    ReportMode: "FROZEN_PLAN_REPORT" | "CURRENT_OPERATIONAL_REPORT";
     RestoreRequest: {
           allow_delete_new_orders?: boolean;
           /** 兼容旧客户端；执行事件不可变，服务端始终拒绝重新打开已完成工单 */
@@ -713,6 +787,22 @@ export interface components {
           idempotency_key: string;
           reason: string;
         };
+    RestoreTransformManifest: {
+          command_base_scenario_hash: string;
+          command_base_scenario_revision: number;
+          manifest_hash?: string;
+          policy_version?: string;
+          request_fingerprint: string;
+          scenario_id: string;
+          source_plan_manifest_hash: string;
+          source_plan_snapshot_hash: string;
+          source_plan_version_id: string;
+          target_scenario_hash: string;
+          target_scenario_revision: number;
+          transform_input_hash: string;
+          transform_output_hash: string;
+        };
+    RevisionProofOrigin: "NATIVE_ATTESTED" | "MIGRATION_BACKFILLED" | "LEGACY_UNATTESTED";
     RiskArtifactDetailPolicy: "SUMMARY_ONLY" | "FULL_TRIAL_DETAIL";
     RiskComparisonResult: {
           delta?: {
@@ -766,6 +856,24 @@ export interface components {
           scenario_set_hash: string;
           self_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           trials: number;
+        };
+    RiskComparisonSaga: {
+          after_analysis_id?: (string) | (null);
+          after_plan_version_id: string;
+          before_analysis_id?: (string) | (null);
+          before_plan_version_id: string;
+          comparison_id?: (string) | (null);
+          created_at: string;
+          error?: ({
+            [key: string]: unknown;
+          }) | (null);
+          id: string;
+          idempotency_key: string;
+          input_manifest_hash: string;
+          request_fingerprint: string;
+          scenario_id: string;
+          status?: "RESERVED" | "BEFORE_COMPLETED" | "AFTER_COMPLETED" | "COMPARISON_COMPLETED" | "FAILED";
+          updated_at: string;
         };
     RiskDecisionAnalysisRunRequest: {
           analysis_scope?: (components['schemas']["DecisionAnalysisScope"]) | (null);
@@ -918,13 +1026,25 @@ export interface components {
           emergency_on_time?: boolean;
           emergency_route_terminal_time?: (number) | (null);
           emergency_technician_id?: (string) | (null);
+          new_overtime_breach_technician_ids?: Array<string>;
+          new_window_failure_ids?: Array<string>;
+          overtime_worsened_technician_ids?: Array<string>;
           published_commitment_sla_rate?: number;
           published_work_total_late_minutes?: number;
           sla_on_time_rate: number;
+          technician_overtime_breach_by_id?: {
+            [key: string]: boolean;
+          };
+          technician_overtime_minutes_by_id?: {
+            [key: string]: number;
+          };
           total_overtime_minutes: number;
           total_unserved_orders: number;
           trial: number;
           work_order_outcomes?: Array<components['schemas']["SimulatedWorkOrderOutcome"]>;
+          work_order_window_violation_by_id?: {
+            [key: string]: boolean;
+          };
         };
     RiskTrialOutcomeArtifact: {
           analysis_run_id: string;
@@ -934,9 +1054,12 @@ export interface components {
           created_at: string;
           detail_policy?: components['schemas']["RiskArtifactDetailPolicy"];
           effective_integrity?: components['schemas']["AnalysisIntegrityStatus"];
+          emergency_decision_evidence?: Array<components['schemas']["EmergencyDecisionEvidence"]>;
           id: string;
           integrity_status?: components['schemas']["AnalysisIntegrityStatus"];
-          metrics: Array<components['schemas']["RiskTrialMetric"]>;
+          metric_policy_version?: string;
+          metrics?: Array<components['schemas']["RiskTrialMetric"]>;
+          paired_trial_vectors?: Array<components['schemas']["PairedTrialVector"]>;
           parent_analysis_integrity?: components['schemas']["AnalysisIntegrityStatus"];
           scenario_id: string;
           scenario_set_hash: string;
@@ -972,6 +1095,65 @@ export interface components {
           source_work_order_id?: (string) | (null);
           technician_id: string;
         };
+    RunInputManifest: {
+          command_base_scenario_hash: string;
+          command_base_scenario_revision: number;
+          command_fingerprint: string;
+          expected_active_plan_version_id?: (string) | (null);
+          manifest_hash?: string;
+          policy_version?: string;
+          requested_time_limit_ms: number;
+          reservation_hash: string;
+          reservation_id: string;
+          restore_transform_manifest_hash?: (string) | (null);
+          run_id: string;
+          scenario_id: string;
+          solver_config_hash: string;
+          solver_name: string;
+          source_plan_version_id?: (string) | (null);
+          target_scenario_hash: string;
+          target_scenario_revision: number;
+        };
+    RunResultManifest: {
+          candidate_id?: (string) | (null);
+          candidate_manifest_hash?: (string) | (null);
+          finished_at: string;
+          manifest_hash?: string;
+          planning_context_hash?: (string) | (null);
+          policy_version?: string;
+          run_id: string;
+          solution_found: boolean;
+          solver_name: string;
+          solver_policy_fingerprint: string;
+          solver_version: string;
+          status: components['schemas']["ScheduleRunStatus"];
+          termination_reason?: (string) | (null);
+        };
+    RuntimeJob: {
+          attempt_number?: number;
+          created_at: string;
+          dedupe_key?: (string) | (null);
+          error?: ({
+            [key: string]: unknown;
+          }) | (null);
+          finished_at?: (string) | (null);
+          heartbeat_at?: (string) | (null);
+          id: string;
+          input_manifest_hash: string;
+          input_payload: {
+            [key: string]: unknown;
+          };
+          job_type: "BASELINE" | "OPTIMIZE" | "REPLAN" | "STRATEGY_EXPERIMENT" | "COST_ANALYSIS" | "CAPACITY_ANALYSIS" | "RISK_ANALYSIS" | "RISK_COMPARISON";
+          lease_expires_at?: (string) | (null);
+          lease_owner?: (string) | (null);
+          progress?: number;
+          result_resource_id?: (string) | (null);
+          result_resource_type?: (string) | (null);
+          scenario_id: string;
+          status?: components['schemas']["RuntimeJobStatus"];
+          updated_at: string;
+        };
+    RuntimeJobStatus: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCEL_REQUESTED" | "CANCELLED" | "INTERRUPTED";
     ScenarioCreate: {
           fixture_id?: string;
           name?: (string) | (null);
@@ -979,6 +1161,9 @@ export interface components {
     ScenarioOperationalView: {
           active_plan_version_id?: (string) | (null);
           current_metrics: components['schemas']["OperationalMetrics"];
+          execution_context_hash?: string;
+          execution_integrity?: components['schemas']["AnalysisIntegrityStatus"];
+          execution_watermark?: number;
           plan_applicability?: (components['schemas']["PlanApplicability"]) | (null);
           scenario_id: string;
           scenario_revision: number;
@@ -1011,6 +1196,7 @@ export interface components {
           work_order_id: string;
         };
     ScheduleCandidate: {
+          candidate_manifest?: (components['schemas']["CandidateManifest"]) | (null);
           created_at: string;
           expected_active_plan_version_id?: (string) | (null);
           id: string;
@@ -1019,6 +1205,7 @@ export interface components {
           publishable: boolean;
           reservation_hash?: (string) | (null);
           reservation_id?: (string) | (null);
+          restore_transform_manifest?: (components['schemas']["RestoreTransformManifest"]) | (null);
           run_id: string;
           scenario_id: string;
           scenario_revision: number;
@@ -1102,11 +1289,14 @@ export interface components {
           expected_active_plan_version_id?: (string) | (null);
           finished_at?: (string) | (null);
           id: string;
+          input_manifest?: (components['schemas']["RunInputManifest"]) | (null);
           planning_context?: (components['schemas']["PlanningContext"]) | (null);
           planning_context_hash?: (string) | (null);
           requested_time_limit_ms: number;
           reservation_hash?: (string) | (null);
           reservation_id?: (string) | (null);
+          restore_transform_manifest?: (components['schemas']["RestoreTransformManifest"]) | (null);
+          result_manifest?: (components['schemas']["RunResultManifest"]) | (null);
           scenario_id: string;
           scenario_revision: number;
           scenario_snapshot_hash: string;
@@ -1119,6 +1309,8 @@ export interface components {
           source_plan_version_id?: (string) | (null);
           started_at: string;
           status: components['schemas']["ScheduleRunStatus"];
+          target_scenario_revision?: (number) | (null);
+          target_scenario_snapshot_hash?: (string) | (null);
           termination_reason?: (string) | (null);
         };
     ScheduleRunStatus: "QUEUED" | "RUNNING" | "OPTIMAL" | "FEASIBLE" | "TIME_LIMIT_FEASIBLE" | "TIME_LIMIT_NO_SOLUTION" | "INFEASIBLE" | "NO_SOLUTION" | "INVALID_MODEL" | "FAILED" | "CANCELLED";

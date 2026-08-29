@@ -25,7 +25,7 @@ from backend.models import (
 )
 from backend.normalization import normalize_schedule
 from backend.scheduler import baseline_schedule, optimized_schedule, solver_status_from_routing
-from backend.storage import Store
+from backend.storage import SCHEMA_VERSION, Store
 from backend.travel import EuclideanTravelTimeProvider, MatrixTravelTimeProvider
 from backend.verification import verify_schedule
 
@@ -1535,7 +1535,7 @@ def test_legacy_semantic_upgrade_is_persisted_once_instead_of_mutating_reads(tmp
     ) == (4, 12, 30, 1)
     with closing(sqlite3.connect(database)) as connection, connection:
         stored = connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert stored == first.model_dump_json()
     assert migrated.list_revisions("main")[-1].reason == "v8 旧数据语义升级"
 

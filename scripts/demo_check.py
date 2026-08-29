@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from backend.fixtures import emergency_order
-from backend.main import app
 
 
 def compact(result: dict) -> str:
@@ -15,42 +18,63 @@ def compact(result: dict) -> str:
     )
 
 
-with TestClient(app) as client:
-    assert client.get("/api/health").status_code == 200
-    scenario = client.post("/api/scenarios", json={"fixture_id": "main", "name": "自动演示检查"}).json()
-    scenario_id = scenario["id"]
-    baseline = client.post(f"/api/scenarios/{scenario_id}/baseline").json()
-    optimized = client.post(f"/api/scenarios/{scenario_id}/optimize", json={"time_limit_seconds": 1}).json()
-    assert optimized["solver_status"] in {"OPTIMAL", "FEASIBLE", "TIME_LIMIT_FEASIBLE"}
-    assert optimized["objective"] < baseline["objective"]
+def main() -> None:
+    # The demo is a repeatable verification command, so it must never inherit
+    # a developer's database or a stale fixed file under /tmp.
+    with tempfile.TemporaryDirectory(prefix="fieldflow-demo-check-") as directory:
+        os.environ["FIELDFLOW_DB"] = str(Path(directory) / "fieldflow.db")
+        from backend.main import app
 
-    vip_ids = {"WO-1024", "WO-1032", "WO-1040"}
-    locked = next(item for item in optimized["assignments"] if item["work_order_id"] in vip_ids)
-    response = client.post(
-        f"/api/scenarios/{scenario_id}/lock",
-        json={"work_order_id": locked["work_order_id"], "technician_id": locked["technician_id"], "locked": True},
-    )
-    assert response.status_code == 200
+        with TestClient(app) as client:
+            assert client.get("/api/health").status_code == 200
+            scenario = client.post("/api/scenarios", json={"fixture_id": "main", "name": "自动演示检查"}).json()
+            scenario_id = scenario["id"]
+            baseline = client.post(f"/api/scenarios/{scenario_id}/baseline").json()
+            optimized = client.post(f"/api/scenarios/{scenario_id}/optimize", json={"time_limit_seconds": 1}).json()
+            assert optimized["solver_status"] in {"OPTIMAL", "FEASIBLE", "TIME_LIMIT_FEASIBLE"}
+            assert optimized["objective"] < baseline["objective"]
 
-    emergency = emergency_order().model_dump(mode="json")
-    emergency.pop("status", None)
-    replanned = client.post(
-        f"/api/scenarios/{scenario_id}/replan",
-        json={
-            "planning_time": 600,
-            "time_limit_seconds": 1,
-            "strategy": "stable",
-            "emergency_order": emergency,
-            "idempotency_key": f"demo-check:{scenario_id}:emergency",
-        },
-    ).json()
-    preserved = next(item for item in replanned["assignments"] if item["work_order_id"] == locked["work_order_id"])
-    assert preserved["technician_id"] == locked["technician_id"]
-    assert replanned["kpis"]["stability_rate"] is not None
-    assert client.get(f"/api/scenarios/{scenario_id}/comparison").status_code == 200
-    assert client.get(f"/api/scenarios/{scenario_id}/report").status_code == 200
+            vip_ids = {"WO-1024", "WO-1032", "WO-1040"}
+            locked = next(item for item in optimized["assignments"] if item["work_order_id"] in vip_ids)
+            response = client.post(
+                f"/api/scenarios/{scenario_id}/lock",
+                json={
+                    "work_order_id": locked["work_order_id"],
+                    "technician_id": locked["technician_id"],
+                    "locked": True,
+                },
+            )
+            assert response.status_code == 200
 
-    print("✓ 人工基线       ", compact(baseline))
-    print("✓ OR-Tools 优化  ", compact(optimized))
-    print("✓ 突发单 + 锁定 + 局部重排", compact(replanned), f"| 稳定率={replanned['kpis']['stability_rate']:.0%}")
-    print("✓ 对比与静态 HTML 报告已生成")
+            emergency = emergency_order().model_dump(mode="json")
+            emergency.pop("status", None)
+            replanned = client.post(
+                f"/api/scenarios/{scenario_id}/replan",
+                json={
+                    "planning_time": 600,
+                    "time_limit_seconds": 1,
+                    "strategy": "stable",
+                    "emergency_order": emergency,
+                    "idempotency_key": f"demo-check:{scenario_id}:emergency",
+                },
+            ).json()
+            preserved = next(
+                item for item in replanned["assignments"] if item["work_order_id"] == locked["work_order_id"]
+            )
+            assert preserved["technician_id"] == locked["technician_id"]
+            assert replanned["kpis"]["stability_rate"] is not None
+            assert client.get(f"/api/scenarios/{scenario_id}/comparison").status_code == 200
+            assert client.get(f"/api/scenarios/{scenario_id}/report").status_code == 200
+
+            print("✓ 人工基线       ", compact(baseline))
+            print("✓ OR-Tools 优化  ", compact(optimized))
+            print(
+                "✓ 突发单 + 锁定 + 局部重排",
+                compact(replanned),
+                f"| 稳定率={replanned['kpis']['stability_rate']:.0%}",
+            )
+            print("✓ 对比与静态 HTML 报告已生成")
+
+
+if __name__ == "__main__":
+    main()

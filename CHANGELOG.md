@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.11 — 2026-08-29
+
+- Split start and complete authority, added resource-bound emergency intake receipts, and made dispatch reads transactionally consistent across D/V/E.
+- Added immutable Run, Candidate, restore-transform and command manifests plus recoverable paired-risk Saga stages.
+- Moved strategy solving and decision analysis into cancellable subprocesses backed by a durable SQLite Job Queue and Transactional Outbox.
+- Added content-addressed compressed Artifact blobs, explicit migration and Artifact maintenance CLIs, hashed dependency locks and a runtime SBOM.
+- Corrected Risk V7 attribution, closed Capacity Artifact cost evidence, and separated frozen-plan from current-operational reports.
+- Derived frontend domain DTOs from OpenAPI, added performance trend and mutation-score gates, and documented retention and privacy boundaries.
+
 ## 0.5.6 — 2026-08-25
 
 - Added Plan Manifest V2 and transitive effective trust across Plan, decision analysis, artifacts and paired risk comparisons.

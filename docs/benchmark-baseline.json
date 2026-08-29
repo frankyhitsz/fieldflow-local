@@ -1,0 +1,14 @@
+{
+  "benchmark_version": "FIELD_SERVICE_PERFORMANCE_BASELINE_V1",
+  "fieldflow_version": "0.5.11",
+  "performance_ms": {
+    "baseline_emergency": 7.553,
+    "baseline_medium": 19.503,
+    "baseline_skill-shortage": 5.764,
+    "baseline_small": 11.824,
+    "capacity_analysis_small": 26.673,
+    "controlled_capacity_small": 28.523,
+    "cost_analysis_small": 130.15,
+    "risk_50_trials_small": 645.716
+  }
+}

@@ -71,6 +71,16 @@ class ScheduleRunStatus(str, Enum):
     cancelled = "CANCELLED"
 
 
+class RuntimeJobStatus(str, Enum):
+    queued = "QUEUED"
+    running = "RUNNING"
+    completed = "COMPLETED"
+    failed = "FAILED"
+    cancel_requested = "CANCEL_REQUESTED"
+    cancelled = "CANCELLED"
+    interrupted = "INTERRUPTED"
+
+
 class PlanCoverageStatus(str, Enum):
     current_and_complete = "CURRENT_AND_COMPLETE"
     partial_new_demand = "PARTIAL_NEW_DEMAND"
@@ -86,11 +96,22 @@ class PlanApplicability(BaseModel):
     metrics_current: bool = True
     commercial_current: bool = True
     reoptimization_opportunity: bool = False
-    invalid_assignment_ids: list[str] = Field(default_factory=list)
+    invalid_assignment_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Deprecated wire name. Contains only pending assignments that are blocked from starting; "
+            "started and completed work remain executable through their verified events."
+        ),
+    )
     evaluated_scenario_revision: int | None = Field(default=None, ge=0)
     evaluated_scenario_snapshot_hash: str = ""
     reducer_policy_version: str = "FIELD_SERVICE_PLAN_APPLICABILITY_V2"
     projection_hash: str = ""
+
+    @property
+    def blocked_start_assignment_ids(self) -> list[str]:
+        """Semantic name for the compatibility field used on the v0.5 wire format."""
+        return self.invalid_assignment_ids
 
 
 class DecisionAnalysisScope(str, Enum):
@@ -172,6 +193,11 @@ class EmergencyLocationPolicy(str, Enum):
 class RiskArtifactDetailPolicy(str, Enum):
     summary_only = "SUMMARY_ONLY"
     full_trial_detail = "FULL_TRIAL_DETAIL"
+
+
+class ReportMode(str, Enum):
+    frozen_plan = "FROZEN_PLAN_REPORT"
+    current_operational = "CURRENT_OPERATIONAL_REPORT"
 
 
 class AnalysisIntegrityStatus(str, Enum):
@@ -611,6 +637,10 @@ class ManualReassignmentResult(BaseModel):
     error: dict[str, Any] | None = None
 
 
+class PlanPreconditionRequest(BaseModel):
+    expected_active_plan_version_id: str | None = None
+
+
 class OptimizeRequest(BaseModel):
     time_limit_seconds: float | None = Field(default=None, ge=1, le=30)
     strategy: Literal["balanced", "completion", "punctuality", "low_travel", "low_overtime", "fair_workload"] = (
@@ -732,6 +762,90 @@ class WorkOrderExecutionResult(BaseModel):
     event: WorkOrderExecutionEvent
 
 
+class EmergencyIntakeStatus(str, Enum):
+    active = "ACTIVE"
+    consumed = "CONSUMED"
+    cancelled = "CANCELLED"
+
+
+class EmergencyIntakeReceipt(BaseModel):
+    id: str
+    scenario_id: Identifier
+    namespace: str
+    idempotency_key: IdempotencyKey
+    work_order_id: Identifier
+    work_order_hash: str
+    committed_revision: int = Field(ge=0)
+    request_fingerprint: str
+    status: EmergencyIntakeStatus = EmergencyIntakeStatus.active
+    replan_plan_version_id: str | None = None
+    created_at: str
+    updated_at: str
+    receipt_hash: str = ""
+
+
+class CancelEmergencyIntakeRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    idempotency_key: IdempotencyKey
+
+
+class CommandRecordManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_COMMAND_RECORD_MANIFEST_V1"
+    namespace: str
+    key: str
+    request_fingerprint: str
+    status: str
+    resource_type: str | None = None
+    resource_id: str | None = None
+    publication_key: str | None = None
+    payload_hash: str
+    created_at: str
+    updated_at: str
+    manifest_hash: str = ""
+
+
+class RuntimeJob(BaseModel):
+    id: str
+    job_type: Literal[
+        "BASELINE",
+        "OPTIMIZE",
+        "REPLAN",
+        "STRATEGY_EXPERIMENT",
+        "COST_ANALYSIS",
+        "CAPACITY_ANALYSIS",
+        "RISK_ANALYSIS",
+        "RISK_COMPARISON",
+    ]
+    scenario_id: str
+    status: RuntimeJobStatus = RuntimeJobStatus.queued
+    progress: int = Field(default=0, ge=0, le=100)
+    input_payload: dict[str, Any]
+    input_manifest_hash: str
+    dedupe_key: str | None = None
+    lease_owner: str | None = None
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
+    attempt_number: int = Field(default=0, ge=0)
+    result_resource_type: str | None = None
+    result_resource_id: str | None = None
+    error: dict[str, Any] | None = None
+    created_at: str
+    updated_at: str
+    finished_at: str | None = None
+
+
+class OutboxEvent(BaseModel):
+    id: str
+    topic: str
+    aggregate_type: str
+    aggregate_id: str
+    payload: dict[str, Any]
+    payload_hash: str
+    status: Literal["PENDING", "DISPATCHED"] = "PENDING"
+    created_at: str
+    dispatched_at: str | None = None
+
+
 class TechnicianUpdate(BaseModel):
     name: DisplayName | None = None
     skills: list[Skill] | None = Field(default=None, min_length=1)
@@ -840,6 +954,9 @@ class PublicationVerificationArtifact(BaseModel):
     planning_context_snapshot: dict[str, Any] | None = None
     transaction_verification_report: dict[str, Any]
     verified_schedule_hash: str
+    run_input_manifest_hash: str = ""
+    run_result_manifest_hash: str = ""
+    candidate_manifest_hash: str = ""
     artifact_hash: str
 
 
@@ -939,6 +1056,10 @@ class OperationalWorkOrderView(BaseModel):
     disposition: CurrentWorkOrderDisposition
     assignment: ScheduleAssignment | None = None
     start_allowed: bool = False
+    complete_allowed: bool = False
+    start_blocking_reason_code: str | None = None
+    complete_blocking_reason_code: str | None = None
+    # Compatibility alias for clients before the start/complete authority split.
     blocking_reason_code: str | None = None
 
 
@@ -957,8 +1078,26 @@ class ScenarioOperationalView(BaseModel):
     scenario_snapshot_hash: str
     active_plan_version_id: str | None = None
     plan_applicability: PlanApplicability | None = None
+    execution_watermark: int = Field(default=0, ge=0)
+    execution_context_hash: str = ""
+    execution_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
     work_orders: list[OperationalWorkOrderView]
     current_metrics: OperationalMetrics
+
+
+class DispatchSnapshot(BaseModel):
+    scenario: ScheduleScenario
+    scenario_head_snapshot_hash: str
+    latest_revision_hash: str
+    scenario_proof_origin: RevisionProofOrigin
+    revision_head_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    revision_history_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.verified
+    revision_history_issue_count: int = Field(default=0, ge=0)
+    active_plan: PlanVersion | None = None
+    operational_view: ScenarioOperationalView
+    execution_watermark: int = Field(ge=0)
+    execution_context_hash: str
+    snapshot_token: str
 
 
 class ActivatePlanRequest(BaseModel):
@@ -1532,7 +1671,7 @@ class RiskSimulationResult(BaseModel):
     emergency_location_work_order_ids: list[Identifier] = Field(default_factory=list)
     artifact_detail_policy: RiskArtifactDetailPolicy = RiskArtifactDetailPolicy.summary_only
     execution_policy_version: str = "FIELD_SERVICE_RISK_EXECUTION_V2"
-    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V6"
+    simulation_policy_version: str = "FIELD_SERVICE_SIMULATION_V7"
     analysis_code_version: str
     algorithm_version: str = "FIELD_SERVICE_DECISION_V2"
     build_sha: str = "legacy-unknown"
@@ -1609,6 +1748,8 @@ class RiskSimulationResult(BaseModel):
     scenario_set_artifact_id: str | None = None
     trial_outcome_artifact_id: str | None = None
     trial_metrics: list[RiskTrialMetric] = Field(default_factory=list, exclude=True)
+    paired_trial_vectors: list[PairedTrialVector] = Field(default_factory=list, exclude=True)
+    emergency_decision_evidence: list[EmergencyDecisionEvidence] = Field(default_factory=list, exclude=True)
 
 
 class CostAnalysisParameters(BaseModel):
@@ -1803,6 +1944,12 @@ class CapacityCounterfactualArtifact(BaseModel):
     external_assignments: list[ExternalAssignment] = Field(default_factory=list)
     work_order_dispositions: list[WorkOrderDisposition] = Field(default_factory=list)
     counterfactual_kpis: CapacityCounterfactualKPI | None = None
+    formal_cost: PlanCostBreakdown | None = None
+    diagnostic_cost: PlanCostBreakdown | None = None
+    cost_ledger_hash: str = ""
+    cost_policy_hash: str = ""
+    capacity_policy_hash: str = ""
+    reference_cost_hash: str = ""
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
@@ -1884,6 +2031,34 @@ class RiskTrialMetric(BaseModel):
     all_demand_total_late_minutes: int = Field(default=0, ge=0)
     emergency_late_minutes: int | None = Field(default=None, ge=0)
     work_order_outcomes: list[SimulatedWorkOrderOutcome] = Field(default_factory=list)
+    work_order_window_violation_by_id: dict[str, bool] = Field(default_factory=dict)
+    technician_overtime_breach_by_id: dict[str, bool] = Field(default_factory=dict)
+    technician_overtime_minutes_by_id: dict[str, int] = Field(default_factory=dict)
+    new_window_failure_ids: list[Identifier] = Field(default_factory=list)
+    new_overtime_breach_technician_ids: list[Identifier] = Field(default_factory=list)
+    overtime_worsened_technician_ids: list[Identifier] = Field(default_factory=list)
+
+
+class PairedTrialVector(BaseModel):
+    trial: int = Field(ge=0)
+    published_commitment_sla_rate: float = Field(ge=0, le=1)
+    all_demand_sla_rate: float = Field(ge=0, le=1)
+    total_overtime_minutes: int = Field(ge=0)
+    total_unserved_orders: int = Field(ge=0)
+    disrupted: bool
+    emergency_event: bool
+    emergency_completed: bool
+    emergency_on_time: bool
+
+
+class EmergencyDecisionEvidence(BaseModel):
+    trial: int = Field(ge=0)
+    emergency_technician_id: Identifier | None = None
+    emergency_dispatch_time: int | None = Field(default=None, ge=0, le=2760)
+    emergency_finish_time: int | None = Field(default=None, ge=0, le=3240)
+    emergency_route_terminal_time: int | None = Field(default=None, ge=0, le=3240)
+    emergency_dispatch_location: Point | None = None
+    information_set: EmergencyDecisionInformationSet | None = None
 
 
 class RiskTrialOutcomeArtifact(BaseModel):
@@ -1893,7 +2068,10 @@ class RiskTrialOutcomeArtifact(BaseModel):
     analysis_run_id: str
     scenario_set_hash: str
     detail_policy: RiskArtifactDetailPolicy = RiskArtifactDetailPolicy.summary_only
-    metrics: list[RiskTrialMetric]
+    metric_policy_version: str = "FIELD_SERVICE_RISK_TRIAL_METRICS_V7"
+    metrics: list[RiskTrialMetric] = Field(default_factory=list)
+    paired_trial_vectors: list[PairedTrialVector] = Field(default_factory=list)
+    emergency_decision_evidence: list[EmergencyDecisionEvidence] = Field(default_factory=list)
     artifact_hash: str = ""
     integrity_status: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
     self_integrity: AnalysisIntegrityStatus = AnalysisIntegrityStatus.legacy_unattested
@@ -2001,6 +2179,29 @@ class RiskComparisonRun(BaseModel):
     created_at: str
 
 
+class RiskComparisonSaga(BaseModel):
+    id: str
+    scenario_id: str
+    idempotency_key: str
+    request_fingerprint: str
+    before_plan_version_id: str
+    after_plan_version_id: str
+    status: Literal[
+        "RESERVED",
+        "BEFORE_COMPLETED",
+        "AFTER_COMPLETED",
+        "COMPARISON_COMPLETED",
+        "FAILED",
+    ] = "RESERVED"
+    input_manifest_hash: str
+    before_analysis_id: str | None = None
+    after_analysis_id: str | None = None
+    comparison_id: str | None = None
+    error: dict[str, Any] | None = None
+    created_at: str
+    updated_at: str
+
+
 class VerificationIssue(BaseModel):
     code: str
     message: str
@@ -2086,7 +2287,80 @@ class ScheduleVerificationReport(BaseModel):
     checked_at: str
 
 
+class RestoreTransformManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_RESTORE_TRANSFORM_V1"
+    scenario_id: str
+    command_base_scenario_revision: int
+    command_base_scenario_hash: str
+    source_plan_version_id: str
+    source_plan_manifest_hash: str
+    source_plan_snapshot_hash: str
+    target_scenario_revision: int
+    target_scenario_hash: str
+    request_fingerprint: str
+    transform_input_hash: str
+    transform_output_hash: str
+    manifest_hash: str = ""
+
+
+class RunInputManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_RUN_INPUT_MANIFEST_V1"
+    run_id: str
+    scenario_id: str
+    command_base_scenario_revision: int
+    command_base_scenario_hash: str
+    target_scenario_revision: int
+    target_scenario_hash: str
+    reservation_id: str
+    reservation_hash: str
+    source_plan_version_id: str | None = None
+    expected_active_plan_version_id: str | None = None
+    command_fingerprint: str
+    solver_name: str
+    solver_config_hash: str
+    requested_time_limit_ms: int
+    restore_transform_manifest_hash: str | None = None
+    manifest_hash: str = ""
+
+
+class RunResultManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_RUN_RESULT_MANIFEST_V1"
+    run_id: str
+    status: ScheduleRunStatus
+    termination_reason: str | None = None
+    solution_found: bool
+    candidate_id: str | None = None
+    candidate_manifest_hash: str | None = None
+    solver_name: str
+    solver_version: str
+    solver_policy_fingerprint: str
+    planning_context_hash: str | None = None
+    finished_at: str
+    manifest_hash: str = ""
+
+
+class CandidateManifest(BaseModel):
+    policy_version: str = "FIELD_SERVICE_CANDIDATE_MANIFEST_V1"
+    candidate_id: str
+    run_id: str
+    run_input_manifest_hash: str
+    scenario_id: str
+    scenario_revision: int
+    scenario_snapshot_hash: str
+    reservation_id: str
+    reservation_hash: str
+    source_plan_version_id: str | None = None
+    expected_active_plan_version_id: str | None = None
+    schedule_hash: str
+    verification_report_hash: str
+    solver_policy_fingerprint: str
+    publishable: bool
+    restore_transform_manifest_hash: str | None = None
+    manifest_hash: str = ""
+
+
 class PlanningReservation(BaseModel):
+    policy_version: str = "FIELD_SERVICE_PLANNING_RESERVATION_V2"
     id: str
     scenario_id: str
     action: Literal["baseline", "optimize", "replan", "activate", "restore", "reattest", "experiment"]
@@ -2104,6 +2378,24 @@ class PlanningReservation(BaseModel):
     command_fingerprint: str
     created_at: str
     reservation_hash: str = ""
+    command_base_scenario_revision: int | None = None
+    command_base_scenario_hash: str | None = None
+    target_scenario_revision: int | None = None
+    target_scenario_hash: str | None = None
+    target_transform_policy: str | None = None
+    target_transform_input_hash: str | None = None
+    target_transform_output_hash: str | None = None
+    restore_transform_manifest: RestoreTransformManifest | None = None
+
+    @model_validator(mode="after")
+    def project_command_base_identity(self) -> PlanningReservation:
+        self.command_base_scenario_revision = (
+            self.scenario_revision
+            if self.command_base_scenario_revision is None
+            else self.command_base_scenario_revision
+        )
+        self.command_base_scenario_hash = self.command_base_scenario_hash or self.scenario_snapshot_hash
+        return self
 
 
 class ScheduleRun(BaseModel):
@@ -2131,6 +2423,11 @@ class ScheduleRun(BaseModel):
     candidate_id: str | None = None
     planning_context: PlanningContext | None = None
     planning_context_hash: str | None = None
+    target_scenario_revision: int | None = None
+    target_scenario_snapshot_hash: str | None = None
+    restore_transform_manifest: RestoreTransformManifest | None = None
+    input_manifest: RunInputManifest | None = None
+    result_manifest: RunResultManifest | None = None
 
 
 class ScheduleCandidate(BaseModel):
@@ -2151,3 +2448,5 @@ class ScheduleCandidate(BaseModel):
     created_at: str
     planning_context: PlanningContext | None = None
     planning_context_hash: str | None = None
+    restore_transform_manifest: RestoreTransformManifest | None = None
+    candidate_manifest: CandidateManifest | None = None

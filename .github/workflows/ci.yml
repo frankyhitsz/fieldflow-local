@@ -22,7 +22,7 @@ jobs:
             requirements-runtime.lock
             requirements-dev.lock
       - run: python -m venv .venv
-      - run: .venv/bin/pip install -r requirements-dev.lock && .venv/bin/pip install -e . --no-deps
+      - run: .venv/bin/pip install --require-hashes -r requirements-dev.lock && .venv/bin/pip install -e . --no-deps
       - name: Check Python 3.11 compatibility
         run: |
           .venv/bin/python -m ruff check backend tests scripts
@@ -47,26 +47,26 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: python -m venv .venv
-      - run: .venv/bin/pip install -r requirements-dev.lock && .venv/bin/pip install -e . --no-deps
+      - run: .venv/bin/pip install --require-hashes -r requirements-dev.lock && .venv/bin/pip install -e . --no-deps
       - run: npm ci --prefix frontend
       - run: npx playwright install --with-deps chromium
         working-directory: frontend
       - name: Run static checks
-        run: make lint
+        run: make lock-check lint
       - name: Audit dependencies
         run: make audit
       - name: Test backend and API
         run: make test
-      - name: Run targeted mutation smoke
-        run: make mutation-smoke
+      - name: Enforce safety mutation score
+        run: make mutation-test
       - name: Test React components
         run: make test-frontend
       - name: Build frontend
         run: make build
       - name: Run demo check
         run: make demo-check
-      - name: Run benchmark smoke
-        run: make benchmark-smoke
+      - name: Check benchmark trend
+        run: make benchmark
       - name: Run Playwright flow
         run: make test-e2e
       - name: Upload browser failure artifacts
@@ -93,7 +93,7 @@ jobs:
             requirements-runtime.lock
             requirements-dev.lock
       - run: python -m venv .venv
-      - run: .venv/bin/pip install -r requirements-dev.lock && .venv/bin/pip install -e . --no-deps
+      - run: .venv/bin/pip install --require-hashes -r requirements-dev.lock && .venv/bin/pip install -e . --no-deps
       - name: Verify macOS runtime compatibility
         run: |
           .venv/bin/python -m ruff check backend tests scripts

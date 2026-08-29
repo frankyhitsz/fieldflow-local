@@ -1,4 +1,4 @@
-.PHONY: setup lint audit test mutation-smoke test-frontend test-e2e build verify demo demo-check benchmark-smoke clean-data
+.PHONY: setup lock-check lint audit test mutation-test mutation-smoke test-frontend test-e2e build verify demo demo-check benchmark benchmark-smoke clean-data
 
 PYTHON := .venv/bin/python
 PYTEST := .venv/bin/pytest
@@ -7,9 +7,13 @@ PORT ?= 8000
 
 setup:
 	python3 -m venv .venv
-	.venv/bin/pip install -r requirements-dev.lock
+	.venv/bin/pip install --require-hashes -r requirements-dev.lock
 	.venv/bin/pip install -e . --no-deps
 	cd frontend && npm ci --cache $(NPM_CACHE)
+
+lock-check:
+	$(PYTHON) scripts/check_lockfiles.py
+	$(PYTHON) -m pip install --dry-run --require-hashes -r requirements-runtime.lock
 
 lint:
 	$(PYTHON) -m ruff check backend tests scripts
@@ -21,8 +25,10 @@ lint:
 test:
 	FIELDFLOW_DB=/tmp/fieldflow-tests.db $(PYTEST) --cov=backend --cov-report=term-missing --cov-fail-under=85 -q
 
-mutation-smoke:
+mutation-test:
 	$(PYTHON) scripts/mutation_smoke.py
+
+mutation-smoke: mutation-test
 
 audit:
 	.venv/bin/pip-audit --cache-dir /tmp/fieldflow-pip-audit -r requirements-runtime.lock
@@ -39,12 +45,14 @@ build:
 	cd frontend && npm run build
 
 demo-check:
-	PYTHONPATH=. FIELDFLOW_DB=/tmp/fieldflow-demo-check.db $(PYTHON) scripts/demo_check.py
+	PYTHONPATH=. $(PYTHON) scripts/demo_check.py
 
-benchmark-smoke:
+benchmark:
 	PYTHONPATH=. $(PYTHON) scripts/benchmark_smoke.py
 
-verify: lint audit test mutation-smoke test-frontend build demo-check benchmark-smoke test-e2e
+benchmark-smoke: benchmark
+
+verify: lock-check lint audit test mutation-test test-frontend build demo-check benchmark test-e2e
 
 demo: build
 	@echo "FieldFlow Local → http://127.0.0.1:$(PORT)"

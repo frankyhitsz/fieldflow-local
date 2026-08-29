@@ -1,6 +1,7 @@
 import importlib
 import json
 import sqlite3
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
@@ -57,7 +58,7 @@ from backend.provenance import (
     release_manifest,
 )
 from backend.scheduler import baseline_schedule, calculate_kpis
-from backend.storage import Store
+from backend.storage import SCHEMA_VERSION, Store
 from backend.travel import EuclideanTravelTimeProvider
 from backend.verification import verify_schedule
 
@@ -780,7 +781,7 @@ def test_emergency_location_policy_is_explicit_and_active_scope_filters_location
     }
 
 
-def test_risk_v6_separates_published_and_emergency_late_minutes_and_outcomes():
+def test_risk_v7_separates_published_and_emergency_late_minutes_and_outcomes():
     plan = _plan()
     expected_work_order_count = len(plan.selected.assignments) + len(plan.selected.unassigned)
     result = simulate_plan_risk(
@@ -792,7 +793,7 @@ def test_risk_v6_separates_published_and_emergency_late_minutes_and_outcomes():
             artifact_detail_policy=RiskArtifactDetailPolicy.full_trial_detail,
         ),
     )
-    assert result.simulation_policy_version == "FIELD_SERVICE_SIMULATION_V6"
+    assert result.simulation_policy_version == "FIELD_SERVICE_SIMULATION_V7"
     assert result.emergency_metric_sample_count == 50
     assert result.emergency_completed_sample_count == sum(metric.emergency_completed for metric in result.trial_metrics)
     for metric in result.trial_metrics:
@@ -1397,7 +1398,7 @@ def test_published_plan_integrity_is_attested_and_checked_by_analysis_report_and
         client.post("/api/scenarios/main/baseline")
         plan = client.get("/api/scenarios/main/plan-versions").json()[0]
         assert plan["published_schedule_hash"]
-        assert plan["publication_verification_policy_version"] == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2"
+        assert plan["publication_verification_policy_version"] == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V3"
         assert plan["publication_verification_report_hash"]
         assert plan["publication_verification_artifact"]["artifact_hash"]
         assert plan["publication_manifest_hash"]
@@ -1967,22 +1968,18 @@ def test_capacity_analysis_run_persists_full_counterfactual_artifacts(monkeypatc
             == outsourced["conditional_upper_bound_kpis"]["active_work_order_count"]
         )
         with closing(sqlite3.connect(database)) as connection, connection:
-            payload = json.loads(
-                connection.execute(
-                    "SELECT payload FROM decision_analysis_artifacts WHERE id=?", (outsourced["id"],)
-                ).fetchone()[0]
-            )
-            payload["external_assignments"][0]["assumed_on_time"] = False
+            blob_hash = connection.execute(
+                "SELECT artifact_blob_hash FROM decision_analysis_artifacts WHERE id=?", (outsourced["id"],)
+            ).fetchone()[0]
             connection.execute(
-                "UPDATE decision_analysis_artifacts SET payload=? WHERE id=?",
-                (json.dumps(payload, ensure_ascii=False), outsourced["id"]),
+                "UPDATE artifact_blobs SET compressed_payload=? WHERE content_hash=?",
+                (b"tampered", blob_hash),
             )
         checked = client.get(f"/api/scenarios/main/analysis-runs/{body['id']}").json()
         assert checked["integrity_status"] == "FAILED"
-        checked_artifact = client.get(
-            f"/api/scenarios/main/analysis-runs/{body['id']}/artifacts/{outsourced['id']}"
-        ).json()
-        assert checked_artifact["integrity_status"] == "FAILED"
+        checked_artifact = client.get(f"/api/scenarios/main/analysis-runs/{body['id']}/artifacts/{outsourced['id']}")
+        assert checked_artifact.status_code == 409
+        assert checked_artifact.json()["detail"]["code"] == "RECORD_INTEGRITY_FAILED"
 
 
 def test_analysis_result_tampering_and_required_attestation_downgrade_fail_closed(monkeypatch, tmp_path):
@@ -2227,15 +2224,13 @@ def test_paired_risk_comparison_persists_two_runs_with_one_scenario_set(monkeypa
                 "UPDATE decision_analysis_runs SET payload=? WHERE id=?",
                 (analysis_payload, body["before_analysis_id"]),
             )
-            trial_payload = connection.execute(
-                "SELECT payload FROM decision_analysis_artifacts WHERE id=?",
+            trial_blob_hash = connection.execute(
+                "SELECT artifact_blob_hash FROM decision_analysis_artifacts WHERE id=?",
                 (body["before_trial_artifact_id"],),
             ).fetchone()[0]
-            tampered_trial = json.loads(trial_payload)
-            tampered_trial["metrics"][0]["total_unserved_orders"] += 1
             connection.execute(
-                "UPDATE decision_analysis_artifacts SET payload=? WHERE id=?",
-                (json.dumps(tampered_trial, ensure_ascii=False), body["before_trial_artifact_id"]),
+                "UPDATE artifact_blobs SET compressed_payload=? WHERE content_hash=?",
+                (b"tampered", trial_blob_hash),
             )
         invalid_trial = client.get(f"/api/scenarios/main/risk-comparisons/{body['id']}").json()
         assert invalid_trial["effective_integrity"] == "FAILED"
@@ -2480,26 +2475,28 @@ def test_required_plan_and_artifact_cannot_downgrade_to_legacy(monkeypatch, tmp_
                 "UPDATE plan_versions SET payload=? WHERE id=?",
                 (json.dumps(plan_payload, ensure_ascii=False), plan["id"]),
             )
-            artifact_payload = json.loads(
-                connection.execute(
-                    "SELECT payload FROM decision_analysis_artifacts WHERE id=?", (artifact["id"],)
-                ).fetchone()[0]
-            )
-            artifact_payload["artifact_hash"] = ""
-            artifact_payload["integrity_status"] = "LEGACY_UNATTESTED"
+            artifact_blob_hash = connection.execute(
+                "SELECT artifact_blob_hash FROM decision_analysis_artifacts WHERE id=?", (artifact["id"],)
+            ).fetchone()[0]
             connection.execute(
-                "UPDATE decision_analysis_artifacts SET payload=? WHERE id=?",
-                (json.dumps(artifact_payload, ensure_ascii=False), artifact["id"]),
+                "UPDATE artifact_blobs SET compressed_payload=? WHERE content_hash=?",
+                (b"tampered", artifact_blob_hash),
+            )
+            assert (
+                connection.execute(
+                    "SELECT attestation_requirement FROM decision_analysis_artifacts WHERE id=?", (artifact["id"],)
+                ).fetchone()[0]
+                == "REQUIRED"
             )
         checked_plan = client.get(f"/api/scenarios/main/plan-versions/{plan['id']}").json()
-        checked_artifact = client.get(
+        checked_artifact_response = client.get(
             f"/api/scenarios/main/analysis-runs/{capacity['id']}/artifacts/{artifact['id']}"
-        ).json()
+        )
         checked_run = client.get(f"/api/scenarios/main/analysis-runs/{capacity['id']}").json()
         assert checked_plan["attestation_requirement"] == "REQUIRED"
         assert checked_plan["integrity_status"] == "FAILED"
-        assert checked_artifact["attestation_requirement"] == "REQUIRED"
-        assert checked_artifact["integrity_status"] == "FAILED"
+        assert checked_artifact_response.status_code == 409
+        assert checked_artifact_response.json()["detail"]["code"] == "RECORD_INTEGRITY_FAILED"
         assert checked_run["integrity_status"] == "FAILED" and checked_run["result"] is None
 
 
@@ -2551,9 +2548,12 @@ def test_malformed_artifact_is_structured_and_invalidates_parent(monkeypatch, tm
         ).json()
         artifact = client.get(f"/api/scenarios/main/analysis-runs/{run['id']}/artifacts").json()[0]
         with closing(sqlite3.connect(database)) as connection, connection:
+            blob_hash = connection.execute(
+                "SELECT artifact_blob_hash FROM decision_analysis_artifacts WHERE id=?", (artifact["id"],)
+            ).fetchone()[0]
             connection.execute(
-                "UPDATE decision_analysis_artifacts SET payload=? WHERE id=?",
-                ("{", artifact["id"]),
+                "UPDATE artifact_blobs SET compressed_payload=? WHERE content_hash=?",
+                (b"malformed", blob_hash),
             )
         parent = client.get(f"/api/scenarios/main/analysis-runs/{run['id']}").json()
         detail = client.get(f"/api/scenarios/main/analysis-runs/{run['id']}/artifacts/{artifact['id']}")
@@ -2871,7 +2871,7 @@ def test_v10_migration_preserves_legacy_technician_cost_value(tmp_path):
         stored = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
         assert stored["technicians"][0]["cost_per_minute_cents"] == 125
         assert "cost_per_minute" not in stored["technicians"][0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_legacy_technician_cost_input_remains_compatible():
@@ -2925,7 +2925,7 @@ def test_v14_analysis_unique_constraint_migrates_to_retryable_attempt_schema(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_analysis_artifacts'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_v14_retry_schema_migration_preserves_analysis_artifacts(monkeypatch, tmp_path):
@@ -2977,7 +2977,10 @@ def test_v14_retry_schema_migration_preserves_analysis_artifacts(monkeypatch, tm
         connection.execute("PRAGMA user_version=14")
     Store(database)
     with closing(sqlite3.connect(database)) as connection:
-        rows = connection.execute("SELECT id, payload FROM decision_analysis_artifacts ORDER BY id").fetchall()
+        rows = connection.execute(
+            "SELECT a.id, b.compressed_payload FROM decision_analysis_artifacts a "
+            "JOIN artifact_blobs b ON b.content_hash=a.artifact_blob_hash ORDER BY a.id"
+        ).fetchall()
         assert len(rows) == len(artifact_hashes)
-        assert {row[0]: json.loads(row[1])["artifact_hash"] for row in rows} == artifact_hashes
+        assert {row[0]: json.loads(zlib.decompress(row[1]))["artifact_hash"] for row in rows} == artifact_hashes
         assert not connection.execute("PRAGMA foreign_key_check").fetchall()

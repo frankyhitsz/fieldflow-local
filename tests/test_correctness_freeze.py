@@ -3,12 +3,14 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.models import FieldImpact, WorkOrderStatus
+from backend.hashing import content_hash
+from backend.models import FieldImpact, WorkOrder, WorkOrderStatus
 from backend.storage import ActivePlanConflict, PublicationConflict, Store
 
 
@@ -473,6 +475,340 @@ def test_execution_command_replay_survives_application_restart(monkeypatch, tmp_
         replay = restarted.post(endpoint, json=request)
         assert replay.status_code == 200
         assert replay.json()["event"]["id"] == first.json()["event"]["id"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value_factory"),
+    [
+        ("shift_end", lambda technician, _order: technician["shift_end"] + 30),
+        (
+            "skills",
+            lambda _technician, order: [
+                next(skill for skill in ("electrical", "hvac", "network") if skill not in order["required_skills"])
+            ],
+        ),
+        (
+            "start_location",
+            lambda technician, _order: {
+                "x": technician["start_location"]["x"] + 1,
+                "y": technician["start_location"]["y"],
+            },
+        ),
+    ],
+    ids=["shift-change", "skill-change", "start-location-change"],
+)
+def test_started_work_order_completes_after_technician_planning_change(monkeypatch, tmp_path, field, value_factory):
+    database = tmp_path / f"complete-after-{field}.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        schedule = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in schedule["assignments"] if item["sequence"] == 1)
+        scenario = client.get("/api/scenarios/main").json()
+        technician = next(item for item in scenario["technicians"] if item["id"] == assignment["technician_id"])
+        order = next(item for item in scenario["work_orders"] if item["id"] == assignment["work_order_id"])
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{order['id']}/start",
+            json={
+                "technician_id": technician["id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": scenario["revision"],
+                "idempotency_key": f"start-before-{field}-001",
+            },
+        )
+        assert started.status_code == 200, started.text
+        edited = client.put(
+            f"/api/v2/scenarios/main/technicians/{technician['id']}",
+            headers={"If-Match": f"D{started.json()['scenario']['revision']}"},
+            json={field: value_factory(technician, order)},
+        )
+        assert edited.status_code == 200, edited.text
+        active = next(item for item in client.get("/api/scenarios/main/plan-versions").json() if item["active"])
+        assert order["id"] not in active["applicability"]["invalid_assignment_ids"]
+
+        completed = client.post(
+            f"/api/scenarios/main/work-orders/{order['id']}/complete",
+            json={
+                "technician_id": technician["id"],
+                "occurred_at": assignment["finish_time"] + 1,
+                "expected_revision": edited.json()["revision"],
+                "idempotency_key": f"complete-after-{field}-001",
+            },
+        )
+        assert completed.status_code == 200, completed.text
+        assert completed.json()["event"]["booking_id"] == started.json()["event"]["booking_id"]
+        assert completed.json()["event"]["plan_version_id"] == started.json()["event"]["plan_version_id"]
+        assert completed.json()["event"]["source_assignment_hash"] == started.json()["event"]["source_assignment_hash"]
+
+
+def test_complete_uses_verified_start_when_original_plan_is_no_longer_active(monkeypatch, tmp_path):
+    database = tmp_path / "complete-without-active-plan.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        schedule = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in schedule["assignments"] if item["sequence"] == 1)
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "start-before-plan-removal-001",
+            },
+        )
+        assert started.status_code == 200, started.text
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("UPDATE scenarios SET active_plan_version_id=NULL WHERE id='main'")
+            connection.execute("UPDATE plan_applicability SET active=0 WHERE scenario_id='main'")
+
+        completed = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/complete",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["finish_time"] + 1,
+                "expected_revision": 1,
+                "idempotency_key": "complete-after-plan-removal-001",
+            },
+        )
+        assert completed.status_code == 200, completed.text
+        assert completed.json()["event"]["plan_version_id"] == started.json()["event"]["plan_version_id"]
+
+
+def test_operational_view_exposes_independent_start_and_complete_authority(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "operational-transition-authority.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        schedule = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in schedule["assignments"] if item["sequence"] == 1)
+        before = client.get("/api/scenarios/main/operational-view").json()
+        pending = next(item for item in before["work_orders"] if item["work_order_id"] == assignment["work_order_id"])
+        assert pending["start_allowed"] is True
+        assert pending["complete_allowed"] is False
+        assert pending["complete_blocking_reason_code"] == "WORK_ORDER_NOT_STARTED"
+
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "operational-authority-start-001",
+            },
+        )
+        assert started.status_code == 200, started.text
+        after = client.get("/api/scenarios/main/operational-view").json()
+        active = next(item for item in after["work_orders"] if item["work_order_id"] == assignment["work_order_id"])
+        assert active["start_allowed"] is False
+        assert active["start_blocking_reason_code"] == "WORK_ORDER_ALREADY_STARTED"
+        assert active["complete_allowed"] is True
+        assert active["complete_blocking_reason_code"] is None
+
+
+def test_dispatch_snapshot_binds_one_scenario_plan_and_execution_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "dispatch-snapshot.db"))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        client.post("/api/scenarios/main/baseline")
+        first = client.get("/api/scenarios/main/dispatch-snapshot")
+        assert first.status_code == 200, first.text
+        first_snapshot = first.json()
+        assert first.headers["etag"] == f'"{first_snapshot["snapshot_token"]}"'
+        assert (
+            first_snapshot["scenario_head_snapshot_hash"]
+            == first_snapshot["operational_view"]["scenario_snapshot_hash"]
+        )
+        assert first_snapshot["active_plan"]["id"] == first_snapshot["operational_view"]["active_plan_version_id"]
+        assert first_snapshot["execution_watermark"] == first_snapshot["operational_view"]["execution_watermark"]
+        assert first_snapshot["execution_context_hash"] == first_snapshot["operational_view"]["execution_context_hash"]
+
+        optimized = client.post(
+            "/api/scenarios/main/optimize",
+            json={
+                "time_limit_seconds": 1,
+                "expected_active_plan_version_id": first_snapshot["active_plan"]["id"],
+            },
+        )
+        assert optimized.status_code == 200, optimized.text
+        second_snapshot = client.get("/api/scenarios/main/dispatch-snapshot").json()
+        assert second_snapshot["scenario"]["revision"] == first_snapshot["scenario"]["revision"]
+        assert second_snapshot["active_plan"]["id"] != first_snapshot["active_plan"]["id"]
+        assert second_snapshot["snapshot_token"] != first_snapshot["snapshot_token"]
+
+
+def test_dispatch_snapshot_validates_execution_event_chain(monkeypatch, tmp_path):
+    database = tmp_path / "dispatch-snapshot-event-integrity.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        schedule = client.post("/api/scenarios/main/baseline").json()
+        assignment = next(item for item in schedule["assignments"] if item["sequence"] == 1)
+        started = client.post(
+            f"/api/scenarios/main/work-orders/{assignment['work_order_id']}/start",
+            json={
+                "technician_id": assignment["technician_id"],
+                "occurred_at": assignment["start_time"],
+                "expected_revision": 0,
+                "idempotency_key": "dispatch-integrity-start-001",
+            },
+        )
+        assert started.status_code == 200, started.text
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute(
+                "UPDATE work_order_execution_events SET booking_id='BOOK-TAMPERED' WHERE id=?",
+                (started.json()["event"]["id"],),
+            )
+        rejected = client.get("/api/scenarios/main/dispatch-snapshot")
+        assert rejected.status_code == 409
+        assert rejected.json()["detail"]["record_type"] == "WORK_ORDER_EXECUTION_EVENT"
+
+
+def _intake_emergency(store: Store, order: WorkOrder, key: str = "receipt-intake-001"):
+    fingerprint = content_hash({"scenario_id": "main", "work_order": order})
+    return store.intake_emergency_work_order(
+        "main",
+        order,
+        namespace="main:emergency-intake",
+        idempotency_key=key,
+        request_fingerprint=fingerprint,
+    )
+
+
+def test_replayed_emergency_intake_requires_the_same_work_order_resource(tmp_path):
+    store = Store(tmp_path / "emergency-receipt-resource.db")
+    scenario = store.get_scenario("main")
+    assert scenario is not None
+    order = scenario.work_orders[0].model_copy(
+        update={
+            "id": "WO-EMG-RECEIPT",
+            "is_emergency": True,
+            "reported_at": scenario.work_orders[0].window_start,
+            "status": WorkOrderStatus.pending,
+        }
+    )
+    committed, created = _intake_emergency(store, order)
+    assert created is True
+    receipt = store.active_emergency_intake_receipt("main", order.id)
+    assert receipt is not None
+    assert receipt.work_order_hash == content_hash(order)
+
+    committed.work_orders = [item for item in committed.work_orders if item.id != order.id]
+    committed.revision += 1
+    store.save_scenario(committed, "simulate legacy deletion", expected_revision=1)
+    with pytest.raises(PublicationConflict) as caught:
+        _intake_emergency(store, order)
+    assert caught.value.code == "EMERGENCY_INTAKE_RESOURCE_MISSING"
+
+
+def test_changed_emergency_payload_rejects_intake_replay(tmp_path):
+    store = Store(tmp_path / "emergency-receipt-change.db")
+    scenario = store.get_scenario("main")
+    assert scenario is not None
+    order = scenario.work_orders[0].model_copy(
+        update={
+            "id": "WO-EMG-CHANGED",
+            "is_emergency": True,
+            "reported_at": scenario.work_orders[0].window_start,
+            "status": WorkOrderStatus.pending,
+        }
+    )
+    committed, _ = _intake_emergency(store, order, "receipt-change-001")
+    stored_order = next(item for item in committed.work_orders if item.id == order.id)
+    stored_order.note = "changed after intake"
+    committed.revision += 1
+    store.save_scenario(committed, "change emergency", expected_revision=1)
+    with pytest.raises(PublicationConflict) as caught:
+        _intake_emergency(store, order, "receipt-change-001")
+    assert caught.value.code == "EMERGENCY_INTAKE_RESOURCE_CHANGED"
+
+
+def test_emergency_intake_cancel_is_explicit_atomic_and_restart_safe(monkeypatch, tmp_path):
+    database = tmp_path / "emergency-receipt-cancel.db"
+    monkeypatch.setenv("FIELDFLOW_DB", str(database))
+    import backend.main as main_module
+
+    main_module = importlib.reload(main_module)
+    with TestClient(main_module.app) as client:
+        store = main_module.require_store()
+        scenario = store.get_scenario("main")
+        assert scenario is not None
+        order = scenario.work_orders[0].model_copy(
+            update={
+                "id": "WO-EMG-CANCEL",
+                "is_emergency": True,
+                "reported_at": scenario.work_orders[0].window_start,
+                "status": WorkOrderStatus.pending,
+            }
+        )
+        committed, _ = _intake_emergency(store, order, "receipt-cancel-intake-001")
+        blocked = client.delete(
+            f"/api/v2/scenarios/main/work-orders/{order.id}",
+            headers={"If-Match": f"D{committed.revision}"},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "EMERGENCY_INTAKE_CANCEL_REQUIRED"
+        cancelled = client.post(
+            f"/api/v2/scenarios/main/emergency-intakes/{order.id}/cancel",
+            json={
+                "expected_revision": committed.revision,
+                "idempotency_key": "receipt-cancel-command-001",
+            },
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        assert order.id not in {item["id"] for item in cancelled.json()["work_orders"]}
+        replay = client.post(
+            f"/api/v2/scenarios/main/emergency-intakes/{order.id}/cancel",
+            json={
+                "expected_revision": committed.revision,
+                "idempotency_key": "receipt-cancel-command-001",
+            },
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["revision"] == cancelled.json()["revision"]
+
+    restarted = Store(database)
+    with pytest.raises(PublicationConflict) as caught:
+        _intake_emergency(restarted, order, "receipt-cancel-intake-001")
+    assert caught.value.code == "EMERGENCY_INTAKE_CANCELLED"
+
+
+def test_concurrent_same_emergency_intake_creates_one_receipt(tmp_path):
+    database = tmp_path / "emergency-receipt-concurrent.db"
+    store = Store(database)
+    scenario = store.get_scenario("main")
+    assert scenario is not None
+    order = scenario.work_orders[0].model_copy(
+        update={
+            "id": "WO-EMG-CONCURRENT",
+            "is_emergency": True,
+            "reported_at": scenario.work_orders[0].window_start,
+            "status": WorkOrderStatus.pending,
+        }
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _intake_emergency(store, order, "receipt-concurrent-001"), range(2)))
+    assert sorted(created for _, created in results) == [False, True]
+    with closing(sqlite3.connect(database)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM emergency_intake_receipts WHERE work_order_id=?",
+                (order.id,),
+            ).fetchone()[0]
+            == 1
+        )
+        payload = json.loads(connection.execute("SELECT payload FROM scenarios WHERE id='main'").fetchone()[0])
+        assert sum(item["id"] == order.id for item in payload["work_orders"]) == 1
 
 
 def test_candidate_publication_cas_rejects_newer_active_plan(monkeypatch, tmp_path):

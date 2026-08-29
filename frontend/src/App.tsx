@@ -5,10 +5,10 @@ import {
   Plus, RefreshCw, Route, Sparkles, TimerReset, Unlock, Users,
   WandSparkles, X, Zap,
 } from 'lucide-react'
-import { api } from './api'
+import { api, ApiError } from './api'
 import { ReviewView, TechnicianEditor, TechniciansView, VersionsView, WorkOrderEditor } from './Management'
 import { StrategyLab } from './StrategyLab'
-import type { Assignment, Comparison, OperationalView, PlanVersion, Scenario, Schedule, Strategy, StrategyProfile, Technician, Unassigned, WorkOrder } from './types'
+import type { Assignment, Comparison, DispatchSnapshot, OperationalView, PlanVersion, Scenario, Schedule, Strategy, StrategyProfile, Technician, Unassigned, WorkOrder } from './types'
 
 const hhmm = (minutes: number) => {
   const day = Math.floor(minutes / 1440)
@@ -286,6 +286,7 @@ export default function App() {
   const [plans, setPlans] = useState<PlanVersion[]>([])
   const [profiles, setProfiles] = useState<StrategyProfile[]>([])
   const [operational, setOperational] = useState<OperationalView>()
+  const [currentDispatch, setCurrentDispatch] = useState<DispatchSnapshot>()
   const [historicalScenario, setHistoricalScenario] = useState<Scenario>()
   const [view, setView] = useState<View>('dispatch')
   const [strategy, setStrategy] = useState<Strategy>('balanced')
@@ -299,9 +300,12 @@ export default function App() {
   const [workEditor, setWorkEditor] = useState<{ initial?: WorkOrder; emergencyPreset?: boolean }>()
   const [techEditor, setTechEditor] = useState<{ initial?: Technician }>()
   const [executionEditor, setExecutionEditor] = useState<{ assignment: Assignment; action: 'start' | 'complete' }>()
+  const [dispatchRefresh, setDispatchRefresh] = useState(0)
   const booted = useRef(false)
   const loadSequence = useRef(0)
   const activeScenarioId = useRef<string | undefined>(undefined)
+  const dispatchToken = useRef<string | undefined>(undefined)
+  const dispatchChannel = useRef<BroadcastChannel | undefined>(undefined)
 
   const loadScenario = async (id: string) => {
     const previousId = activeScenarioId.current
@@ -310,6 +314,7 @@ export default function App() {
     setLoadingScenarioId(id)
     setWorking('正在读取业务场景')
     setLoadError(undefined)
+    setCurrentDispatch(undefined); setOperational(undefined)
     try {
       const [next, planItems] = await Promise.all([api.scenario(id), api.planVersions(id)])
       if (sequence !== loadSequence.current) return
@@ -350,19 +355,68 @@ export default function App() {
   }, [toast])
 
   useEffect(() => {
+    const refresh = () => setDispatchRefresh(value => value + 1)
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    if (typeof BroadcastChannel !== 'undefined') {
+      const channel = new BroadcastChannel('fieldflow-dispatch')
+      dispatchChannel.current = channel
+      channel.onmessage = event => {
+        const message = event.data as { scenarioId?: string; snapshotToken?: string }
+        if (message.scenarioId === activeScenarioId.current && message.snapshotToken !== dispatchToken.current) refresh()
+      }
+    }
+    return () => {
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+      dispatchChannel.current?.close(); dispatchChannel.current = undefined
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!currentDispatch || dispatchToken.current === currentDispatch.snapshot_token) return
+    dispatchToken.current = currentDispatch.snapshot_token
+    dispatchChannel.current?.postMessage({ scenarioId: currentDispatch.scenario.id, snapshotToken: currentDispatch.snapshot_token })
+  }, [currentDispatch])
+
+  useEffect(() => {
     if (!scenario || historicalScenario) return
     const scenarioId = scenario.id
-    const scenarioRevision = scenario.revision
+    const expectedRevision = scenario.revision
+    const expectedActivePlanId = plans.find(item => item.active)?.id ?? null
+    const expectedScheduleId = schedule?.id ?? null
     let cancelled = false
-    api.operationalView(scenarioId).then(view => {
-      if (!cancelled && activeScenarioId.current === scenarioId && view.scenario_revision === scenarioRevision) {
-        setOperational(view)
+    api.dispatchSnapshot(scenarioId).then(async snapshot => {
+      if (cancelled || activeScenarioId.current !== scenarioId) return
+      const snapshotPlanId = snapshot.active_plan?.id ?? null
+      const snapshotScheduleId = snapshot.active_plan?.selected.id ?? null
+      const internallyConsistent = snapshot.scenario.id === scenarioId
+        && snapshot.scenario_head_snapshot_hash === snapshot.operational_view.scenario_snapshot_hash
+        && snapshot.operational_view.active_plan_version_id === snapshotPlanId
+        && snapshot.execution_watermark === snapshot.operational_view.execution_watermark
+        && snapshot.execution_context_hash === snapshot.operational_view.execution_context_hash
+      if (!internallyConsistent) throw new Error('调度快照的 D/V/E 证明不一致，已拒绝更新界面')
+      if (snapshot.scenario.revision === expectedRevision
+        && snapshotPlanId === expectedActivePlanId
+        && snapshotScheduleId === expectedScheduleId) {
+        setCurrentDispatch(snapshot); setOperational(snapshot.operational_view)
+        return
       }
+      // Another tab may publish a new V without advancing D. Reconcile the
+      // version list with the same transactional snapshot before accepting it.
+      const planItems = await api.planVersions(scenarioId)
+      if (cancelled || activeScenarioId.current !== scenarioId) return
+      const listedActiveId = planItems.find(item => item.active)?.id ?? null
+      if (listedActiveId !== snapshotPlanId) return
+      setCurrentDispatch(snapshot); setScenario(snapshot.scenario); setPlans(planItems)
+      setSchedule(snapshot.active_plan?.selected); setOperational(snapshot.operational_view)
+      setHistoricalScenario(undefined)
+      setScenarios(current => current.map(item => item.id === scenarioId ? snapshot.scenario : item))
     }).catch(error => {
       if (!cancelled) setToast(error instanceof Error ? error.message : '当前执行状态核对失败')
     })
     return () => { cancelled = true }
-  }, [scenario, schedule?.id, historicalScenario])
+  }, [scenario, schedule?.id, plans, historicalScenario, dispatchRefresh])
 
   const act = async (label: string, call: () => Promise<Schedule>, success: string) => {
     setWorking(label)
@@ -383,6 +437,9 @@ export default function App() {
   const currentOperational = !historicalScenario && scenario
     && operational?.scenario_id === scenario.id
     && operational.scenario_revision === scenario.revision
+    && operational.scenario_snapshot_hash === currentDispatch?.scenario_head_snapshot_hash
+    && operational.active_plan_version_id === (currentDispatch?.active_plan?.id ?? null)
+    && schedule?.id === currentDispatch?.active_plan?.selected.id
     ? operational
     : undefined
   const selected = useMemo(() => displayScenario?.work_orders.find(o => o.id === selectedId), [displayScenario, selectedId])
@@ -494,9 +551,18 @@ export default function App() {
   }
 
   const deleteWorkOrder = async (order: WorkOrder) => {
-    if (!window.confirm(`确认删除待处理工单 ${order.id}？`)) return
-    setWorking('正在删除工单')
-    try { const next = await api.deleteWorkOrder(scenario.id, order.id, scenario.revision); if (activeScenarioId.current !== next.id) return; setWorkEditor(undefined); await applyScenarioEdit(next, '工单已删除') }
+    if (!window.confirm(order.is_emergency ? `确认取消突发工单 ${order.id} 的接收并删除？` : `确认删除待处理工单 ${order.id}？`)) return
+    setWorking(order.is_emergency ? '正在取消突发工单接收' : '正在删除工单')
+    try {
+      let next: Scenario
+      try { next = await api.deleteWorkOrder(scenario.id, order.id, scenario.revision) }
+      catch (error) {
+        if (!(error instanceof ApiError) || error.code !== 'EMERGENCY_INTAKE_CANCEL_REQUIRED') throw error
+        next = await api.cancelEmergencyIntake(scenario.id, order.id, scenario.revision)
+      }
+      if (activeScenarioId.current !== next.id) return
+      setWorkEditor(undefined); await applyScenarioEdit(next, order.is_emergency ? '突发工单接收已取消' : '工单已删除')
+    }
     catch (error) { setToast(error instanceof Error ? error.message : '工单删除失败') }
     finally { setWorking(undefined) }
   }
@@ -570,7 +636,7 @@ export default function App() {
   return <div className="app-shell">
     <Sidebar scenarios={scenarios} current={scenario} active={view} busy={!!working || !!loadingScenarioId} onSelect={loadScenario} onNavigate={nextView => { setView(nextView); if (nextView === 'lab' && !scenario.id.startsWith('strategy-')) void loadScenario('strategy-medium') }} />
     <main className="main-content">
-      <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务时段 {serviceWindow}</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule || plans.find(item => item.selected.id === schedule.id)?.effective_integrity !== 'VERIFIED'} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}`, '_blank')}><FileText size={16} />导出报告</button></div></header>
+      <header className="topbar"><div><div className="date-line"><span>{dateText}</span><i />服务时段 {serviceWindow}</div><h1>{shownScenario.name}</h1></div><div className="top-actions"><SolverBadge schedule={schedule} /><button className="ghost-btn" disabled={!schedule || plans.find(item => item.selected.id === schedule.id)?.effective_integrity !== 'VERIFIED'} onClick={() => schedule && window.open(`/api/scenarios/${scenario.id}/report?schedule_id=${schedule.id}&mode=CURRENT_OPERATIONAL_REPORT`, '_blank')}><FileText size={16} />导出当前运营报告</button></div></header>
       {view === 'dispatch' && dispatch}
       {view === 'versions' && <VersionsView scenario={scenario} plans={plans} onOpen={async item => { setWorking('正在读取版本快照'); try { const detail = await api.planVersion(scenario.id, item.id); setSchedule(detail.selected); setHistoricalScenario(detail.active && detail.data_revision === scenario.revision ? undefined : detail.scenario_snapshot || undefined); setBaseline(detail.artifacts.find(artifactItem => artifactItem.role === 'baseline')?.schedule); setView('dispatch'); setToast(`已打开历史方案 V${String(item.number).padStart(3, '0')}`) } catch (error) { setToast(error instanceof Error ? error.message : '版本读取失败') } finally { setWorking(undefined) } }} onActivate={async item => {
         setWorking('正在核对并激活历史计划')

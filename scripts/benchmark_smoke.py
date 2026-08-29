@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
+import time
+from pathlib import Path
 
 from backend._version import __version__
 from backend.decision import (
@@ -28,6 +31,12 @@ from backend.provenance import build_plan_manifest_payload
 from backend.scheduler import baseline_schedule, calculate_kpis
 from backend.travel import EuclideanTravelTimeProvider
 from backend.verification import verify_schedule
+
+ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description="Run reproducible FieldFlow scenario and performance benchmarks")
+parser.add_argument("--write-baseline", action="store_true")
+arguments = parser.parse_args()
+performance_ms: dict[str, float] = {}
 
 
 def plan_for(scenario_id: str):
@@ -90,7 +99,9 @@ for name, fixture_id in (
     ("skill-shortage", "skill-shortage"),
     ("emergency", "emergency"),
 ):
+    started = time.perf_counter()
     scenario, plan = plan_for(fixture_id)
+    performance_ms[f"baseline_{name}"] = round((time.perf_counter() - started) * 1000, 3)
     rows.append(
         {
             "name": name,
@@ -129,14 +140,22 @@ rows.append(
 )
 
 scenario, plan = plan_for("main")
+started = time.perf_counter()
 cost = cost_analysis(plan)
+performance_ms["cost_analysis_small"] = round((time.perf_counter() - started) * 1000, 3)
+started = time.perf_counter()
 capacity = capacity_analysis(plan, CapacityAnalysisRequest())
+performance_ms["capacity_analysis_small"] = round((time.perf_counter() - started) * 1000, 3)
 risk_request = RiskSimulationRequest(seed=20260824, trials=50)
+started = time.perf_counter()
 risk = simulate_plan_risk(plan, risk_request)
+performance_ms["risk_50_trials_small"] = round((time.perf_counter() - started) * 1000, 3)
+started = time.perf_counter()
 controlled_capacity = capacity_analysis(
     plan,
     CapacityAnalysisRequest(reference_mode=CapacityReferenceMode.controlled_reoptimization),
 )
+performance_ms["controlled_capacity_small"] = round((time.perf_counter() - started) * 1000, 3)
 assert cost.breakdown.total_economic_impact_cents > 0
 assert cost.breakdown.total_economic_impact_cents == (
     cost.breakdown.cash_operating_cost_cents + cost.breakdown.service_failure_loss_cents
@@ -264,11 +283,42 @@ rows.extend(
     ]
 )
 
+baseline_path = ROOT / "docs" / "benchmark-baseline.json"
+if arguments.write_baseline:
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "benchmark_version": "FIELD_SERVICE_PERFORMANCE_BASELINE_V1",
+                "fieldflow_version": __version__,
+                "performance_ms": performance_ms,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+regressions: list[dict[str, float | str]] = []
+if baseline_path.exists() and not arguments.write_baseline:
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))["performance_ms"]
+    for name, elapsed in performance_ms.items():
+        if name not in baseline:
+            continue
+        # CI hosts vary substantially. This gate catches order-of-magnitude regressions,
+        # while the committed values still make smaller trends visible in artifacts.
+        limit = max(float(baseline[name]) * 5, float(baseline[name]) + 500)
+        if elapsed > limit:
+            regressions.append({"name": name, "elapsed_ms": elapsed, "limit_ms": round(limit, 3)})
+
 print(
     json.dumps(
         {
-            "benchmark_version": "FIELD_SERVICE_BENCHMARK_V1",
+            "benchmark_version": "FIELD_SERVICE_BENCHMARK_V2",
             "fieldflow_version": __version__,
+            "performance_ms": performance_ms,
+            "performance_regressions": regressions,
             "decision_checks": {
                 "cost_total_economic_impact_cents": cost.breakdown.total_economic_impact_cents,
                 "capacity_options": len(capacity.options),
@@ -283,3 +333,5 @@ print(
         indent=2,
     )
 )
+if regressions:
+    raise SystemExit(1)

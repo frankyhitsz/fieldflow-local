@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -125,15 +126,33 @@ def run_mutation(mutation: Mutation) -> bool:
 
 def main() -> int:
     survivors = []
+    results: list[dict[str, str | bool]] = []
     for mutation in MUTATIONS:
         killed = run_mutation(mutation)
         print(f"{'KILLED' if killed else 'SURVIVED'} {mutation.name}")
+        results.append({"name": mutation.name, "module": mutation.file, "killed": killed})
         if not killed:
             survivors.append(mutation.name)
+    score = (len(MUTATIONS) - len(survivors)) / len(MUTATIONS)
+    print(
+        json.dumps(
+            {
+                "mutation_policy_version": "FIELD_SERVICE_SAFETY_MUTATION_V2",
+                "scope": "safety-critical invariant anchors",
+                "total": len(MUTATIONS),
+                "killed": len(MUTATIONS) - len(survivors),
+                "survived": len(survivors),
+                "score": score,
+                "minimum_score": 1.0,
+                "results": results,
+            },
+            indent=2,
+        )
+    )
     if survivors:
-        print(f"mutation smoke failed; survivors: {', '.join(survivors)}")
+        print(f"safety mutation score failed; survivors: {', '.join(survivors)}")
         return 1
-    print(f"mutation smoke passed: {len(MUTATIONS)} targeted mutants killed")
+    print(f"safety mutation score passed: {len(MUTATIONS)}/{len(MUTATIONS)} mutants killed")
     return 0
 
 

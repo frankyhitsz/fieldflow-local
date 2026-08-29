@@ -4,9 +4,10 @@ import json
 import sqlite3
 import threading
 import uuid
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -22,18 +23,24 @@ from .models import (
     AnalysisIntegrityStatus,
     AnalysisReservationManifest,
     AttestationRequirement,
+    CandidateManifest,
     CapacityCounterfactualArtifact,
+    CommandRecordManifest,
     CurrentWorkOrderDisposition,
     DecisionAnalysisArtifact,
     DecisionAnalysisContext,
     DecisionAnalysisRun,
     DecisionResultManifest,
+    DispatchSnapshot,
+    EmergencyIntakeReceipt,
+    EmergencyIntakeStatus,
     ExecutionSourceAssignment,
     ExecutionSourceContext,
     FieldImpact,
     FrozenBookingIdentity,
     OperationalMetrics,
     OperationalWorkOrderView,
+    OutboxEvent,
     PlanApplicability,
     PlanCoverageStatus,
     PlanningContext,
@@ -43,11 +50,17 @@ from .models import (
     PublicationPlanningContext,
     PublicationVerificationArtifact,
     ReattestationMode,
+    RestoreTransformManifest,
     RevisionChainStatus,
     RevisionProofOrigin,
     RiskComparisonRun,
+    RiskComparisonSaga,
     RiskTrialOutcomeArtifact,
     RouteEntryContext,
+    RunInputManifest,
+    RunResultManifest,
+    RuntimeJob,
+    RuntimeJobStatus,
     ScenarioOperationalView,
     ScenarioRevision,
     ScheduleArtifact,
@@ -75,7 +88,10 @@ from .timeutils import service_ready_at
 from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 27
+
+_ARTIFACT_BLOB_CODEC = "ZLIB_JSON_V1"
+_MAX_ARTIFACT_BLOB_BYTES = 64 * 1024 * 1024
 
 _INTEGRITY_RANK = {
     AnalysisIntegrityStatus.failed: 0,
@@ -89,7 +105,7 @@ def _effective_integrity(*statuses: AnalysisIntegrityStatus) -> AnalysisIntegrit
 
 
 def _artifact_hash_payload(artifact: DecisionAnalysisArtifact) -> dict:
-    return artifact.model_dump(
+    payload = artifact.model_dump(
         exclude={
             "artifact_hash",
             "integrity_status",
@@ -100,6 +116,61 @@ def _artifact_hash_payload(artifact: DecisionAnalysisArtifact) -> dict:
             "attestation_requirement",
         },
         mode="json",
+    )
+    if isinstance(artifact, CapacityCounterfactualArtifact) and not any(
+        (
+            artifact.formal_cost,
+            artifact.diagnostic_cost,
+            artifact.cost_ledger_hash,
+            artifact.cost_policy_hash,
+            artifact.capacity_policy_hash,
+            artifact.reference_cost_hash,
+        )
+    ):
+        for field in (
+            "formal_cost",
+            "diagnostic_cost",
+            "cost_ledger_hash",
+            "cost_policy_hash",
+            "capacity_policy_hash",
+            "reference_cost_hash",
+        ):
+            payload.pop(field, None)
+    return payload
+
+
+def _capacity_cost_ledger_hash(artifact: CapacityCounterfactualArtifact) -> str:
+    return content_hash(
+        {
+            "policy_version": "FIELD_SERVICE_CAPACITY_COST_LEDGER_V1",
+            "option_id": artifact.option_id,
+            "formal_cost": artifact.formal_cost,
+            "diagnostic_cost": artifact.diagnostic_cost,
+            "reference_cost_hash": artifact.reference_cost_hash,
+            "cost_policy_hash": artifact.cost_policy_hash,
+            "capacity_policy_hash": artifact.capacity_policy_hash,
+        }
+    )
+
+
+def _capacity_cost_closure_valid(artifact: CapacityCounterfactualArtifact) -> bool:
+    if not any(
+        (
+            artifact.formal_cost,
+            artifact.diagnostic_cost,
+            artifact.cost_ledger_hash,
+            artifact.cost_policy_hash,
+            artifact.capacity_policy_hash,
+            artifact.reference_cost_hash,
+        )
+    ):
+        return True  # Legacy Artifact remains readable under its original hash policy.
+    return bool(
+        artifact.diagnostic_cost
+        and artifact.cost_policy_hash
+        and artifact.capacity_policy_hash
+        and artifact.reference_cost_hash
+        and artifact.cost_ledger_hash == _capacity_cost_ledger_hash(artifact)
     )
 
 
@@ -207,6 +278,89 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _store_artifact_blob(con: sqlite3.Connection, payload: str) -> str:
+    value = json.loads(payload)
+    canonical_payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw = canonical_payload.encode("utf-8")
+    if len(raw) > _MAX_ARTIFACT_BLOB_BYTES:
+        raise ValueError("artifact payload exceeds the 64 MiB storage limit")
+    blob_hash = content_hash(value)
+    compressed = zlib.compress(raw, level=9)
+    con.execute(
+        "INSERT OR IGNORE INTO artifact_blobs(content_hash, codec, compressed_payload, uncompressed_size, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (blob_hash, _ARTIFACT_BLOB_CODEC, compressed, len(raw), _now()),
+    )
+    stored = con.execute(
+        "SELECT codec, compressed_payload, uncompressed_size FROM artifact_blobs WHERE content_hash=?",
+        (blob_hash,),
+    ).fetchone()
+    if (
+        not stored
+        or stored["codec"] != _ARTIFACT_BLOB_CODEC
+        or int(stored["uncompressed_size"]) != len(raw)
+        or zlib.decompress(stored["compressed_payload"]) != raw
+    ):
+        raise sqlite3.IntegrityError("artifact blob hash collision or stored content mismatch")
+    return blob_hash
+
+
+def _artifact_blob_reference(blob_hash: str) -> str:
+    return json.dumps({"artifact_blob_hash": blob_hash}, separators=(",", ":"))
+
+
+def _read_artifact_blob(con: sqlite3.Connection, blob_hash: str) -> bytes:
+    blob = con.execute(
+        "SELECT codec, compressed_payload, uncompressed_size FROM artifact_blobs WHERE content_hash=?",
+        (blob_hash,),
+    ).fetchone()
+    if not blob or blob["codec"] != _ARTIFACT_BLOB_CODEC:
+        raise ValueError("artifact blob is missing or uses an unsupported codec")
+    if not 0 <= int(blob["uncompressed_size"]) <= _MAX_ARTIFACT_BLOB_BYTES:
+        raise ValueError("artifact blob declares an invalid uncompressed size")
+    try:
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(blob["compressed_payload"], _MAX_ARTIFACT_BLOB_BYTES + 1)
+        value = json.loads(raw)
+    except (TypeError, zlib.error, json.JSONDecodeError) as error:
+        raise ValueError("artifact blob cannot be decoded") from error
+    if (
+        len(raw) > _MAX_ARTIFACT_BLOB_BYTES
+        or not decompressor.eof
+        or decompressor.unused_data
+        or len(raw) != int(blob["uncompressed_size"])
+        or content_hash(value) != blob_hash
+    ):
+        raise ValueError("artifact blob integrity check failed")
+    return raw
+
+
+def _migrate_artifact_payload_to_blob(con: sqlite3.Connection, payload: str) -> str:
+    value = json.loads(payload)
+    if isinstance(value, dict) and set(value) == {"artifact_blob_hash"}:
+        existing_hash = value["artifact_blob_hash"]
+        if not isinstance(existing_hash, str):
+            raise ValueError("artifact blob reference hash must be a string")
+        _read_artifact_blob(con, existing_hash)
+        return existing_hash
+    return _store_artifact_blob(con, payload)
+
+
+def _load_artifact_payload(con: sqlite3.Connection, row: sqlite3.Row) -> str:
+    blob_hash = row["artifact_blob_hash"] if "artifact_blob_hash" in row.keys() else None
+    payload = str(row["payload"])
+    if not blob_hash:
+        return payload
+    try:
+        reference = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("artifact blob reference is malformed") from error
+    if reference != {"artifact_blob_hash": blob_hash}:
+        raise ValueError("artifact blob reference does not match relational hash")
+    raw = _read_artifact_blob(con, str(blob_hash))
+    return raw.decode("utf-8")
+
+
 _EXECUTION_EVENT_TRUST_FIELDS = {
     "event_content_hash",
     "self_integrity",
@@ -236,6 +390,111 @@ def _scenario_revision_hash(revision: ScenarioRevision) -> str:
 
 def _planning_reservation_hash(reservation: PlanningReservation) -> str:
     return content_hash(reservation.model_dump(exclude={"reservation_hash"}, mode="json"))
+
+
+def _restore_transform_manifest_hash(manifest: RestoreTransformManifest) -> str:
+    return content_hash(manifest.model_dump(exclude={"manifest_hash"}, mode="json"))
+
+
+def _run_input_manifest_hash(manifest: RunInputManifest) -> str:
+    return content_hash(manifest.model_dump(exclude={"manifest_hash"}, mode="json"))
+
+
+def _run_result_manifest_hash(manifest: RunResultManifest) -> str:
+    return content_hash(manifest.model_dump(exclude={"manifest_hash"}, mode="json"))
+
+
+def _candidate_manifest_hash(manifest: CandidateManifest) -> str:
+    return content_hash(manifest.model_dump(exclude={"manifest_hash"}, mode="json"))
+
+
+def _publication_verification_artifact_hash(artifact: PublicationVerificationArtifact) -> str:
+    payload = artifact.model_dump(exclude={"artifact_hash"}, mode="json")
+    if artifact.policy_version == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2":
+        for field in ("run_input_manifest_hash", "run_result_manifest_hash", "candidate_manifest_hash"):
+            if not payload.get(field):
+                payload.pop(field, None)
+    return content_hash(payload)
+
+
+def _command_manifest_hash(manifest: CommandRecordManifest) -> str:
+    return content_hash(manifest.model_dump(exclude={"manifest_hash"}, mode="json"))
+
+
+def _build_command_manifest(
+    *,
+    namespace: str,
+    key: str,
+    request_fingerprint: str,
+    status: str,
+    resource_type: str | None,
+    resource_id: str | None,
+    publication_key: str | None,
+    payload: str,
+    created_at: str,
+    updated_at: str,
+) -> CommandRecordManifest:
+    manifest = CommandRecordManifest(
+        namespace=namespace,
+        key=key,
+        request_fingerprint=request_fingerprint,
+        status=status,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        publication_key=publication_key,
+        payload_hash=content_hash(json.loads(payload)),
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+    manifest.manifest_hash = _command_manifest_hash(manifest)
+    return manifest
+
+
+def _runtime_job_input_hash(
+    job_type: str,
+    scenario_id: str,
+    input_payload: dict,
+    dedupe_key: str | None,
+) -> str:
+    return content_hash(
+        {
+            "policy_version": "FIELD_SERVICE_RUNTIME_JOB_INPUT_V1",
+            "job_type": job_type,
+            "scenario_id": scenario_id,
+            "input_payload": input_payload,
+            "dedupe_key": dedupe_key,
+        }
+    )
+
+
+def _outbox_payload_hash(event: OutboxEvent) -> str:
+    return content_hash(
+        {
+            "topic": event.topic,
+            "aggregate_type": event.aggregate_type,
+            "aggregate_id": event.aggregate_id,
+            "payload": event.payload,
+        }
+    )
+
+
+def _authorized_restore_target(
+    base: ScheduleScenario,
+    source: PlanVersion,
+) -> ScheduleScenario:
+    if not source.scenario_snapshot:
+        raise PublicationConflict(
+            "来源方案快照缺失",
+            code="SOURCE_PLAN_SNAPSHOT_MISSING",
+        )
+    target = source.scenario_snapshot.model_copy(deep=True)
+    target.id = base.id
+    target.revision = base.revision + 1
+    return target
+
+
+def _emergency_intake_receipt_hash(receipt: EmergencyIntakeReceipt) -> str:
+    return content_hash(receipt.model_dump(exclude={"receipt_hash"}, mode="json"))
 
 
 def _plan_applicability_hash(
@@ -420,11 +679,13 @@ class Store:
         self,
         path: str | Path,
         travel_provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
+        *,
+        allow_migration: bool = True,
     ):
         self.path = str(path)
         self.travel_provider = travel_provider
         self._lock = threading.RLock()
-        self._init()
+        self._init(allow_migration=allow_migration)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -518,6 +779,7 @@ class Store:
                 experiment_id TEXT,
                 role TEXT NOT NULL,
                 payload TEXT NOT NULL,
+                artifact_blob_hash TEXT,
                 created_at TEXT NOT NULL,
                 CHECK ((plan_version_id IS NOT NULL AND experiment_id IS NULL) OR (plan_version_id IS NULL AND experiment_id IS NOT NULL)),
                 FOREIGN KEY(plan_version_id) REFERENCES plan_versions(id) ON DELETE CASCADE,
@@ -553,8 +815,9 @@ class Store:
             SELECT p.id, p.scenario_id, p.number, p.payload, p.created_at
             FROM plan_versions p WHERE EXISTS (SELECT 1 FROM scenarios x WHERE x.id=p.scenario_id);
             INSERT INTO strategy_experiments_new SELECT e.* FROM strategy_experiments e WHERE EXISTS (SELECT 1 FROM scenarios x WHERE x.id=e.scenario_id);
-            INSERT INTO schedule_artifacts_new
-            SELECT a.* FROM schedule_artifacts a
+            INSERT INTO schedule_artifacts_new(id, plan_version_id, experiment_id, role, payload, artifact_blob_hash, created_at)
+            SELECT a.id, a.plan_version_id, a.experiment_id, a.role, a.payload, a.artifact_blob_hash, a.created_at
+            FROM schedule_artifacts a
             WHERE (a.plan_version_id IS NOT NULL AND a.experiment_id IS NULL AND EXISTS (SELECT 1 FROM plan_versions p WHERE p.id=a.plan_version_id))
                OR (a.plan_version_id IS NULL AND a.experiment_id IS NOT NULL AND EXISTS (SELECT 1 FROM strategy_experiments e WHERE e.id=a.experiment_id));
             INSERT INTO publication_keys_new
@@ -639,13 +902,22 @@ class Store:
                 previous_hash = revision.revision_hash
                 expected_number += 1
 
-    def _init(self) -> None:
+    def _init(self, *, allow_migration: bool) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as con:
             version = int(con.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"database schema v{version} is newer than this application supports (v{SCHEMA_VERSION})"
+                )
+            has_fieldflow_schema = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name IN "
+                "('scenarios', 'plan_versions', 'scenario_revisions') LIMIT 1"
+            ).fetchone()
+            if version < SCHEMA_VERSION and has_fieldflow_schema and not allow_migration:
+                raise RuntimeError(
+                    f"database schema v{version} requires explicit migration to v{SCHEMA_VERSION}; "
+                    "run `fieldflow migrate dry-run` and then `fieldflow migrate apply`"
                 )
             con.execute("PRAGMA journal_mode = WAL")
             if version < SCHEMA_VERSION:
@@ -755,6 +1027,13 @@ class Store:
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
                     FOREIGN KEY(analysis_run_id) REFERENCES decision_analysis_runs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS artifact_blobs (
+                    content_hash TEXT PRIMARY KEY,
+                    codec TEXT NOT NULL CHECK(codec IN ('ZLIB_JSON_V1')),
+                    compressed_payload BLOB NOT NULL,
+                    uncompressed_size INTEGER NOT NULL CHECK(uncompressed_size >= 0),
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS decision_analysis_attempts (
                     logical_analysis_id TEXT NOT NULL,
                     attempt_number INTEGER NOT NULL,
@@ -776,6 +1055,21 @@ class Store:
                     UNIQUE(scenario_id, number),
                     UNIQUE(scenario_id, comparison_hash),
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS risk_comparison_sagas (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('RESERVED', 'BEFORE_COMPLETED', 'AFTER_COMPLETED', 'COMPARISON_COMPLETED', 'FAILED')),
+                    input_manifest_hash TEXT NOT NULL,
+                    before_analysis_id TEXT,
+                    after_analysis_id TEXT,
+                    comparison_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(scenario_id, idempotency_key)
                 );
                 CREATE TABLE IF NOT EXISTS migration_orphans (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -822,6 +1116,18 @@ class Store:
                     status TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    input_manifest_hash TEXT,
+                    result_manifest_hash TEXT,
+                    scenario_revision INTEGER,
+                    scenario_snapshot_hash TEXT,
+                    target_scenario_revision INTEGER,
+                    target_scenario_snapshot_hash TEXT,
+                    reservation_id TEXT,
+                    reservation_hash TEXT,
+                    source_plan_version_id TEXT,
+                    expected_active_plan_version_id TEXT,
+                    solver_config_hash TEXT,
+                    candidate_id TEXT,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS schedule_candidates (
@@ -831,6 +1137,16 @@ class Store:
                     publishable INTEGER NOT NULL CHECK(publishable IN (0, 1)),
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    candidate_manifest_hash TEXT,
+                    scenario_revision INTEGER,
+                    scenario_snapshot_hash TEXT,
+                    reservation_id TEXT,
+                    reservation_hash TEXT,
+                    source_plan_version_id TEXT,
+                    expected_active_plan_version_id TEXT,
+                    schedule_hash TEXT,
+                    verification_report_hash TEXT,
+                    solver_policy_fingerprint TEXT,
                     FOREIGN KEY(run_id) REFERENCES schedule_runs(id) ON DELETE CASCADE,
                     FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
@@ -851,9 +1167,60 @@ class Store:
                     resource_id TEXT,
                     publication_key TEXT,
                     payload TEXT NOT NULL,
+                    command_manifest_hash TEXT,
+                    command_manifest_payload TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(namespace, key)
+                );
+                CREATE TABLE IF NOT EXISTS runtime_jobs (
+                    id TEXT PRIMARY KEY,
+                    job_type TEXT NOT NULL,
+                    scenario_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCEL_REQUESTED', 'CANCELLED', 'INTERRUPTED')),
+                    progress INTEGER NOT NULL CHECK(progress BETWEEN 0 AND 100),
+                    input_manifest_hash TEXT NOT NULL,
+                    dedupe_key TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    heartbeat_at TEXT,
+                    attempt_number INTEGER NOT NULL DEFAULT 0,
+                    result_resource_type TEXT,
+                    result_resource_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    UNIQUE(job_type, scenario_id, dedupe_key)
+                );
+                CREATE TABLE IF NOT EXISTS outbox_events (
+                    id TEXT PRIMARY KEY,
+                    topic TEXT NOT NULL,
+                    aggregate_type TEXT NOT NULL,
+                    aggregate_id TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PENDING', 'DISPATCHED')),
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    dispatched_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS emergency_intake_receipts (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    work_order_id TEXT NOT NULL,
+                    work_order_hash TEXT NOT NULL,
+                    committed_revision INTEGER NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'CONSUMED', 'CANCELLED')),
+                    replan_plan_version_id TEXT,
+                    receipt_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(namespace, idempotency_key),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS work_order_execution_events (
                     id TEXT PRIMARY KEY,
@@ -879,6 +1246,11 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_candidates_run ON schedule_candidates(run_id);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_runtime_jobs_claim ON runtime_jobs(status, lease_expires_at, created_at);
+                CREATE INDEX IF NOT EXISTS idx_runtime_jobs_scenario ON runtime_jobs(scenario_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_emergency_receipts_resource
+                    ON emergency_intake_receipts(scenario_id, work_order_id, status);
                 CREATE INDEX IF NOT EXISTS idx_execution_events_order ON work_order_execution_events(scenario_id, work_order_id, sequence);
                 """
             )
@@ -1134,6 +1506,25 @@ class Store:
                 con.execute(
                     "UPDATE command_keys SET publication_key=namespace || ':' || key WHERE namespace LIKE '%:replan'"
                 )
+            if "command_manifest_hash" not in command_columns:
+                con.execute("ALTER TABLE command_keys ADD COLUMN command_manifest_hash TEXT")
+            if "command_manifest_payload" not in command_columns:
+                con.execute("ALTER TABLE command_keys ADD COLUMN command_manifest_payload TEXT")
+            for artifact_table in ("decision_analysis_artifacts", "schedule_artifacts"):
+                artifact_columns = {row[1] for row in con.execute(f"PRAGMA table_info({artifact_table})")}
+                if "artifact_blob_hash" not in artifact_columns:
+                    con.execute(f"ALTER TABLE {artifact_table} ADD COLUMN artifact_blob_hash TEXT")
+                for artifact_row in con.execute(
+                    f"SELECT id, payload FROM {artifact_table} WHERE artifact_blob_hash IS NULL"
+                ).fetchall():
+                    try:
+                        blob_hash = _migrate_artifact_payload_to_blob(con, str(artifact_row["payload"]))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    con.execute(
+                        f"UPDATE {artifact_table} SET payload=?, artifact_blob_hash=? WHERE id=?",
+                        (_artifact_blob_reference(blob_hash), blob_hash, artifact_row["id"]),
+                    )
             if version < 18:
                 for trigger in (
                     "prevent_legacy_plan_insert",
@@ -1220,6 +1611,8 @@ class Store:
                             f"ALTER TABLE {table} ADD COLUMN attestation_requirement TEXT NOT NULL DEFAULT 'LEGACY_MIGRATED'"
                         )
                     con.execute(f"UPDATE {table} SET attestation_requirement='LEGACY_MIGRATED'")
+                    if table == "decision_analysis_artifacts":
+                        continue
                     rows = con.execute(f"SELECT rowid, payload FROM {table}").fetchall()
                     for item in rows:
                         try:
@@ -1281,6 +1674,8 @@ class Store:
                 # They remain viewable, but are explicitly non-actionable after this migration.
                 for table in ("plan_versions", "decision_analysis_runs", "decision_analysis_artifacts"):
                     con.execute(f"UPDATE {table} SET attestation_requirement='LEGACY_MIGRATED'")
+                    if table == "decision_analysis_artifacts":
+                        continue
                     rows = con.execute(f"SELECT rowid, payload FROM {table}").fetchall()
                     for item in rows:
                         try:
@@ -1322,6 +1717,38 @@ class Store:
                 )
                 """
             )
+            run_columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(schedule_runs)")}
+            for column, definition in {
+                "input_manifest_hash": "TEXT",
+                "result_manifest_hash": "TEXT",
+                "scenario_revision": "INTEGER",
+                "scenario_snapshot_hash": "TEXT",
+                "target_scenario_revision": "INTEGER",
+                "target_scenario_snapshot_hash": "TEXT",
+                "reservation_id": "TEXT",
+                "reservation_hash": "TEXT",
+                "source_plan_version_id": "TEXT",
+                "expected_active_plan_version_id": "TEXT",
+                "solver_config_hash": "TEXT",
+                "candidate_id": "TEXT",
+            }.items():
+                if column not in run_columns:
+                    con.execute(f"ALTER TABLE schedule_runs ADD COLUMN {column} {definition}")
+            candidate_columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(schedule_candidates)")}
+            for column, definition in {
+                "candidate_manifest_hash": "TEXT",
+                "scenario_revision": "INTEGER",
+                "scenario_snapshot_hash": "TEXT",
+                "reservation_id": "TEXT",
+                "reservation_hash": "TEXT",
+                "source_plan_version_id": "TEXT",
+                "expected_active_plan_version_id": "TEXT",
+                "schedule_hash": "TEXT",
+                "verification_report_hash": "TEXT",
+                "solver_policy_fingerprint": "TEXT",
+            }.items():
+                if column not in candidate_columns:
+                    con.execute(f"ALTER TABLE schedule_candidates ADD COLUMN {column} {definition}")
             for analysis_row in con.execute("SELECT id, payload FROM decision_analysis_runs").fetchall():
                 try:
                     analysis = DecisionAnalysisRun.model_validate_json(analysis_row["payload"])
@@ -1773,6 +2200,23 @@ class Store:
                             applicability_row["plan_version_id"],
                         ),
                     )
+            # Some legacy rebuilds above recreate the artifact tables. Re-apply
+            # the content-addressing columns only after those rebuilds finish.
+            for artifact_table in ("decision_analysis_artifacts", "schedule_artifacts"):
+                artifact_columns = {row[1] for row in con.execute(f"PRAGMA table_info({artifact_table})")}
+                if "artifact_blob_hash" not in artifact_columns:
+                    con.execute(f"ALTER TABLE {artifact_table} ADD COLUMN artifact_blob_hash TEXT")
+                for artifact_row in con.execute(
+                    f"SELECT id, payload FROM {artifact_table} WHERE artifact_blob_hash IS NULL"
+                ).fetchall():
+                    try:
+                        blob_hash = _migrate_artifact_payload_to_blob(con, str(artifact_row["payload"]))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    con.execute(
+                        f"UPDATE {artifact_table} SET payload=?, artifact_blob_hash=? WHERE id=?",
+                        (_artifact_blob_reference(blob_hash), blob_hash, artifact_row["id"]),
+                    )
             con.execute(
                 """
                 INSERT OR IGNORE INTO plan_metadata(plan_version_id, label, note, tags, updated_at)
@@ -1804,6 +2248,119 @@ class Store:
                             "INSERT INTO migration_orphans(source_table, source_id, payload, reason, migrated_at) VALUES (?, ?, ?, 'malformed JSON', ?)",
                             (quarantine_table, malformed["id"], malformed["payload"], _now()),
                         )
+            if version < 24:
+                legacy_intakes = con.execute(
+                    "SELECT * FROM command_keys "
+                    "WHERE namespace LIKE '%:emergency-intake' AND resource_type='work_order'"
+                ).fetchall()
+                for command in legacy_intakes:
+                    scenario_id = str(command["namespace"]).removesuffix(":emergency-intake")
+                    scenario_row = con.execute("SELECT payload FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
+                    try:
+                        scenario = (
+                            ScheduleScenario.model_validate_json(scenario_row["payload"]) if scenario_row else None
+                        )
+                        order = (
+                            next(
+                                (item for item in scenario.work_orders if item.id == str(command["resource_id"] or "")),
+                                None,
+                            )
+                            if scenario
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        order = None
+                    if not order:
+                        con.execute(
+                            "INSERT INTO migration_orphans(source_table, source_id, payload, reason, migrated_at) "
+                            "VALUES ('command_keys', ?, ?, 'v24 emergency intake resource missing', ?)",
+                            (
+                                f"{command['namespace']}:{command['key']}",
+                                str(command["payload"]),
+                                _now(),
+                            ),
+                        )
+                        continue
+                    assert scenario is not None
+                    receipt_identity_hash = content_hash(
+                        {"namespace": str(command["namespace"]), "key": str(command["key"])}
+                    )
+                    receipt_id = f"EIR-{receipt_identity_hash[:16]}"
+                    receipt = EmergencyIntakeReceipt(
+                        id=receipt_id,
+                        scenario_id=scenario_id,
+                        namespace=str(command["namespace"]),
+                        idempotency_key=str(command["key"]),
+                        work_order_id=order.id,
+                        work_order_hash=content_hash(order),
+                        committed_revision=scenario.revision,
+                        request_fingerprint=str(command["request_fingerprint"]),
+                        status=EmergencyIntakeStatus.active,
+                        created_at=str(command["created_at"]),
+                        updated_at=str(command["updated_at"]),
+                    )
+                    receipt.receipt_hash = _emergency_intake_receipt_hash(receipt)
+                    con.execute(
+                        "INSERT OR IGNORE INTO emergency_intake_receipts("
+                        "id, scenario_id, namespace, idempotency_key, work_order_id, work_order_hash, "
+                        "committed_revision, request_fingerprint, status, replan_plan_version_id, "
+                        "receipt_hash, payload, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            receipt.id,
+                            receipt.scenario_id,
+                            receipt.namespace,
+                            receipt.idempotency_key,
+                            receipt.work_order_id,
+                            receipt.work_order_hash,
+                            receipt.committed_revision,
+                            receipt.request_fingerprint,
+                            receipt.status.value,
+                            receipt.replan_plan_version_id,
+                            receipt.receipt_hash,
+                            receipt.model_dump_json(),
+                            receipt.created_at,
+                            receipt.updated_at,
+                        ),
+                    )
+            for command in con.execute(
+                "SELECT * FROM command_keys WHERE command_manifest_hash IS NULL OR command_manifest_payload IS NULL"
+            ).fetchall():
+                source_id = f"{command['namespace']}:{command['key']}"
+                try:
+                    manifest = _build_command_manifest(
+                        namespace=str(command["namespace"]),
+                        key=str(command["key"]),
+                        request_fingerprint=str(command["request_fingerprint"]),
+                        status=str(command["status"]),
+                        resource_type=command["resource_type"],
+                        resource_id=command["resource_id"],
+                        publication_key=command["publication_key"],
+                        payload=str(command["payload"]),
+                        created_at=str(command["created_at"]),
+                        updated_at=str(command["updated_at"]),
+                    )
+                    con.execute(
+                        "UPDATE command_keys SET command_manifest_hash=?, command_manifest_payload=? "
+                        "WHERE namespace=? AND key=?",
+                        (
+                            manifest.manifest_hash,
+                            manifest.model_dump_json(),
+                            command["namespace"],
+                            command["key"],
+                        ),
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    already_recorded = con.execute(
+                        "SELECT 1 FROM migration_orphans WHERE source_table='command_keys' AND source_id=?",
+                        (source_id,),
+                    ).fetchone()
+                    if not already_recorded:
+                        con.execute(
+                            "INSERT INTO migration_orphans(source_table, source_id, payload, reason, migrated_at) "
+                            "VALUES ('command_keys', ?, ?, 'malformed command record', ?)",
+                            (source_id, str(command["payload"]), _now()),
+                        )
             if version < SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             duplicate_run = con.execute(
@@ -1821,8 +2378,11 @@ class Store:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_applicability_active_unique ON plan_applicability(scenario_id) WHERE active=1;
                 CREATE INDEX IF NOT EXISTS idx_decision_analysis_plan ON decision_analysis_runs(plan_version_id, number);
                 CREATE INDEX IF NOT EXISTS idx_decision_analysis_artifacts_run ON decision_analysis_artifacts(analysis_run_id, option_id);
+                CREATE INDEX IF NOT EXISTS idx_decision_analysis_artifact_blob ON decision_analysis_artifacts(artifact_blob_hash);
+                CREATE INDEX IF NOT EXISTS idx_schedule_artifact_blob ON schedule_artifacts(artifact_blob_hash);
                 CREATE INDEX IF NOT EXISTS idx_risk_comparisons_scenario ON risk_comparison_runs(scenario_id, number);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_comparisons_idempotency ON risk_comparison_runs(scenario_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_risk_comparison_sagas_status ON risk_comparison_sagas(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_revisions_scenario ON scenario_revisions(scenario_id, number);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_plan ON schedule_artifacts(plan_version_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_scenario ON schedule_runs(scenario_id, created_at);
@@ -1830,6 +2390,61 @@ class Store:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_run_unique ON schedule_candidates(run_id);
                 CREATE INDEX IF NOT EXISTS idx_planning_reservations_scenario ON planning_reservations(scenario_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_commands_status ON command_keys(status, updated_at);
+                CREATE TRIGGER IF NOT EXISTS trg_schedule_run_input_immutable
+                BEFORE UPDATE ON schedule_runs
+                WHEN OLD.input_manifest_hash IS NOT NULL AND (
+                    NEW.input_manifest_hash IS NOT OLD.input_manifest_hash OR
+                    NEW.scenario_id IS NOT OLD.scenario_id OR
+                    NEW.scenario_revision IS NOT OLD.scenario_revision OR
+                    NEW.scenario_snapshot_hash IS NOT OLD.scenario_snapshot_hash OR
+                    NEW.target_scenario_revision IS NOT OLD.target_scenario_revision OR
+                    NEW.target_scenario_snapshot_hash IS NOT OLD.target_scenario_snapshot_hash OR
+                    NEW.reservation_id IS NOT OLD.reservation_id OR
+                    NEW.reservation_hash IS NOT OLD.reservation_hash OR
+                    NEW.source_plan_version_id IS NOT OLD.source_plan_version_id OR
+                    NEW.expected_active_plan_version_id IS NOT OLD.expected_active_plan_version_id OR
+                    NEW.solver_config_hash IS NOT OLD.solver_config_hash
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'schedule run input identity is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_schedule_run_terminal_immutable
+                BEFORE UPDATE ON schedule_runs
+                WHEN OLD.status NOT IN ('QUEUED', 'RUNNING') AND (
+                    NEW.status IS NOT OLD.status OR
+                    NEW.payload IS NOT OLD.payload OR
+                    NEW.result_manifest_hash IS NOT OLD.result_manifest_hash OR
+                    NEW.candidate_id IS NOT OLD.candidate_id
+                ) AND NOT (
+                    OLD.status='FAILED' AND
+                    json_extract(OLD.payload, '$.termination_reason')='APPLICATION_RESTARTED' AND
+                    NEW.status='RUNNING' AND
+                    NEW.result_manifest_hash IS NULL AND
+                    NEW.candidate_id IS OLD.candidate_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'terminal schedule run is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_schedule_candidate_immutable
+                BEFORE UPDATE ON schedule_candidates
+                BEGIN
+                    SELECT RAISE(ABORT, 'schedule candidate is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_runtime_job_input_immutable
+                BEFORE UPDATE ON runtime_jobs
+                WHEN NEW.job_type IS NOT OLD.job_type OR
+                     NEW.scenario_id IS NOT OLD.scenario_id OR
+                     NEW.input_manifest_hash IS NOT OLD.input_manifest_hash OR
+                     NEW.dedupe_key IS NOT OLD.dedupe_key
+                BEGIN
+                    SELECT RAISE(ABORT, 'runtime job input identity is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_runtime_job_terminal_immutable
+                BEFORE UPDATE ON runtime_jobs
+                WHEN OLD.status IN ('COMPLETED', 'FAILED', 'CANCELLED') AND NEW.payload IS NOT OLD.payload
+                BEGIN
+                    SELECT RAISE(ABORT, 'terminal runtime job is immutable');
+                END;
                 CREATE INDEX IF NOT EXISTS idx_execution_events_sequence ON work_order_execution_events(scenario_id, sequence);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_sequence_unique ON work_order_execution_events(scenario_id, sequence);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_action_unique ON work_order_execution_events(scenario_id, work_order_id, action);
@@ -1861,6 +2476,9 @@ class Store:
                 BEFORE UPDATE OF attestation_requirement ON decision_analysis_artifacts
                 WHEN OLD.attestation_requirement<>NEW.attestation_requirement
                 BEGIN SELECT RAISE(ABORT, 'attestation requirement is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_artifact_blob_change
+                BEFORE UPDATE OF payload, artifact_blob_hash ON decision_analysis_artifacts
+                BEGIN SELECT RAISE(ABORT, 'decision artifact content is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_legacy_risk_comparison_insert
                 BEFORE INSERT ON risk_comparison_runs
                 WHEN NEW.attestation_requirement='LEGACY_MIGRATED'
@@ -1903,9 +2521,66 @@ class Store:
                 )
                 """
             )
-            con.execute(
-                "UPDATE strategy_experiments SET payload=json_set(payload, '$.status', 'INTERRUPTED', '$.error', '应用重启，实验已中断') WHERE json_valid(payload) AND json_extract(payload, '$.status') IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')"
-            )
+            interrupted_jobs = con.execute(
+                "SELECT * FROM runtime_jobs WHERE status IN ('RUNNING', 'CANCEL_REQUESTED')"
+            ).fetchall()
+            for job_row in interrupted_jobs:
+                try:
+                    job = self._load_runtime_job_row(job_row)
+                except DecisionAnalysisIntegrityError:
+                    continue
+                job.status = (
+                    RuntimeJobStatus.cancelled
+                    if job.status is RuntimeJobStatus.cancel_requested
+                    else RuntimeJobStatus.interrupted
+                )
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.updated_at = _now()
+                if job.status is RuntimeJobStatus.cancelled:
+                    job.progress = 100
+                    job.finished_at = job.updated_at
+                con.execute(
+                    "UPDATE runtime_jobs SET status=?, progress=?, lease_owner=NULL, lease_expires_at=NULL, "
+                    "payload=?, updated_at=?, finished_at=? WHERE id=?",
+                    (
+                        job.status.value,
+                        job.progress,
+                        job.model_dump_json(),
+                        job.updated_at,
+                        job.finished_at,
+                        job.id,
+                    ),
+                )
+            active_experiment_rows = con.execute(
+                "SELECT id, payload FROM strategy_experiments "
+                "WHERE json_valid(payload) AND json_extract(payload, '$.status') "
+                "IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')"
+            ).fetchall()
+            for experiment_row in active_experiment_rows:
+                try:
+                    experiment = StrategyExperiment.model_validate_json(experiment_row["payload"])
+                except (TypeError, ValueError):
+                    continue
+                job_row = con.execute(
+                    "SELECT status FROM runtime_jobs WHERE id=?",
+                    (f"JOB-EXP-{experiment.id}",),
+                ).fetchone()
+                if experiment.status == "CANCEL_REQUESTED":
+                    experiment.status = "CANCELLED"
+                    experiment.error = "应用重启前已请求取消"
+                    experiment.finished_at = _now()
+                elif job_row and job_row["status"] in {"QUEUED", "INTERRUPTED"}:
+                    experiment.status = "QUEUED"
+                    experiment.error = "应用重启后从持久任务恢复"
+                else:
+                    experiment.status = "INTERRUPTED"
+                    experiment.error = "应用重启，实验缺少可恢复任务"
+                    experiment.finished_at = _now()
+                con.execute(
+                    "UPDATE strategy_experiments SET payload=? WHERE id=?",
+                    (experiment.model_dump_json(), experiment.id),
+                )
             interrupted = con.execute(
                 "SELECT payload FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')"
             ).fetchall()
@@ -1962,7 +2637,7 @@ class Store:
                 )
             abandoned_commands = con.execute(
                 """
-                SELECT namespace, key, publication_key, payload
+                SELECT *
                 FROM command_keys
                 WHERE status IN ('RUNNING', 'REPLAN_RUNNING')
                    OR (status IN ('RESERVED', 'ANALYSIS_RESERVED') AND namespace LIKE '%:analysis-%')
@@ -1975,36 +2650,25 @@ class Store:
                     (command["publication_key"] or command["key"],),
                 ).fetchone()
                 if publication:
-                    con.execute(
-                        "UPDATE command_keys SET status='COMPLETED', resource_type='plan_version', resource_id=?, payload=?, updated_at=? WHERE namespace=? AND key=?",
-                        (
-                            publication["plan_version_id"],
-                            json.dumps(
-                                {"plan_version_id": publication["plan_version_id"], "reconciled": True},
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                            _now(),
-                            command["namespace"],
-                            command["key"],
-                        ),
+                    self._update_command_row(
+                        con,
+                        command,
+                        status="COMPLETED",
+                        resource_type="plan_version",
+                        resource_id=str(publication["plan_version_id"]),
+                        payload={"plan_version_id": publication["plan_version_id"], "reconciled": True},
                     )
                 else:
-                    con.execute(
-                        "UPDATE command_keys SET status='FAILED_RETRYABLE', payload=?, updated_at=? WHERE namespace=? AND key=?",
-                        (
-                            json.dumps(
-                                {
-                                    "message": "应用在命令完成前重启；相同幂等键可以重新执行",
-                                    "reconciled": True,
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                            _now(),
-                            command["namespace"],
-                            command["key"],
-                        ),
+                    self._update_command_row(
+                        con,
+                        command,
+                        status="FAILED_RETRYABLE",
+                        resource_type=command["resource_type"],
+                        resource_id=command["resource_id"],
+                        payload={
+                            "message": "应用在命令完成前重启；相同幂等键可以重新执行",
+                            "reconciled": True,
+                        },
                     )
         self.seed_fixtures()
         self.seed_profiles()
@@ -2388,7 +3052,13 @@ class Store:
             ).fetchone()
             if not latest_row or int(latest_row["number"]) != head_number:
                 raise ValueError("scenario latest revision mismatch")
-            latest = cls._load_revision_row(con, latest_row, None, verify_predecessor=False)
+            latest = cls._load_revision_row(
+                con,
+                latest_row,
+                None,
+                verify_predecessor=False,
+                verify_chain_status=False,
+            )
             if (
                 scenario.revision != head_number
                 or content_hash(scenario) != snapshot_hash
@@ -2615,14 +3285,18 @@ class Store:
                 plan.self_integrity = AnalysisIntegrityStatus.failed
                 plan.effective_integrity = AnalysisIntegrityStatus.failed
                 return plan
-        artifact_hash = content_hash(artifact.model_dump(exclude={"artifact_hash"}, mode="json"))
+        artifact_hash = _publication_verification_artifact_hash(artifact)
         expected_manifest = content_hash(build_plan_manifest_payload(plan))
         plan.integrity_status = (
             AnalysisIntegrityStatus.verified
             if plan.publication_manifest_version == "FIELD_SERVICE_PUBLICATION_MANIFEST_V2"
             and plan.scenario_snapshot_hash == content_hash(plan.scenario_snapshot)
             and plan.published_schedule_hash == content_hash(plan.selected)
-            and artifact_hash == artifact.artifact_hash
+            and artifact.artifact_hash
+            in {
+                artifact_hash,
+                content_hash(artifact.model_dump(exclude={"artifact_hash"}, mode="json")),
+            }
             and artifact.verified_schedule_hash == plan.published_schedule_hash
             and content_hash(artifact.transaction_verification_report) == plan.publication_verification_report_hash
             and expected_manifest == plan.publication_manifest_hash
@@ -2892,25 +3566,496 @@ class Store:
                     )
             self._insert_revision(con, scenario, reason)
 
-    def get_command_record(self, namespace: str, key: str, fingerprint: str) -> dict | None:
-        with self._connect() as con:
+    @staticmethod
+    def _load_command_row(row: sqlite3.Row) -> dict:
+        try:
+            payload = json.loads(row["payload"])
+            if not isinstance(payload, dict):
+                raise ValueError("command payload is not an object")
+            manifest = CommandRecordManifest.model_validate_json(row["command_manifest_payload"])
+            relation_valid = (
+                manifest.manifest_hash == str(row["command_manifest_hash"])
+                and manifest.manifest_hash == _command_manifest_hash(manifest)
+                and manifest.namespace == str(row["namespace"])
+                and manifest.key == str(row["key"])
+                and manifest.request_fingerprint == str(row["request_fingerprint"])
+                and manifest.status == str(row["status"])
+                and manifest.resource_type == row["resource_type"]
+                and manifest.resource_id == row["resource_id"]
+                and manifest.publication_key == row["publication_key"]
+                and manifest.created_at == str(row["created_at"])
+                and manifest.updated_at == str(row["updated_at"])
+            )
+            if not relation_valid:
+                raise ValueError("command relation manifest mismatch")
+            if manifest.payload_hash != content_hash(payload):
+                raise DecisionAnalysisIntegrityError(
+                    "幂等命令载荷完整性校验失败",
+                    record_id=f"{row['namespace']}:{row['key']}",
+                    record_type="COMMAND_RECORD",
+                    code="COMMAND_PAYLOAD_INTEGRITY_FAILED",
+                )
+            return {
+                "namespace": str(row["namespace"]),
+                "key": str(row["key"]),
+                "request_fingerprint": str(row["request_fingerprint"]),
+                "status": str(row["status"]),
+                "resource_type": row["resource_type"],
+                "resource_id": row["resource_id"],
+                "publication_key": row["publication_key"],
+                "payload": payload,
+                "command_manifest_hash": manifest.manifest_hash,
+            }
+        except DecisionAnalysisIntegrityError:
+            raise
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "幂等命令记录完整性校验失败",
+                record_id=f"{row['namespace']}:{row['key']}",
+                record_type="COMMAND_RECORD",
+            ) from error
+
+    @staticmethod
+    def _insert_command_row(
+        con: sqlite3.Connection,
+        *,
+        namespace: str,
+        key: str,
+        request_fingerprint: str,
+        status: str,
+        resource_type: str | None,
+        resource_id: str | None,
+        payload: dict,
+        publication_key: str | None = None,
+        on_conflict_do_nothing: bool = False,
+    ) -> None:
+        now = _now()
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        manifest = _build_command_manifest(
+            namespace=namespace,
+            key=key,
+            request_fingerprint=request_fingerprint,
+            status=status,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            publication_key=publication_key,
+            payload=payload_json,
+            created_at=now,
+            updated_at=now,
+        )
+        conflict = " ON CONFLICT(namespace, key) DO NOTHING" if on_conflict_do_nothing else ""
+        con.execute(
+            "INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, "
+            "publication_key, payload, command_manifest_hash, command_manifest_payload, created_at, updated_at) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){conflict}",
+            (
+                namespace,
+                key,
+                request_fingerprint,
+                status,
+                resource_type,
+                resource_id,
+                publication_key,
+                payload_json,
+                manifest.manifest_hash,
+                manifest.model_dump_json(),
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _load_command_reference_row(row: sqlite3.Row) -> dict:
+        manifest = CommandRecordManifest.model_validate_json(row["command_manifest_payload"])
+        relation_valid = (
+            manifest.manifest_hash == str(row["command_manifest_hash"])
+            and manifest.manifest_hash == _command_manifest_hash(manifest)
+            and manifest.namespace == str(row["namespace"])
+            and manifest.key == str(row["key"])
+            and manifest.request_fingerprint == str(row["request_fingerprint"])
+            and manifest.status == str(row["status"])
+            and manifest.resource_type == row["resource_type"]
+            and manifest.resource_id == row["resource_id"]
+            and manifest.publication_key == row["publication_key"]
+            and manifest.created_at == str(row["created_at"])
+            and manifest.updated_at == str(row["updated_at"])
+        )
+        if not relation_valid:
+            raise DecisionAnalysisIntegrityError(
+                "幂等命令关系清单校验失败",
+                record_id=f"{row['namespace']}:{row['key']}",
+                record_type="COMMAND_RECORD",
+            )
+        return {
+            "namespace": manifest.namespace,
+            "key": manifest.key,
+            "request_fingerprint": manifest.request_fingerprint,
+            "status": manifest.status,
+            "resource_type": manifest.resource_type,
+            "resource_id": manifest.resource_id,
+            "publication_key": manifest.publication_key,
+            "payload": {},
+            "command_manifest_hash": manifest.manifest_hash,
+            "payload_recovered_from_resource": True,
+        }
+
+    def _trusted_command_in_transaction(
+        self,
+        con: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        allow_payload_recovery: bool = False,
+    ) -> dict:
+        try:
+            return self._load_command_row(row)
+        except DecisionAnalysisIntegrityError:
+            self._record_read_isolation(
+                con,
+                "command_keys",
+                f"{row['namespace']}:{row['key']}",
+                str(row["payload"]),
+                "read isolation: command manifest mismatch",
+            )
+            if allow_payload_recovery:
+                try:
+                    return self._load_command_reference_row(row)
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError):
+                    pass
+            raise
+
+    @staticmethod
+    def _update_command_row(
+        con: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        status: str,
+        resource_type: str | None,
+        resource_id: str | None,
+        payload: dict,
+        publication_key: str | None = None,
+    ) -> None:
+        updated_at = _now()
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        resolved_publication_key = publication_key or row["publication_key"]
+        manifest = _build_command_manifest(
+            namespace=str(row["namespace"]),
+            key=str(row["key"]),
+            request_fingerprint=str(row["request_fingerprint"]),
+            status=status,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            publication_key=resolved_publication_key,
+            payload=payload_json,
+            created_at=str(row["created_at"]),
+            updated_at=updated_at,
+        )
+        con.execute(
+            "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, publication_key=?, payload=?, "
+            "command_manifest_hash=?, command_manifest_payload=?, updated_at=? WHERE namespace=? AND key=?",
+            (
+                status,
+                resource_type,
+                resource_id,
+                resolved_publication_key,
+                payload_json,
+                manifest.manifest_hash,
+                manifest.model_dump_json(),
+                updated_at,
+                row["namespace"],
+                row["key"],
+            ),
+        )
+
+    def get_command_record(
+        self,
+        namespace: str,
+        key: str,
+        fingerprint: str,
+        *,
+        allow_payload_recovery: bool = False,
+    ) -> dict | None:
+        integrity_error: DecisionAnalysisIntegrityError | None = None
+        command: dict | None = None
+        with self._lock, self._connect() as con:
             row = con.execute(
                 "SELECT * FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, key),
             ).fetchone()
-        if not row:
+            if row:
+                try:
+                    command = self._load_command_row(row)
+                except DecisionAnalysisIntegrityError as error:
+                    self._record_read_isolation(
+                        con,
+                        "command_keys",
+                        f"{namespace}:{key}",
+                        str(row["payload"]),
+                        "read isolation: command manifest mismatch",
+                    )
+                    if allow_payload_recovery:
+                        try:
+                            command = self._load_command_reference_row(row)
+                        except DecisionAnalysisIntegrityError:
+                            integrity_error = error
+                    else:
+                        integrity_error = error
+        if integrity_error:
+            raise integrity_error
+        if command is None:
             return None
-        if row["request_fingerprint"] != fingerprint:
+        if command["request_fingerprint"] != fingerprint:
             raise PublicationConflict("相同幂等键对应了不同请求")
-        return {
-            "namespace": row["namespace"],
-            "key": row["key"],
-            "status": row["status"],
-            "resource_type": row["resource_type"],
-            "resource_id": row["resource_id"],
-            "publication_key": row["publication_key"],
-            "payload": json.loads(row["payload"]),
-        }
+        return command
+
+    @staticmethod
+    def _load_emergency_intake_receipt_row(row: sqlite3.Row) -> EmergencyIntakeReceipt:
+        try:
+            receipt = EmergencyIntakeReceipt.model_validate_json(row["payload"])
+            relation_valid = (
+                receipt.id == str(row["id"])
+                and receipt.scenario_id == str(row["scenario_id"])
+                and receipt.namespace == str(row["namespace"])
+                and receipt.idempotency_key == str(row["idempotency_key"])
+                and receipt.work_order_id == str(row["work_order_id"])
+                and receipt.work_order_hash == str(row["work_order_hash"])
+                and receipt.committed_revision == int(row["committed_revision"])
+                and receipt.request_fingerprint == str(row["request_fingerprint"])
+                and receipt.status.value == str(row["status"])
+                and receipt.replan_plan_version_id == row["replan_plan_version_id"]
+                and receipt.receipt_hash == str(row["receipt_hash"])
+                and receipt.receipt_hash == _emergency_intake_receipt_hash(receipt)
+            )
+            if not relation_valid:
+                raise ValueError("emergency intake receipt identity mismatch")
+            return receipt
+        except (TypeError, ValueError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "突发工单接收凭证完整性校验失败",
+                record_id=str(row["id"]),
+                record_type="EMERGENCY_INTAKE_RECEIPT",
+            ) from error
+
+    def active_emergency_intake_receipt(self, scenario_id: str, work_order_id: str) -> EmergencyIntakeReceipt | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM emergency_intake_receipts "
+                "WHERE scenario_id=? AND work_order_id=? AND status='ACTIVE' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (scenario_id, work_order_id),
+            ).fetchone()
+            return self._load_emergency_intake_receipt_row(row) if row else None
+
+    def consume_emergency_intake_receipt(
+        self,
+        namespace: str,
+        idempotency_key: str,
+        plan_version_id: str,
+    ) -> EmergencyIntakeReceipt:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT * FROM emergency_intake_receipts WHERE namespace=? AND idempotency_key=?",
+                (namespace, idempotency_key),
+            ).fetchone()
+            if not row:
+                raise PublicationConflict(
+                    "突发工单接收凭证不存在",
+                    code="EMERGENCY_INTAKE_RECEIPT_MISSING",
+                )
+            receipt = self._load_emergency_intake_receipt_row(row)
+            if receipt.status is EmergencyIntakeStatus.cancelled:
+                raise PublicationConflict(
+                    "突发工单接收已取消",
+                    code="EMERGENCY_INTAKE_CANCELLED",
+                    details={"receipt_id": receipt.id},
+                )
+            scenario_row = con.execute(
+                "SELECT * FROM scenarios WHERE id=?",
+                (receipt.scenario_id,),
+            ).fetchone()
+            scenario = self._load_scenario_head_row(con, scenario_row) if scenario_row else None
+            current_order = (
+                next((item for item in scenario.work_orders if item.id == receipt.work_order_id), None)
+                if scenario
+                else None
+            )
+            if current_order is None:
+                raise PublicationConflict(
+                    "突发工单接收凭证对应的工单已缺失",
+                    code="EMERGENCY_INTAKE_RESOURCE_MISSING",
+                    details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
+                )
+            if content_hash(current_order) != receipt.work_order_hash:
+                raise PublicationConflict(
+                    "突发工单接收后内容已变化",
+                    code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
+                    details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
+                )
+            if receipt.status is EmergencyIntakeStatus.consumed:
+                if receipt.replan_plan_version_id != plan_version_id:
+                    raise PublicationConflict(
+                        "突发接收凭证已绑定另一个重排方案",
+                        code="EMERGENCY_INTAKE_PLAN_MISMATCH",
+                        details={"receipt_id": receipt.id},
+                    )
+                return receipt
+            receipt.status = EmergencyIntakeStatus.consumed
+            receipt.replan_plan_version_id = plan_version_id
+            receipt.updated_at = _now()
+            receipt.receipt_hash = _emergency_intake_receipt_hash(receipt)
+            con.execute(
+                "UPDATE emergency_intake_receipts SET status=?, replan_plan_version_id=?, "
+                "receipt_hash=?, payload=?, updated_at=? WHERE id=?",
+                (
+                    receipt.status.value,
+                    receipt.replan_plan_version_id,
+                    receipt.receipt_hash,
+                    receipt.model_dump_json(),
+                    receipt.updated_at,
+                    receipt.id,
+                ),
+            )
+            return receipt
+
+    def cancel_emergency_intake(
+        self,
+        scenario_id: str,
+        work_order_id: str,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> ScheduleScenario:
+        namespace = f"{scenario_id}:emergency-intake-cancel:{work_order_id}"
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            command = con.execute(
+                "SELECT * FROM command_keys WHERE namespace=? AND key=?",
+                (namespace, idempotency_key),
+            ).fetchone()
+            if command:
+                command = self._trusted_command_in_transaction(con, command, allow_payload_recovery=True)
+            scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
+            if not scenario_row:
+                raise KeyError(f"scenario {scenario_id} not found")
+            scenario = self._load_scenario_head_row(con, scenario_row)
+            if command:
+                if command["request_fingerprint"] != request_fingerprint:
+                    raise PublicationConflict("相同幂等键对应了不同取消请求")
+                if command["resource_type"] != "emergency_intake_receipt" or not command["resource_id"]:
+                    raise PublicationConflict(
+                        "取消命令缺少接收凭证引用",
+                        code="EMERGENCY_INTAKE_CANCEL_REPLAY_INVALID",
+                    )
+                receipt_row = con.execute(
+                    "SELECT * FROM emergency_intake_receipts WHERE id=?",
+                    (command["resource_id"],),
+                ).fetchone()
+                receipt = self._load_emergency_intake_receipt_row(receipt_row) if receipt_row else None
+                if not receipt or receipt.status is not EmergencyIntakeStatus.cancelled:
+                    raise PublicationConflict(
+                        "取消命令对应的接收凭证状态不一致",
+                        code="EMERGENCY_INTAKE_CANCEL_REPLAY_INVALID",
+                    )
+                return scenario
+            if scenario.revision != expected_revision:
+                raise ScenarioRevisionConflict(expected_revision, scenario.revision)
+            receipt_row = con.execute(
+                "SELECT * FROM emergency_intake_receipts "
+                "WHERE scenario_id=? AND work_order_id=? AND status='ACTIVE' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (scenario_id, work_order_id),
+            ).fetchone()
+            if not receipt_row:
+                raise PublicationConflict(
+                    "没有可取消的活动突发接收凭证",
+                    code="EMERGENCY_INTAKE_ACTIVE_RECEIPT_REQUIRED",
+                    details={"work_order_id": work_order_id},
+                )
+            receipt = self._load_emergency_intake_receipt_row(receipt_row)
+            order = next((item for item in scenario.work_orders if item.id == work_order_id), None)
+            if not order:
+                raise PublicationConflict(
+                    "活动接收凭证对应的突发工单已缺失",
+                    code="EMERGENCY_INTAKE_RESOURCE_MISSING",
+                    details={"receipt_id": receipt.id, "work_order_id": work_order_id},
+                )
+            if content_hash(order) != receipt.work_order_hash:
+                raise PublicationConflict(
+                    "活动接收凭证对应的突发工单内容已变化",
+                    code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
+                    details={"receipt_id": receipt.id, "work_order_id": work_order_id},
+                )
+            if order.status is not WorkOrderStatus.pending:
+                raise PublicationConflict(
+                    "已开始或已完成的突发工单不能取消接收",
+                    code="EXECUTED_WORK_ORDER_DELETE_FORBIDDEN",
+                    details={"work_order_id": work_order_id},
+                )
+            previous_scenario = scenario.model_copy(deep=True)
+            active_plan_id = str(scenario_row["active_plan_version_id"] or "")
+            active_plan: PlanVersion | None = None
+            if active_plan_id:
+                plan_row = con.execute(
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                    "FROM plan_versions WHERE id=? AND scenario_id=?",
+                    (active_plan_id, scenario_id),
+                ).fetchone()
+                if plan_row:
+                    active_plan = self._load_plan_row(con, plan_row)
+            scenario.work_orders = [item for item in scenario.work_orders if item.id != work_order_id]
+            scenario.locked_assignments = [
+                item for item in scenario.locked_assignments if item.work_order_id != work_order_id
+            ]
+            scenario.revision += 1
+            scenario = ScheduleScenario.model_validate(scenario.model_dump(mode="python"))
+            con.execute(
+                "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (scenario.model_dump_json(), scenario_id),
+            )
+            if active_plan:
+                is_unassigned = any(item.work_order_id == work_order_id for item in active_plan.selected.unassigned)
+                applicability = reduce_plan_applicability(
+                    active_plan,
+                    previous_scenario,
+                    scenario,
+                    active_plan.applicability,
+                    (FieldImpact.removed_unassigned_demand if is_unassigned else FieldImpact.assignment_feasibility),
+                    [] if is_unassigned else [work_order_id],
+                )
+                self._set_plan_applicability(
+                    con,
+                    active_plan.id,
+                    scenario_id,
+                    active=True,
+                    applicability=applicability,
+                    evaluated_scenario=scenario,
+                )
+            self._insert_revision(con, scenario, f"取消突发工单接收 {work_order_id}")
+            receipt.status = EmergencyIntakeStatus.cancelled
+            receipt.updated_at = _now()
+            receipt.receipt_hash = _emergency_intake_receipt_hash(receipt)
+            con.execute(
+                "UPDATE emergency_intake_receipts SET status=?, receipt_hash=?, payload=?, updated_at=? WHERE id=?",
+                (
+                    receipt.status.value,
+                    receipt.receipt_hash,
+                    receipt.model_dump_json(),
+                    receipt.updated_at,
+                    receipt.id,
+                ),
+            )
+            self._insert_command_row(
+                con,
+                namespace=namespace,
+                key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                status="COMPLETED",
+                resource_type="emergency_intake_receipt",
+                resource_id=receipt.id,
+                payload={"work_order_id": work_order_id},
+            )
+            return scenario
 
     def intake_emergency_work_order(
         self,
@@ -2920,6 +4065,7 @@ class Store:
         namespace: str,
         idempotency_key: str,
         request_fingerprint: str,
+        replan_job_payload: dict | None = None,
     ) -> tuple[ScheduleScenario, bool]:
         """Persist reported demand before any solver work and keep the last plan visible."""
         if order.status is not WorkOrderStatus.pending:
@@ -2931,12 +4077,10 @@ class Store:
             raise PublicationConflict("突发工单必须标记为紧急并包含接报时间")
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            command = con.execute(
-                "SELECT request_fingerprint FROM command_keys WHERE namespace=? AND key=?",
+            receipt_row = con.execute(
+                "SELECT * FROM emergency_intake_receipts WHERE namespace=? AND idempotency_key=?",
                 (namespace, idempotency_key),
             ).fetchone()
-            if command and command["request_fingerprint"] != request_fingerprint:
-                raise PublicationConflict("相同幂等键对应了不同请求")
             scenario_row = con.execute(
                 "SELECT * FROM scenarios WHERE id=?",
                 (scenario_id,),
@@ -2944,8 +4088,58 @@ class Store:
             if not scenario_row:
                 raise KeyError(f"scenario {scenario_id} not found")
             scenario = self._load_scenario_head_row(con, scenario_row)
-            if command:
+            if receipt_row:
+                receipt = self._load_emergency_intake_receipt_row(receipt_row)
+                if receipt.request_fingerprint != request_fingerprint:
+                    raise PublicationConflict("相同幂等键对应了不同请求")
+                if receipt.status is EmergencyIntakeStatus.cancelled:
+                    raise PublicationConflict(
+                        "突发工单接收已取消，不能重放",
+                        code="EMERGENCY_INTAKE_CANCELLED",
+                        details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
+                    )
+                current_order = next(
+                    (item for item in scenario.work_orders if item.id == receipt.work_order_id),
+                    None,
+                )
+                if current_order is None:
+                    raise PublicationConflict(
+                        "突发工单接收凭证对应的工单已缺失，不能继续重排",
+                        code="EMERGENCY_INTAKE_RESOURCE_MISSING",
+                        details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
+                    )
+                if content_hash(current_order) != receipt.work_order_hash:
+                    raise PublicationConflict(
+                        "突发工单接收后内容已变化，不能按原请求重放",
+                        code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
+                        details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
+                    )
+                if current_order.model_dump(mode="json") != order.model_dump(mode="json"):
+                    raise PublicationConflict(
+                        "重放请求中的突发工单与接收凭证不一致",
+                        code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
+                        details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
+                    )
+                if replan_job_payload is not None:
+                    self._insert_runtime_job(
+                        con,
+                        job_type="REPLAN",
+                        scenario_id=scenario_id,
+                        input_payload=replan_job_payload,
+                        dedupe_key=receipt.id,
+                        job_id=f"JOB-EMG-{receipt.id.removeprefix('EIR-')}",
+                    )
                 return scenario, False
+            command = con.execute(
+                "SELECT * FROM command_keys WHERE namespace=? AND key=?",
+                (namespace, idempotency_key),
+            ).fetchone()
+            if command:
+                self._trusted_command_in_transaction(con, command, allow_payload_recovery=True)
+                raise PublicationConflict(
+                    "突发接收命令缺少资源凭证，不能安全重放",
+                    code="EMERGENCY_INTAKE_RECEIPT_MISSING",
+                )
             existing = next((item for item in scenario.work_orders if item.id == order.id), None)
             if existing and existing.model_dump(mode="json") != order.model_dump(mode="json"):
                 raise PublicationConflict(f"工单 {order.id} 已存在，但内容与本次请求不同")
@@ -2997,18 +4191,68 @@ class Store:
                         evaluated_scenario=scenario,
                     )
             now = _now()
+            receipt_identity_hash = content_hash({"namespace": namespace, "key": idempotency_key})
+            receipt = EmergencyIntakeReceipt(
+                id=f"EIR-{receipt_identity_hash[:16]}",
+                scenario_id=scenario_id,
+                namespace=namespace,
+                idempotency_key=idempotency_key,
+                work_order_id=order.id,
+                work_order_hash=content_hash(order),
+                committed_revision=scenario.revision,
+                request_fingerprint=request_fingerprint,
+                status=EmergencyIntakeStatus.active,
+                created_at=now,
+                updated_at=now,
+            )
+            receipt.receipt_hash = _emergency_intake_receipt_hash(receipt)
+            con.execute(
+                "INSERT INTO emergency_intake_receipts("
+                "id, scenario_id, namespace, idempotency_key, work_order_id, work_order_hash, "
+                "committed_revision, request_fingerprint, status, replan_plan_version_id, "
+                "receipt_hash, payload, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    receipt.id,
+                    receipt.scenario_id,
+                    receipt.namespace,
+                    receipt.idempotency_key,
+                    receipt.work_order_id,
+                    receipt.work_order_hash,
+                    receipt.committed_revision,
+                    receipt.request_fingerprint,
+                    receipt.status.value,
+                    receipt.replan_plan_version_id,
+                    receipt.receipt_hash,
+                    receipt.model_dump_json(),
+                    receipt.created_at,
+                    receipt.updated_at,
+                ),
+            )
+            if replan_job_payload is not None:
+                self._insert_runtime_job(
+                    con,
+                    job_type="REPLAN",
+                    scenario_id=scenario_id,
+                    input_payload=replan_job_payload,
+                    dedupe_key=receipt.id,
+                    job_id=f"JOB-EMG-{receipt.id.removeprefix('EIR-')}",
+                )
             payload = json.dumps(
                 {"work_order_id": order.id, "scenario_revision": scenario.revision},
                 ensure_ascii=False,
                 sort_keys=True,
             )
-            con.execute(
-                """
-                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, payload, created_at, updated_at)
-                VALUES (?, ?, ?, 'INTAKE_COMMITTED', 'work_order', ?, ?, ?, ?)
-                ON CONFLICT(namespace, key) DO NOTHING
-                """,
-                (namespace, idempotency_key, request_fingerprint, order.id, payload, now, now),
+            self._insert_command_row(
+                con,
+                namespace=namespace,
+                key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                status="INTAKE_COMMITTED",
+                resource_type="work_order",
+                resource_id=order.id,
+                payload=json.loads(payload),
+                on_conflict_do_nothing=True,
             )
             return scenario, created
 
@@ -3027,7 +4271,7 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT request_fingerprint, status FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT * FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, key),
             ).fetchone()
             if not row:
@@ -3039,15 +4283,34 @@ class Store:
                 if row["status"] == status:
                     return
                 raise PublicationConflict("幂等命令已进入终态，不能覆盖")
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            updated_at = _now()
+            resolved_publication_key = publication_key or row["publication_key"]
+            manifest = _build_command_manifest(
+                namespace=namespace,
+                key=key,
+                request_fingerprint=fingerprint,
+                status=status,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                publication_key=resolved_publication_key,
+                payload=payload_json,
+                created_at=str(row["created_at"]),
+                updated_at=updated_at,
+            )
             con.execute(
-                "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, publication_key=COALESCE(?, publication_key), payload=?, updated_at=? WHERE namespace=? AND key=?",
+                "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, "
+                "publication_key=?, payload=?, command_manifest_hash=?, command_manifest_payload=?, updated_at=? "
+                "WHERE namespace=? AND key=?",
                 (
                     status,
                     resource_type,
                     resource_id,
-                    publication_key,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    _now(),
+                    resolved_publication_key,
+                    payload_json,
+                    manifest.manifest_hash,
+                    manifest.model_dump_json(),
+                    updated_at,
                     namespace,
                     key,
                 ),
@@ -3068,22 +4331,41 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT request_fingerprint, status FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT * FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, key),
             ).fetchone()
             if row:
                 if row["request_fingerprint"] != fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同请求")
                 if row["status"] == "FAILED_RETRYABLE":
+                    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                    updated_at = _now()
+                    resolved_publication_key = publication_key or row["publication_key"]
+                    manifest = _build_command_manifest(
+                        namespace=namespace,
+                        key=key,
+                        request_fingerprint=fingerprint,
+                        status=status,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        publication_key=resolved_publication_key,
+                        payload=payload_json,
+                        created_at=str(row["created_at"]),
+                        updated_at=updated_at,
+                    )
                     con.execute(
-                        "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, publication_key=COALESCE(?, publication_key), payload=?, updated_at=? WHERE namespace=? AND key=?",
+                        "UPDATE command_keys SET status=?, resource_type=?, resource_id=?, publication_key=?, "
+                        "payload=?, command_manifest_hash=?, command_manifest_payload=?, updated_at=? "
+                        "WHERE namespace=? AND key=?",
                         (
                             status,
                             resource_type,
                             resource_id,
-                            publication_key,
-                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                            _now(),
+                            resolved_publication_key,
+                            payload_json,
+                            manifest.manifest_hash,
+                            manifest.model_dump_json(),
+                            updated_at,
                             namespace,
                             key,
                         ),
@@ -3091,10 +4373,25 @@ class Store:
                     return True
                 return False
             now = _now()
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            manifest = _build_command_manifest(
+                namespace=namespace,
+                key=key,
+                request_fingerprint=fingerprint,
+                status=status,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                publication_key=publication_key,
+                payload=payload_json,
+                created_at=now,
+                updated_at=now,
+            )
             con.execute(
                 """
-                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, publication_key, payload, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id,
+                                         publication_key, payload, command_manifest_hash, command_manifest_payload,
+                                         created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     namespace,
@@ -3104,12 +4401,395 @@ class Store:
                     resource_type,
                     resource_id,
                     publication_key,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    payload_json,
+                    manifest.manifest_hash,
+                    manifest.model_dump_json(),
                     now,
                     now,
                 ),
             )
             return True
+
+    @staticmethod
+    def _load_runtime_job_row(row: sqlite3.Row) -> RuntimeJob:
+        try:
+            job = RuntimeJob.model_validate_json(row["payload"])
+            relation_valid = (
+                job.id == str(row["id"])
+                and job.job_type == str(row["job_type"])
+                and job.scenario_id == str(row["scenario_id"])
+                and job.status.value == str(row["status"])
+                and job.progress == int(row["progress"])
+                and job.input_manifest_hash == str(row["input_manifest_hash"])
+                and job.dedupe_key == row["dedupe_key"]
+                and job.lease_owner == row["lease_owner"]
+                and job.lease_expires_at == row["lease_expires_at"]
+                and job.heartbeat_at == row["heartbeat_at"]
+                and job.attempt_number == int(row["attempt_number"])
+                and job.result_resource_type == row["result_resource_type"]
+                and job.result_resource_id == row["result_resource_id"]
+                and job.created_at == str(row["created_at"])
+                and job.updated_at == str(row["updated_at"])
+                and job.finished_at == row["finished_at"]
+                and job.input_manifest_hash
+                == _runtime_job_input_hash(job.job_type, job.scenario_id, job.input_payload, job.dedupe_key)
+            )
+            if not relation_valid:
+                raise ValueError("runtime job identity mismatch")
+            return job
+        except (TypeError, ValueError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "持久任务记录完整性校验失败",
+                record_id=str(row["id"]),
+                record_type="RUNTIME_JOB",
+            ) from error
+
+    @staticmethod
+    def _insert_runtime_job(
+        con: sqlite3.Connection,
+        *,
+        job_type: Literal[
+            "BASELINE",
+            "OPTIMIZE",
+            "REPLAN",
+            "STRATEGY_EXPERIMENT",
+            "COST_ANALYSIS",
+            "CAPACITY_ANALYSIS",
+            "RISK_ANALYSIS",
+            "RISK_COMPARISON",
+        ],
+        scenario_id: str,
+        input_payload: dict,
+        dedupe_key: str | None,
+        job_id: str | None = None,
+    ) -> tuple[RuntimeJob, bool]:
+        if dedupe_key is not None:
+            existing = con.execute(
+                "SELECT * FROM runtime_jobs WHERE job_type=? AND scenario_id=? AND dedupe_key=?",
+                (job_type, scenario_id, dedupe_key),
+            ).fetchone()
+            if existing:
+                stored = Store._load_runtime_job_row(existing)
+                expected_hash = _runtime_job_input_hash(job_type, scenario_id, input_payload, dedupe_key)
+                if stored.input_manifest_hash != expected_hash:
+                    raise PublicationConflict(
+                        "任务幂等键对应了不同输入",
+                        code="IDEMPOTENCY_KEY_REUSED",
+                        details={"job_id": stored.id},
+                    )
+                return stored, False
+        now = _now()
+        resolved_id = job_id or f"JOB-{uuid.uuid4().hex[:16]}"
+        job = RuntimeJob(
+            id=resolved_id,
+            job_type=job_type,
+            scenario_id=scenario_id,
+            input_payload=input_payload,
+            input_manifest_hash=_runtime_job_input_hash(job_type, scenario_id, input_payload, dedupe_key),
+            dedupe_key=dedupe_key,
+            created_at=now,
+            updated_at=now,
+        )
+        con.execute(
+            "INSERT INTO runtime_jobs(id, job_type, scenario_id, status, progress, input_manifest_hash, "
+            "dedupe_key, lease_owner, lease_expires_at, heartbeat_at, attempt_number, result_resource_type, "
+            "result_resource_id, payload, created_at, updated_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL, ?, ?, ?, NULL)",
+            (
+                job.id,
+                job.job_type,
+                job.scenario_id,
+                job.status.value,
+                job.progress,
+                job.input_manifest_hash,
+                job.dedupe_key,
+                job.model_dump_json(),
+                job.created_at,
+                job.updated_at,
+            ),
+        )
+        event = OutboxEvent(
+            id=f"OUT-{uuid.uuid4().hex[:16]}",
+            topic="runtime-job.queued",
+            aggregate_type="runtime_job",
+            aggregate_id=job.id,
+            payload={"job_id": job.id, "job_type": job.job_type, "scenario_id": job.scenario_id},
+            payload_hash="",
+            created_at=now,
+        )
+        event.payload_hash = _outbox_payload_hash(event)
+        con.execute(
+            "INSERT INTO outbox_events(id, topic, aggregate_type, aggregate_id, payload_hash, status, payload, "
+            "created_at, dispatched_at) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, NULL)",
+            (
+                event.id,
+                event.topic,
+                event.aggregate_type,
+                event.aggregate_id,
+                event.payload_hash,
+                event.model_dump_json(),
+                event.created_at,
+            ),
+        )
+        return job, True
+
+    def enqueue_runtime_job(
+        self,
+        *,
+        job_type: Literal[
+            "BASELINE",
+            "OPTIMIZE",
+            "REPLAN",
+            "STRATEGY_EXPERIMENT",
+            "COST_ANALYSIS",
+            "CAPACITY_ANALYSIS",
+            "RISK_ANALYSIS",
+            "RISK_COMPARISON",
+        ],
+        scenario_id: str,
+        input_payload: dict,
+        dedupe_key: str | None = None,
+        job_id: str | None = None,
+    ) -> tuple[RuntimeJob, bool]:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            return self._insert_runtime_job(
+                con,
+                job_type=job_type,
+                scenario_id=scenario_id,
+                input_payload=input_payload,
+                dedupe_key=dedupe_key,
+                job_id=job_id,
+            )
+
+    def get_runtime_job(self, job_id: str) -> RuntimeJob | None:
+        with self._connect() as con:
+            row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
+            return self._load_runtime_job_row(row) if row else None
+
+    def list_runtime_jobs(self, scenario_id: str, *, limit: int = 100) -> list[RuntimeJob]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM runtime_jobs WHERE scenario_id=? ORDER BY created_at DESC LIMIT ?",
+                (scenario_id, limit),
+            ).fetchall()
+            return [self._load_runtime_job_row(row) for row in rows]
+
+    def list_recoverable_runtime_jobs(self, job_type: str | None = None) -> list[RuntimeJob]:
+        with self._connect() as con:
+            if job_type:
+                rows = con.execute(
+                    "SELECT * FROM runtime_jobs WHERE status IN ('QUEUED', 'INTERRUPTED') AND job_type=? "
+                    "ORDER BY created_at",
+                    (job_type,),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT * FROM runtime_jobs WHERE status IN ('QUEUED', 'INTERRUPTED') ORDER BY created_at"
+                ).fetchall()
+            return [self._load_runtime_job_row(row) for row in rows]
+
+    def claim_runtime_job(
+        self,
+        worker_id: str,
+        *,
+        job_id: str | None = None,
+        lease_seconds: int = 30,
+    ) -> RuntimeJob | None:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            now = _now()
+            if job_id:
+                row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT * FROM runtime_jobs WHERE status IN ('QUEUED', 'INTERRUPTED') "
+                    "OR (status='RUNNING' AND lease_expires_at<?) ORDER BY created_at LIMIT 1",
+                    (now,),
+                ).fetchone()
+            if not row:
+                return None
+            job = self._load_runtime_job_row(row)
+            if job.status in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
+                return None
+            if job.status is RuntimeJobStatus.cancel_requested:
+                return None
+            if job.status is RuntimeJobStatus.running and job.lease_expires_at and job.lease_expires_at >= now:
+                return None
+            job.status = RuntimeJobStatus.running
+            job.lease_owner = worker_id
+            job.heartbeat_at = now
+            job.lease_expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+            job.attempt_number += 1
+            job.updated_at = now
+            con.execute(
+                "UPDATE runtime_jobs SET status=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, "
+                "attempt_number=?, payload=?, updated_at=? WHERE id=?",
+                (
+                    job.status.value,
+                    job.lease_owner,
+                    job.lease_expires_at,
+                    job.heartbeat_at,
+                    job.attempt_number,
+                    job.model_dump_json(),
+                    job.updated_at,
+                    job.id,
+                ),
+            )
+            return job
+
+    def heartbeat_runtime_job(self, job_id: str, worker_id: str, progress: int, lease_seconds: int = 30) -> RuntimeJob:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            job = self._load_runtime_job_row(row)
+            if job.status is not RuntimeJobStatus.running or job.lease_owner != worker_id:
+                raise PublicationConflict("任务租约已失效", code="JOB_LEASE_LOST")
+            now = _now()
+            job.progress = max(job.progress, progress)
+            job.heartbeat_at = now
+            job.lease_expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+            job.updated_at = now
+            con.execute(
+                "UPDATE runtime_jobs SET progress=?, lease_expires_at=?, heartbeat_at=?, payload=?, updated_at=? "
+                "WHERE id=?",
+                (job.progress, job.lease_expires_at, job.heartbeat_at, job.model_dump_json(), now, job.id),
+            )
+            return job
+
+    def finish_runtime_job(
+        self,
+        job_id: str,
+        worker_id: str | None,
+        *,
+        status: RuntimeJobStatus,
+        result_resource_type: str | None = None,
+        result_resource_id: str | None = None,
+        error: dict | None = None,
+    ) -> RuntimeJob:
+        if status not in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
+            raise ValueError("runtime job finish requires a terminal status")
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            job = self._load_runtime_job_row(row)
+            if job.status in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
+                return job
+            if worker_id is not None and job.lease_owner not in {None, worker_id}:
+                raise PublicationConflict("任务租约已被其他 worker 接管", code="JOB_LEASE_LOST")
+            now = _now()
+            job.status = status
+            job.progress = 100
+            job.result_resource_type = result_resource_type
+            job.result_resource_id = result_resource_id
+            job.error = error
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.heartbeat_at = now
+            job.updated_at = now
+            job.finished_at = now
+            con.execute(
+                "UPDATE runtime_jobs SET status=?, progress=100, lease_owner=NULL, lease_expires_at=NULL, "
+                "heartbeat_at=?, result_resource_type=?, result_resource_id=?, payload=?, updated_at=?, finished_at=? "
+                "WHERE id=?",
+                (
+                    job.status.value,
+                    job.heartbeat_at,
+                    job.result_resource_type,
+                    job.result_resource_id,
+                    job.model_dump_json(),
+                    job.updated_at,
+                    job.finished_at,
+                    job.id,
+                ),
+            )
+            return job
+
+    def request_runtime_job_cancel(self, job_id: str) -> RuntimeJob:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            job = self._load_runtime_job_row(row)
+            if job.status is RuntimeJobStatus.queued:
+                terminal = RuntimeJobStatus.cancelled
+            elif job.status is RuntimeJobStatus.running:
+                terminal = RuntimeJobStatus.cancel_requested
+            else:
+                return job
+            now = _now()
+            job.status = terminal
+            job.updated_at = now
+            if terminal is RuntimeJobStatus.cancelled:
+                job.progress = 100
+                job.finished_at = now
+            con.execute(
+                "UPDATE runtime_jobs SET status=?, progress=?, payload=?, updated_at=?, finished_at=? WHERE id=?",
+                (job.status.value, job.progress, job.model_dump_json(), now, job.finished_at, job.id),
+            )
+            return job
+
+    def list_pending_outbox(self, limit: int = 100) -> list[OutboxEvent]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM outbox_events WHERE status='PENDING' ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+            events: list[OutboxEvent] = []
+            for row in rows:
+                event = OutboxEvent.model_validate_json(row["payload"])
+                if (
+                    event.id != row["id"]
+                    or event.topic != row["topic"]
+                    or event.aggregate_type != row["aggregate_type"]
+                    or event.aggregate_id != row["aggregate_id"]
+                    or event.status != row["status"]
+                    or event.created_at != row["created_at"]
+                    or event.dispatched_at != row["dispatched_at"]
+                    or event.payload_hash != row["payload_hash"]
+                    or event.payload_hash != _outbox_payload_hash(event)
+                ):
+                    raise DecisionAnalysisIntegrityError(
+                        "Outbox 事件完整性校验失败",
+                        record_id=str(row["id"]),
+                        record_type="OUTBOX_EVENT",
+                    )
+                events.append(event)
+            return events
+
+    def mark_outbox_dispatched_for_aggregate(self, aggregate_id: str) -> int:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            rows = con.execute(
+                "SELECT * FROM outbox_events WHERE aggregate_id=? AND status='PENDING'",
+                (aggregate_id,),
+            ).fetchall()
+            dispatched = 0
+            for row in rows:
+                event = OutboxEvent.model_validate_json(row["payload"])
+                if (
+                    event.id != row["id"]
+                    or event.payload_hash != row["payload_hash"]
+                    or event.payload_hash != _outbox_payload_hash(event)
+                ):
+                    raise DecisionAnalysisIntegrityError(
+                        "Outbox 事件完整性校验失败",
+                        record_id=str(row["id"]),
+                        record_type="OUTBOX_EVENT",
+                    )
+                event.status = "DISPATCHED"
+                event.dispatched_at = _now()
+                con.execute(
+                    "UPDATE outbox_events SET status='DISPATCHED', payload=?, dispatched_at=? WHERE id=?",
+                    (event.model_dump_json(), event.dispatched_at, event.id),
+                )
+                dispatched += 1
+            return dispatched
 
     def transition_work_order(
         self,
@@ -3123,13 +4803,24 @@ class Store:
         if action not in {"start", "complete"}:
             raise ValueError(f"unsupported execution action: {action}")
         namespace = f"work-order-{action}:{scenario_id}:{work_order_id}"
+        # Validate and durably quarantine a pre-existing command before opening
+        # the write transaction. Terminal replays may recover from a damaged
+        # display payload only when the independently stored relation manifest
+        # still proves the resource reference.
+        self.get_command_record(
+            namespace,
+            request.idempotency_key,
+            request_fingerprint,
+            allow_payload_recovery=True,
+        )
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             command = con.execute(
-                "SELECT request_fingerprint, resource_type, resource_id FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT * FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, request.idempotency_key),
             ).fetchone()
             if command:
+                command = self._trusted_command_in_transaction(con, command, allow_payload_recovery=True)
                 if command["request_fingerprint"] != request_fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同执行请求")
                 if command["resource_type"] != "execution_event" or not command["resource_id"]:
@@ -3182,37 +4873,42 @@ class Store:
             order = next((item for item in scenario.work_orders if item.id == work_order_id), None)
             if not order:
                 raise KeyError(f"工单 {work_order_id} 不存在")
-            plan_id = scenario_row["active_plan_version_id"]
-            if not plan_id:
-                raise PublicationConflict("当前没有可执行方案，请先生成并发布方案")
-            plan_row = con.execute(
-                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=?",
-                (plan_id,),
-            ).fetchone()
-            if not plan_row:
-                raise PublicationConflict("当前方案记录不存在，请刷新后重试")
-            plan = self._load_plan_row(con, plan_row)
-            self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
-            if work_order_id in plan.applicability.invalid_assignment_ids:
-                raise PublicationConflict(
-                    "该工单的发布分配已因业务数据变化失效，请先局部重排",
-                    code="INVALID_ASSIGNMENT_CANNOT_START",
-                    details={"work_order_id": work_order_id, "plan_version_id": plan.id},
-                )
-            assignment = next((item for item in plan.selected.assignments if item.work_order_id == work_order_id), None)
-            if not assignment:
-                raise PublicationConflict("该工单未在当前方案中分配，不能登记执行状态")
-            if assignment.technician_id != request.technician_id:
-                raise PublicationConflict("执行技师与当前方案分配不一致")
-            if request.occurred_at < (order.reported_at or 0):
-                raise PublicationConflict("执行时间不能早于工单接报时间")
-
             expected_status = WorkOrderStatus.pending if action == "start" else WorkOrderStatus.started
             target_status = WorkOrderStatus.started if action == "start" else WorkOrderStatus.completed
             start_event: WorkOrderExecutionEvent | None = None
             if order.status is not expected_status:
                 raise PublicationConflict(f"工单当前为 {order.status.value}，不能执行 {action} 操作")
+            active_plan_id = str(scenario_row["active_plan_version_id"] or "")
+            plan: PlanVersion | None = None
+            assignment = None
             if action == "start":
+                if not active_plan_id:
+                    raise PublicationConflict("当前没有可执行方案，请先生成并发布方案")
+                plan_row = con.execute(
+                    "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
+                    "FROM plan_versions WHERE id=? AND scenario_id=?",
+                    (active_plan_id, scenario_id),
+                ).fetchone()
+                if not plan_row:
+                    raise PublicationConflict("当前方案记录不存在，请刷新后重试")
+                plan = self._load_plan_row(con, plan_row)
+                self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
+                if work_order_id in plan.applicability.blocked_start_assignment_ids:
+                    raise PublicationConflict(
+                        "该工单的发布分配已因业务数据变化失效，请先局部重排",
+                        code="INVALID_ASSIGNMENT_CANNOT_START",
+                        details={"work_order_id": work_order_id, "plan_version_id": plan.id},
+                    )
+                assignment = next(
+                    (item for item in plan.selected.assignments if item.work_order_id == work_order_id),
+                    None,
+                )
+                if not assignment:
+                    raise PublicationConflict("该工单未在当前方案中分配，不能登记开始服务")
+                if assignment.technician_id != request.technician_id:
+                    raise PublicationConflict("执行技师与当前方案分配不一致")
+                if request.occurred_at < (order.reported_at or 0):
+                    raise PublicationConflict("执行时间不能早于工单接报时间")
                 snapshot_fingerprint = assignment.planning_fingerprint
                 if not snapshot_fingerprint and plan.scenario_snapshot:
                     snapshot_fingerprint = assignment_planning_fingerprint(
@@ -3307,11 +5003,15 @@ class Store:
                     )
             if action == "complete":
                 start_row = con.execute(
-                    "SELECT * FROM work_order_execution_events WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY occurred_at DESC LIMIT 1",
+                    "SELECT * FROM work_order_execution_events "
+                    "WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY sequence DESC LIMIT 1",
                     (scenario_id, work_order_id),
                 ).fetchone()
                 if not start_row:
-                    raise PublicationConflict("找不到该工单的开始服务记录")
+                    raise PublicationConflict(
+                        "找不到该工单的开始服务记录",
+                        code="VERIFIED_START_EVENT_REQUIRED",
+                    )
                 try:
                     start_event = self._load_execution_event_row(con, start_row)
                 except DecisionAnalysisIntegrityError as error:
@@ -3320,8 +5020,23 @@ class Store:
                         code="EXECUTION_EVENT_INTEGRITY_FAILED",
                         details={"event_id": str(start_row["id"])},
                     ) from error
+                existing_complete = con.execute(
+                    "SELECT id FROM work_order_execution_events "
+                    "WHERE scenario_id=? AND work_order_id=? AND action='complete' LIMIT 1",
+                    (scenario_id, work_order_id),
+                ).fetchone()
+                if existing_complete:
+                    raise PublicationConflict(
+                        "该 Booking 已经存在完成事件",
+                        code="DUPLICATE_COMPLETE_EVENT",
+                        details={"event_id": str(existing_complete["id"]), "booking_id": start_event.booking_id},
+                    )
                 if start_event.technician_id != request.technician_id:
-                    raise PublicationConflict("完成服务的技师与开始服务记录不一致")
+                    raise PublicationConflict(
+                        "完成服务的技师与开始服务记录不一致",
+                        code="COMPLETE_TECHNICIAN_MISMATCH",
+                        details={"booking_id": start_event.booking_id},
+                    )
                 if request.occurred_at <= start_event.occurred_at:
                     raise PublicationConflict(
                         "完成时间必须严格晚于开始时间",
@@ -3339,17 +5054,22 @@ class Store:
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM work_order_execution_events WHERE scenario_id=?",
                 (scenario_id,),
             ).fetchone()
-            start_event_for_identity = start_event if action == "complete" else None
-            source_assignment_hash = (
-                start_event_for_identity.source_assignment_hash
-                if start_event_for_identity
-                else assignment.source_assignment_hash or assignment_source_fingerprint(assignment)
-            )
-            source_sequence = (
-                start_event_for_identity.source_sequence
-                if start_event_for_identity
-                else assignment.source_sequence or assignment.sequence
-            )
+            if action == "start":
+                assert plan is not None and assignment is not None
+                start_event_for_identity = None
+                event_plan_version_id = plan.id
+                source_assignment_hash = assignment.source_assignment_hash or assignment_source_fingerprint(assignment)
+                source_sequence = assignment.source_sequence or assignment.sequence
+                planned_start_at = assignment.start_time
+                planned_finish_at = assignment.finish_time
+            else:
+                assert start_event is not None
+                start_event_for_identity = start_event
+                event_plan_version_id = start_event.plan_version_id
+                source_assignment_hash = start_event.source_assignment_hash
+                source_sequence = start_event.source_sequence
+                planned_start_at = start_event.planned_start_at
+                planned_finish_at = start_event.planned_finish_at
             event = WorkOrderExecutionEvent(
                 id=f"EXEC-{uuid.uuid4().hex[:12]}",
                 scenario_id=scenario_id,
@@ -3359,7 +5079,7 @@ class Store:
                 sequence=int(sequence_row["next_sequence"]),
                 occurred_at=request.occurred_at,
                 scenario_revision=scenario.revision,
-                plan_version_id=plan.id,
+                plan_version_id=event_plan_version_id,
                 idempotency_key=request.idempotency_key,
                 created_at=_now(),
                 booking_id=(
@@ -3369,12 +5089,8 @@ class Store:
                 ),
                 source_assignment_hash=source_assignment_hash,
                 source_sequence=source_sequence,
-                planned_start_at=(
-                    start_event_for_identity.planned_start_at if start_event_for_identity else assignment.start_time
-                ),
-                planned_finish_at=(
-                    start_event_for_identity.planned_finish_at if start_event_for_identity else assignment.finish_time
-                ),
+                planned_start_at=planned_start_at,
+                planned_finish_at=planned_finish_at,
                 actual_duration_minutes=(
                     request.occurred_at - start_event_for_identity.occurred_at if start_event_for_identity else None
                 ),
@@ -3382,7 +5098,7 @@ class Store:
                     max(0, request.occurred_at - order.window_end) if action == "start" else 0
                 ),
                 planned_start_variance_minutes=(
-                    request.occurred_at - assignment.start_time if action == "start" else None
+                    request.occurred_at - assignment.start_time if action == "start" and assignment else None
                 ),
                 actual_late_start_minutes=(max(0, request.occurred_at - order.window_end) if action == "start" else 0),
                 early_start_override_reason=(request.early_start_override_reason if action == "start" else None),
@@ -3395,14 +5111,15 @@ class Store:
                 "UPDATE scenarios SET payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (scenario.model_dump_json(), scenario_id),
             )
-            self._set_plan_applicability(
-                con,
-                plan.id,
-                scenario_id,
-                active=True,
-                applicability=plan.applicability,
-                evaluated_scenario=scenario,
-            )
+            if active_plan_id:
+                self._set_plan_applicability(
+                    con,
+                    active_plan_id,
+                    scenario_id,
+                    active=True,
+                    applicability=(plan.applicability if plan is not None else None),
+                    evaluated_scenario=scenario,
+                )
             self._insert_revision(
                 con, scenario, f"工单 {work_order_id} {'开始服务' if action == 'start' else '完成服务'}"
             )
@@ -3430,21 +5147,15 @@ class Store:
                     event.created_at,
                 ),
             )
-            now = _now()
-            con.execute(
-                """
-                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, payload, created_at, updated_at)
-                VALUES (?, ?, ?, 'COMPLETED', 'execution_event', ?, ?, ?, ?)
-                """,
-                (
-                    namespace,
-                    request.idempotency_key,
-                    request_fingerprint,
-                    event.id,
-                    json.dumps({"result": result.model_dump(mode="json")}, ensure_ascii=False, sort_keys=True),
-                    now,
-                    now,
-                ),
+            self._insert_command_row(
+                con,
+                namespace=namespace,
+                key=request.idempotency_key,
+                request_fingerprint=request_fingerprint,
+                status="COMPLETED",
+                resource_type="execution_event",
+                resource_id=event.id,
+                payload={"result": result.model_dump(mode="json")},
             )
             return result
 
@@ -3506,12 +5217,6 @@ class Store:
                     record_id=active_plan_version_id,
                     record_type="PLAN_VERSION",
                 )
-        if verified_events and not plan:
-            raise DecisionAnalysisIntegrityError(
-                "存在执行事件但没有可信活动方案",
-                record_id=verified_events[-1].id,
-                record_type="WORK_ORDER_EXECUTION_EVENT",
-            )
         assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
         started_sources: list[ExecutionSourceAssignment] = []
         completed_sources: list[ExecutionSourceAssignment] = []
@@ -3519,8 +5224,6 @@ class Store:
             if order.status not in {WorkOrderStatus.started, WorkOrderStatus.completed}:
                 continue
             assignment = assignments.get(order.id)
-            if order.status is WorkOrderStatus.started and (not assignment or not plan):
-                continue
             start_event = events_by_order_action.get((order.id, "start"))
             if not start_event:
                 raise DecisionAnalysisIntegrityError(
@@ -3738,6 +5441,12 @@ class Store:
                 source_assignment.source_assignment_hash or assignment_source_fingerprint(source_assignment)
             ):
                 raise ValueError("execution event source assignment mismatch")
+            if (
+                event.source_sequence != (source_assignment.source_sequence or source_assignment.sequence)
+                or event.planned_start_at != source_assignment.start_time
+                or event.planned_finish_at != source_assignment.finish_time
+            ):
+                raise ValueError("execution event frozen assignment identity mismatch")
             event.self_integrity = AnalysisIntegrityStatus.verified
             event.source_plan_integrity = AnalysisIntegrityStatus.verified
             event.effective_integrity = AnalysisIntegrityStatus.verified
@@ -3763,10 +5472,11 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             existing = con.execute(
-                "SELECT request_fingerprint, resource_id FROM command_keys WHERE namespace=? AND key=?",
+                "SELECT * FROM command_keys WHERE namespace=? AND key=?",
                 (namespace, idempotency_key),
             ).fetchone()
             if existing:
+                existing = self._trusted_command_in_transaction(con, existing, allow_payload_recovery=True)
                 if existing["request_fingerprint"] != request_fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同请求")
                 row = con.execute("SELECT * FROM scenarios WHERE id=?", (existing["resource_id"],)).fetchone()
@@ -3780,25 +5490,15 @@ class Store:
                 (scenario.id, scenario.model_dump_json()),
             )
             self._insert_revision(con, scenario, f"从方案 {source_version_id} 克隆")
-            now = _now()
-            con.execute(
-                """
-                INSERT INTO command_keys(namespace, key, request_fingerprint, status, resource_type, resource_id, payload, created_at, updated_at)
-                VALUES (?, ?, ?, 'COMPLETED', 'scenario', ?, ?, ?, ?)
-                """,
-                (
-                    namespace,
-                    idempotency_key,
-                    request_fingerprint,
-                    scenario.id,
-                    json.dumps(
-                        {"scenario_id": scenario.id, "source_version_id": source_version_id},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    now,
-                    now,
-                ),
+            self._insert_command_row(
+                con,
+                namespace=namespace,
+                key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                status="COMPLETED",
+                resource_type="scenario",
+                resource_id=scenario.id,
+                payload={"scenario_id": scenario.id, "source_version_id": source_version_id},
             )
             return scenario
 
@@ -4040,12 +5740,10 @@ class Store:
             )
             if current_revision != required_revision:
                 raise ScenarioRevisionConflict(required_revision, current_revision)
-            candidate_row = con.execute(
-                "SELECT payload FROM schedule_candidates WHERE id=?", (candidate_id,)
-            ).fetchone()
+            candidate_row = con.execute("SELECT * FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
             if not candidate_row:
                 raise PublicationConflict("候选方案不存在")
-            candidate = ScheduleCandidate.model_validate_json(candidate_row["payload"])
+            candidate = self._load_schedule_candidate_row(con, candidate_row)
             if not candidate.publishable or not candidate.verification_report.publishable:
                 raise PublicationConflict("候选方案未通过发布验证")
             if candidate.scenario_id != scenario.id:
@@ -4066,16 +5764,29 @@ class Store:
             expected_context_hash = content_hash(candidate.planning_context) if candidate.planning_context else None
             if candidate.planning_context_hash != expected_context_hash:
                 raise PublicationConflict("候选方案的计划上下文指纹不一致")
-            run_row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (candidate.run_id,)).fetchone()
+            run_row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (candidate.run_id,)).fetchone()
             if not run_row:
                 raise PublicationConflict("候选方案缺少求解记录")
-            candidate_run = ScheduleRun.model_validate_json(run_row["payload"])
+            candidate_run = self._load_schedule_run_row(con, run_row)
+            run_target_revision = candidate_run.target_scenario_revision or candidate_run.scenario_revision
+            run_target_hash = candidate_run.target_scenario_snapshot_hash or candidate_run.scenario_snapshot_hash
             if (
                 candidate_run.scenario_id != candidate.scenario_id
-                or candidate_run.scenario_revision != candidate.scenario_revision
-                or candidate_run.scenario_snapshot_hash != candidate.scenario_snapshot_hash
+                or run_target_revision != candidate.scenario_revision
+                or run_target_hash != candidate.scenario_snapshot_hash
             ):
                 raise PublicationConflict("求解记录与候选方案的数据谱系不一致")
+            if (
+                candidate_run.input_manifest is None
+                or candidate_run.result_manifest is None
+                or candidate.candidate_manifest is None
+                or candidate_run.result_manifest.candidate_manifest_hash != candidate.candidate_manifest.manifest_hash
+                or candidate.candidate_manifest.run_input_manifest_hash != candidate_run.input_manifest.manifest_hash
+            ):
+                raise PublicationConflict(
+                    "求解记录与候选方案的清单证据不完整",
+                    code="RUN_CANDIDATE_MANIFEST_INTEGRITY_FAILED",
+                )
             if candidate_run.source_plan_version_id != candidate.source_plan_version_id:
                 raise PublicationConflict("求解记录与候选方案的来源版本不一致")
             if candidate_run.expected_active_plan_version_id != candidate.expected_active_plan_version_id:
@@ -4114,6 +5825,22 @@ class Store:
                     code="PLANNING_RESERVATION_INTEGRITY_FAILED",
                     details={"reservation_id": candidate.reservation_id},
                 )
+            if action == "restore":
+                transform = reservation.restore_transform_manifest
+                if (
+                    transform is None
+                    or candidate.restore_transform_manifest != transform
+                    or candidate_run.restore_transform_manifest != transform
+                    or transform.manifest_hash != _restore_transform_manifest_hash(transform)
+                    or reservation.target_scenario_revision != scenario.revision
+                    or reservation.target_scenario_hash != content_hash(scenario)
+                    or transform.target_scenario_hash != content_hash(scenario)
+                    or transform.transform_output_hash != content_hash(scenario)
+                ):
+                    raise PublicationConflict(
+                        "恢复目标变换证明失败",
+                        code="RESTORE_TRANSFORM_INTEGRITY_FAILED",
+                    )
             expected_reservation_revision = scenario.revision - 1 if replace_scenario else scenario.revision
             if (
                 reservation.scenario_revision != expected_reservation_revision
@@ -4222,6 +5949,34 @@ class Store:
                         code="SOURCE_PLAN_CHANGED_DURING_COMMAND",
                         details={"reservation_id": reservation.id, "resource_id": publication_source.id},
                     )
+                if action == "restore":
+                    transform = reservation.restore_transform_manifest
+                    assert transform is not None
+                    authorized_target = _authorized_restore_target(current_scenario, publication_source)
+                    transform_input = {
+                        "policy_version": transform.policy_version,
+                        "scenario_id": current_scenario.id,
+                        "command_base_scenario_revision": current_scenario.revision,
+                        "command_base_scenario_hash": content_hash(current_scenario),
+                        "source_plan_version_id": publication_source.id,
+                        "source_plan_manifest_hash": publication_source.publication_manifest_hash,
+                        "source_plan_snapshot_hash": content_hash(publication_source.scenario_snapshot),
+                        "request_fingerprint": reservation.command_fingerprint,
+                    }
+                    if (
+                        authorized_target.model_dump(mode="json") != scenario.model_dump(mode="json")
+                        or transform.command_base_scenario_revision != current_scenario.revision
+                        or transform.command_base_scenario_hash != content_hash(current_scenario)
+                        or transform.source_plan_version_id != publication_source.id
+                        or transform.source_plan_manifest_hash != publication_source.publication_manifest_hash
+                        or transform.source_plan_snapshot_hash != content_hash(publication_source.scenario_snapshot)
+                        or transform.request_fingerprint != reservation.command_fingerprint
+                        or transform.transform_input_hash != content_hash(transform_input)
+                    ):
+                        raise PublicationConflict(
+                            "恢复目标不等于授权的基础快照变换",
+                            code="RESTORE_TRANSFORM_INVALID",
+                        )
             elif candidate.source_plan_version_id:
                 raise PublicationConflict("候选方案声明了来源版本，但发布请求未携带来源")
             elif reservation.source_plan_version_id is not None:
@@ -4301,7 +6056,7 @@ class Store:
             verification_report_payload = transaction_verification.model_dump(exclude={"checked_at"}, mode="json")
             verification_report_hash = content_hash(verification_report_payload)
             verification_artifact_payload = {
-                "policy_version": "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+                "policy_version": "FIELD_SERVICE_PUBLICATION_VERIFICATION_V3",
                 "candidate_snapshot": candidate.model_dump(mode="json"),
                 "planning_context_snapshot": (
                     candidate.planning_context.model_dump(mode="json")
@@ -4312,6 +6067,9 @@ class Store:
                 ),
                 "transaction_verification_report": verification_report_payload,
                 "verified_schedule_hash": content_hash(chosen),
+                "run_input_manifest_hash": candidate_run.input_manifest.manifest_hash,
+                "run_result_manifest_hash": candidate_run.result_manifest.manifest_hash,
+                "candidate_manifest_hash": candidate.candidate_manifest.manifest_hash,
             }
             verification_artifact = PublicationVerificationArtifact(
                 **verification_artifact_payload,
@@ -4342,7 +6100,7 @@ class Store:
                 candidate_id=candidate_id,
                 scenario_snapshot_hash=content_hash(scenario),
                 published_schedule_hash=content_hash(chosen),
-                publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V2",
+                publication_verification_policy_version="FIELD_SERVICE_PUBLICATION_VERIFICATION_V3",
                 publication_verification_report_hash=verification_report_hash,
                 publication_verification_artifact=verification_artifact,
                 publication_planning_context=publication_context,
@@ -4413,9 +6171,19 @@ class Store:
                 (chosen.id, chosen.scenario_id, chosen.kind, number, chosen.model_dump_json(), chosen.created_at),
             )
             for artifact in persisted_artifacts:
+                artifact_payload = artifact.model_dump_json()
+                artifact_blob_hash = _store_artifact_blob(con, artifact_payload)
                 con.execute(
-                    "INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) VALUES (?, ?, NULL, ?, ?, ?)",
-                    (artifact.id, plan.id, artifact.role, artifact.model_dump_json(), plan.created_at),
+                    "INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, "
+                    "artifact_blob_hash, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                    (
+                        artifact.id,
+                        plan.id,
+                        artifact.role,
+                        _artifact_blob_reference(artifact_blob_hash),
+                        artifact_blob_hash,
+                        plan.created_at,
+                    ),
                 )
             if replace_scenario:
                 con.execute(
@@ -4478,6 +6246,7 @@ class Store:
         solver_config_hash: str,
         run_id: str | None = None,
         started_at: str | None = None,
+        target_scenario: ScheduleScenario | None = None,
     ) -> tuple[PlanningReservation, ScheduleRun]:
         """Freeze every planning input and create its run in one SQLite write snapshot."""
         with self._lock, self._connect() as con:
@@ -4555,6 +6324,46 @@ class Store:
                     source_plan = self._load_plan_row(con, source_row)
                 self._require_loaded_plan_for_use(source_plan, source_use_case)
 
+            restore_transform: RestoreTransformManifest | None = None
+            resolved_target = target_scenario or scenario
+            if action == "restore":
+                if source_plan is None or target_scenario is None:
+                    raise PublicationConflict(
+                        "恢复命令缺少来源方案或目标快照",
+                        code="RESTORE_TRANSFORM_REQUIRED",
+                    )
+                authorized_target = _authorized_restore_target(scenario, source_plan)
+                if target_scenario.model_dump(mode="json") != authorized_target.model_dump(mode="json"):
+                    raise PublicationConflict(
+                        "恢复目标不是来源方案的授权快照变换",
+                        code="RESTORE_TRANSFORM_INVALID",
+                    )
+                transform_input = {
+                    "policy_version": "FIELD_SERVICE_RESTORE_TRANSFORM_V1",
+                    "scenario_id": scenario.id,
+                    "command_base_scenario_revision": scenario.revision,
+                    "command_base_scenario_hash": content_hash(scenario),
+                    "source_plan_version_id": source_plan.id,
+                    "source_plan_manifest_hash": source_plan.publication_manifest_hash,
+                    "source_plan_snapshot_hash": content_hash(source_plan.scenario_snapshot),
+                    "request_fingerprint": command_fingerprint,
+                }
+                restore_transform = RestoreTransformManifest(
+                    **transform_input,
+                    target_scenario_revision=target_scenario.revision,
+                    target_scenario_hash=content_hash(target_scenario),
+                    transform_input_hash=content_hash(transform_input),
+                    transform_output_hash=content_hash(target_scenario),
+                )
+                restore_transform.manifest_hash = _restore_transform_manifest_hash(restore_transform)
+            elif target_scenario is not None and target_scenario.model_dump(mode="json") != scenario.model_dump(
+                mode="json"
+            ):
+                raise PublicationConflict(
+                    "只有恢复命令可以声明不同的目标快照",
+                    code="TARGET_SCENARIO_NOT_ALLOWED",
+                )
+
             execution_context = self._execution_source_context(con, scenario, active_plan_id)
             resolved_run_id = run_id or f"RUN-{uuid.uuid4().hex[:12]}"
             reservation_id = f"RES-{resolved_run_id}"
@@ -4576,14 +6385,14 @@ class Store:
                         code="PLANNING_RESERVATION_CONFLICT",
                         details={"reservation_id": reservation_id},
                     )
-                run_row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (resolved_run_id,)).fetchone()
+                run_row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (resolved_run_id,)).fetchone()
                 if not run_row:
                     raise PublicationConflict(
                         "规划预留引用的求解记录不存在",
                         code="PLANNING_RESERVATION_RUN_MISSING",
                         details={"reservation_id": reservation_id},
                     )
-                run = ScheduleRun.model_validate_json(run_row["payload"])
+                run = self._load_schedule_run_row(con, run_row)
                 if run.status is ScheduleRunStatus.failed and run.termination_reason == "APPLICATION_RESTARTED":
                     run.status = ScheduleRunStatus.running
                     run.termination_reason = None
@@ -4612,6 +6421,14 @@ class Store:
                 execution_context=execution_context,
                 command_fingerprint=command_fingerprint,
                 created_at=now,
+                command_base_scenario_revision=scenario.revision,
+                command_base_scenario_hash=content_hash(scenario),
+                target_scenario_revision=resolved_target.revision,
+                target_scenario_hash=content_hash(resolved_target),
+                target_transform_policy=(restore_transform.policy_version if restore_transform else None),
+                target_transform_input_hash=(restore_transform.transform_input_hash if restore_transform else None),
+                target_transform_output_hash=(restore_transform.transform_output_hash if restore_transform else None),
+                restore_transform_manifest=restore_transform,
             )
             reservation.reservation_hash = _planning_reservation_hash(reservation)
             requested_ms = int(round(requested_time_limit_seconds * 1000))
@@ -4633,15 +6450,57 @@ class Store:
                 effective_time_limit_ms=requested_ms,
                 status=ScheduleRunStatus.running,
                 started_at=now,
+                target_scenario_revision=resolved_target.revision,
+                target_scenario_snapshot_hash=content_hash(resolved_target),
+                restore_transform_manifest=(restore_transform.model_copy(deep=True) if restore_transform else None),
             )
+            run_input = RunInputManifest(
+                run_id=run.id,
+                scenario_id=scenario.id,
+                command_base_scenario_revision=scenario.revision,
+                command_base_scenario_hash=reservation.scenario_snapshot_hash,
+                target_scenario_revision=resolved_target.revision,
+                target_scenario_hash=content_hash(resolved_target),
+                reservation_id=reservation.id,
+                reservation_hash=reservation.reservation_hash,
+                source_plan_version_id=reservation.source_plan_version_id,
+                expected_active_plan_version_id=reservation.active_plan_version_id,
+                command_fingerprint=reservation.command_fingerprint,
+                solver_name=solver_name,
+                solver_config_hash=solver_config_hash,
+                requested_time_limit_ms=requested_ms,
+                restore_transform_manifest_hash=(restore_transform.manifest_hash if restore_transform else None),
+            )
+            run_input.manifest_hash = _run_input_manifest_hash(run_input)
+            run.input_manifest = run_input
             con.execute(
                 "INSERT INTO planning_reservations(id, scenario_id, reservation_hash, payload, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (reservation.id, scenario_id, reservation.reservation_hash, reservation.model_dump_json(), now),
             )
             con.execute(
-                "INSERT INTO schedule_runs(id, scenario_id, status, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (run.id, run.scenario_id, run.status.value, run.model_dump_json(), run.started_at),
+                "INSERT INTO schedule_runs("
+                "id, scenario_id, status, payload, created_at, input_manifest_hash, result_manifest_hash, "
+                "scenario_revision, scenario_snapshot_hash, target_scenario_revision, target_scenario_snapshot_hash, "
+                "reservation_id, reservation_hash, source_plan_version_id, expected_active_plan_version_id, "
+                "solver_config_hash, candidate_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    run.id,
+                    run.scenario_id,
+                    run.status.value,
+                    run.model_dump_json(),
+                    run.started_at,
+                    run.input_manifest.manifest_hash,
+                    run.scenario_revision,
+                    run.scenario_snapshot_hash,
+                    run.target_scenario_revision,
+                    run.target_scenario_snapshot_hash,
+                    run.reservation_id,
+                    run.reservation_hash,
+                    run.source_plan_version_id,
+                    run.expected_active_plan_version_id,
+                    run.solver_config_hash,
+                ),
             )
             return reservation, run
 
@@ -4667,10 +6526,10 @@ class Store:
                 or stored_reservation.reservation_hash != reservation.reservation_hash
             ):
                 raise PublicationConflict("规划预留证明失败", code="PLANNING_RESERVATION_INTEGRITY_FAILED")
-            run_row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
+            run_row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
             if not run_row:
                 raise PublicationConflict("求解记录不存在")
-            stored_run = ScheduleRun.model_validate_json(run_row["payload"])
+            stored_run = self._load_schedule_run_row(con, run_row)
             if (
                 stored_run.reservation_id != reservation.id
                 or stored_run.reservation_hash != reservation.reservation_hash
@@ -4707,15 +6566,153 @@ class Store:
                 )
             return reservation
 
+    def _load_schedule_run_row(self, con: sqlite3.Connection, row: sqlite3.Row) -> ScheduleRun:
+        run = ScheduleRun.model_validate_json(row["payload"])
+        relational = {
+            "id": str(row["id"]),
+            "scenario_id": str(row["scenario_id"]),
+            "status": str(row["status"]),
+        }
+        if (
+            run.id != relational["id"]
+            or run.scenario_id != relational["scenario_id"]
+            or run.status.value != relational["status"]
+        ):
+            raise DecisionAnalysisIntegrityError(
+                "求解记录关系身份与内容不一致",
+                record_id=str(row["id"]),
+                record_type="SCHEDULE_RUN",
+            )
+        relational_input_hash = row["input_manifest_hash"]
+        if relational_input_hash is None:
+            return run
+        manifest = run.input_manifest
+        target_revision = run.target_scenario_revision or run.scenario_revision
+        target_hash = run.target_scenario_snapshot_hash or run.scenario_snapshot_hash
+        if (
+            manifest is None
+            or manifest.manifest_hash != str(relational_input_hash)
+            or manifest.manifest_hash != _run_input_manifest_hash(manifest)
+            or manifest.run_id != run.id
+            or manifest.scenario_id != run.scenario_id
+            or manifest.command_base_scenario_revision != run.scenario_revision
+            or manifest.command_base_scenario_hash != run.scenario_snapshot_hash
+            or manifest.target_scenario_revision != target_revision
+            or manifest.target_scenario_hash != target_hash
+            or manifest.reservation_id != run.reservation_id
+            or manifest.reservation_hash != run.reservation_hash
+            or manifest.source_plan_version_id != run.source_plan_version_id
+            or manifest.expected_active_plan_version_id != run.expected_active_plan_version_id
+            or manifest.solver_name != run.solver_name
+            or manifest.solver_config_hash != run.solver_config_hash
+            or manifest.requested_time_limit_ms != run.requested_time_limit_ms
+            or row["scenario_revision"] != run.scenario_revision
+            or row["scenario_snapshot_hash"] != run.scenario_snapshot_hash
+            or row["target_scenario_revision"] != target_revision
+            or row["target_scenario_snapshot_hash"] != target_hash
+            or row["reservation_id"] != run.reservation_id
+            or row["reservation_hash"] != run.reservation_hash
+            or row["source_plan_version_id"] != run.source_plan_version_id
+            or row["expected_active_plan_version_id"] != run.expected_active_plan_version_id
+            or row["solver_config_hash"] != run.solver_config_hash
+        ):
+            raise DecisionAnalysisIntegrityError(
+                "求解记录输入清单校验失败",
+                record_id=run.id,
+                record_type="SCHEDULE_RUN",
+            )
+        transform = run.restore_transform_manifest
+        if manifest.restore_transform_manifest_hash:
+            if (
+                transform is None
+                or transform.manifest_hash != manifest.restore_transform_manifest_hash
+                or transform.manifest_hash != _restore_transform_manifest_hash(transform)
+            ):
+                raise DecisionAnalysisIntegrityError(
+                    "求解记录恢复变换清单校验失败",
+                    record_id=run.id,
+                    record_type="SCHEDULE_RUN",
+                )
+        relational_result_hash = row["result_manifest_hash"]
+        if relational_result_hash is not None:
+            result = run.result_manifest
+            if (
+                result is None
+                or result.manifest_hash != str(relational_result_hash)
+                or result.manifest_hash != _run_result_manifest_hash(result)
+                or result.run_id != run.id
+                or result.status is not run.status
+                or result.candidate_id != run.candidate_id
+                or result.finished_at != run.finished_at
+                or row["candidate_id"] != run.candidate_id
+            ):
+                raise DecisionAnalysisIntegrityError(
+                    "求解记录结果清单校验失败",
+                    record_id=run.id,
+                    record_type="SCHEDULE_RUN",
+                )
+        return run
+
+    def _load_schedule_candidate_row(self, con: sqlite3.Connection, row: sqlite3.Row) -> ScheduleCandidate:
+        candidate = ScheduleCandidate.model_validate_json(row["payload"])
+        if (
+            candidate.id != str(row["id"])
+            or candidate.run_id != str(row["run_id"])
+            or candidate.scenario_id != str(row["scenario_id"])
+            or int(candidate.publishable) != int(row["publishable"])
+        ):
+            raise DecisionAnalysisIntegrityError(
+                "候选方案关系身份与内容不一致",
+                record_id=str(row["id"]),
+                record_type="SCHEDULE_CANDIDATE",
+            )
+        relational_hash = row["candidate_manifest_hash"]
+        if relational_hash is None:
+            return candidate
+        manifest = candidate.candidate_manifest
+        if (
+            manifest is None
+            or manifest.manifest_hash != str(relational_hash)
+            or manifest.manifest_hash != _candidate_manifest_hash(manifest)
+            or manifest.candidate_id != candidate.id
+            or manifest.run_id != candidate.run_id
+            or manifest.scenario_id != candidate.scenario_id
+            or manifest.scenario_revision != candidate.scenario_revision
+            or manifest.scenario_snapshot_hash != candidate.scenario_snapshot_hash
+            or manifest.reservation_id != candidate.reservation_id
+            or manifest.reservation_hash != candidate.reservation_hash
+            or manifest.source_plan_version_id != candidate.source_plan_version_id
+            or manifest.expected_active_plan_version_id != candidate.expected_active_plan_version_id
+            or manifest.schedule_hash != content_hash(candidate.schedule)
+            or manifest.verification_report_hash != content_hash(candidate.verification_report)
+            or manifest.solver_policy_fingerprint != candidate.solver_policy_fingerprint
+            or manifest.publishable != candidate.publishable
+            or row["scenario_revision"] != candidate.scenario_revision
+            or row["scenario_snapshot_hash"] != candidate.scenario_snapshot_hash
+            or row["reservation_id"] != candidate.reservation_id
+            or row["reservation_hash"] != candidate.reservation_hash
+            or row["source_plan_version_id"] != candidate.source_plan_version_id
+            or row["expected_active_plan_version_id"] != candidate.expected_active_plan_version_id
+            or row["schedule_hash"] != manifest.schedule_hash
+            or row["verification_report_hash"] != manifest.verification_report_hash
+            or row["solver_policy_fingerprint"] != candidate.solver_policy_fingerprint
+        ):
+            raise DecisionAnalysisIntegrityError(
+                "候选方案清单校验失败",
+                record_id=candidate.id,
+                record_type="SCHEDULE_CANDIDATE",
+            )
+        return candidate
+
     def save_schedule_run(self, run: ScheduleRun) -> ScheduleRun:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             existing_row = con.execute(
-                "SELECT payload FROM schedule_runs WHERE id=?",
+                "SELECT * FROM schedule_runs WHERE id=?",
                 (run.id,),
             ).fetchone()
             if existing_row:
-                existing = ScheduleRun.model_validate_json(existing_row["payload"])
+                existing = self._load_schedule_run_row(con, existing_row)
                 terminal = {
                     ScheduleRunStatus.optimal,
                     ScheduleRunStatus.feasible,
@@ -4731,9 +6728,46 @@ class Store:
                     if existing.model_dump(mode="json") != run.model_dump(mode="json"):
                         raise PublicationConflict("求解记录已进入终态，不能覆盖")
                     return existing
+                if existing.input_manifest is not None and existing.input_manifest != run.input_manifest:
+                    raise PublicationConflict("求解记录输入清单不可修改")
+            terminal_statuses = {
+                ScheduleRunStatus.optimal,
+                ScheduleRunStatus.feasible,
+                ScheduleRunStatus.time_limit_feasible,
+                ScheduleRunStatus.time_limit_no_solution,
+                ScheduleRunStatus.infeasible,
+                ScheduleRunStatus.no_solution,
+                ScheduleRunStatus.invalid_model,
+                ScheduleRunStatus.failed,
+                ScheduleRunStatus.cancelled,
+            }
+            if run.status in terminal_statuses and run.result_manifest is None:
+                if not run.finished_at:
+                    raise PublicationConflict("终态求解记录缺少完成时间")
+                result_manifest = RunResultManifest(
+                    run_id=run.id,
+                    status=run.status,
+                    termination_reason=run.termination_reason,
+                    solution_found=run.solution_found,
+                    candidate_id=run.candidate_id,
+                    candidate_manifest_hash=None,
+                    solver_name=run.solver_name,
+                    solver_version=run.solver_version,
+                    solver_policy_fingerprint=run.solver_policy_fingerprint,
+                    planning_context_hash=run.planning_context_hash,
+                    finished_at=run.finished_at,
+                )
+                result_manifest.manifest_hash = _run_result_manifest_hash(result_manifest)
+                run.result_manifest = result_manifest
             con.execute(
-                "INSERT INTO schedule_runs(id, scenario_id, status, payload, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, payload=excluded.payload",
-                (run.id, run.scenario_id, run.status.value, run.model_dump_json(), run.started_at),
+                "UPDATE schedule_runs SET status=?, payload=?, result_manifest_hash=?, candidate_id=? WHERE id=?",
+                (
+                    run.status.value,
+                    run.model_dump_json(),
+                    run.result_manifest.manifest_hash if run.result_manifest else None,
+                    run.candidate_id,
+                    run.id,
+                ),
             )
         return run
 
@@ -4741,10 +6775,10 @@ class Store:
         """Resume exactly the same run after startup marked it interrupted."""
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
+            row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
             if not row:
                 raise PublicationConflict("待恢复的求解记录不存在")
-            stored = ScheduleRun.model_validate_json(row["payload"])
+            stored = self._load_schedule_run_row(con, row)
             if stored.status is not ScheduleRunStatus.failed or stored.termination_reason != "APPLICATION_RESTARTED":
                 raise PublicationConflict("只有因应用重启中断的求解记录可以恢复")
             expected = stored.model_copy(
@@ -4778,10 +6812,10 @@ class Store:
             raise PublicationConflict("完成求解记录前必须设置终态和对应候选")
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            run_row = con.execute("SELECT payload FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
+            run_row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
             if not run_row:
                 raise PublicationConflict("求解记录不存在")
-            stored = ScheduleRun.model_validate_json(run_row["payload"])
+            stored = self._load_schedule_run_row(con, run_row)
             reservation_row = con.execute(
                 "SELECT payload, reservation_hash FROM planning_reservations WHERE id=?",
                 (run.reservation_id,),
@@ -4797,14 +6831,76 @@ class Store:
                 raise PublicationConflict("求解记录引用的规划预留证明失败")
             if stored.status not in {ScheduleRunStatus.queued, ScheduleRunStatus.running}:
                 if stored.candidate_id == candidate.id:
-                    existing = con.execute(
-                        "SELECT payload FROM schedule_candidates WHERE id=?", (candidate.id,)
-                    ).fetchone()
+                    existing = con.execute("SELECT * FROM schedule_candidates WHERE id=?", (candidate.id,)).fetchone()
                     if existing:
-                        return stored, ScheduleCandidate.model_validate_json(existing["payload"])
+                        return stored, self._load_schedule_candidate_row(con, existing)
                 raise PublicationConflict("求解记录已经结束，不能再次完成")
+            if stored.input_manifest is None:
+                raise PublicationConflict("求解记录缺少输入清单", code="RUN_INPUT_MANIFEST_REQUIRED")
+            if run.input_manifest != stored.input_manifest:
+                raise PublicationConflict("求解记录输入身份在运行期间发生变化")
+            target_revision = stored.target_scenario_revision or stored.scenario_revision
+            target_hash = stored.target_scenario_snapshot_hash or stored.scenario_snapshot_hash
+            if candidate.scenario_revision != target_revision or candidate.scenario_snapshot_hash != target_hash:
+                raise PublicationConflict("候选方案与求解目标快照不一致")
+            if stored.action == "restore":
+                transform = stored.restore_transform_manifest
+                if (
+                    transform is None
+                    or candidate.restore_transform_manifest != transform
+                    or transform.manifest_hash != _restore_transform_manifest_hash(transform)
+                ):
+                    raise PublicationConflict(
+                        "恢复候选缺少可信的目标变换清单",
+                        code="RESTORE_TRANSFORM_INTEGRITY_FAILED",
+                    )
+            elif candidate.restore_transform_manifest is not None:
+                raise PublicationConflict("非恢复候选不能携带恢复变换清单")
+            candidate_manifest = CandidateManifest(
+                candidate_id=candidate.id,
+                run_id=candidate.run_id,
+                run_input_manifest_hash=stored.input_manifest.manifest_hash,
+                scenario_id=candidate.scenario_id,
+                scenario_revision=candidate.scenario_revision,
+                scenario_snapshot_hash=candidate.scenario_snapshot_hash,
+                reservation_id=candidate.reservation_id or "",
+                reservation_hash=candidate.reservation_hash or "",
+                source_plan_version_id=candidate.source_plan_version_id,
+                expected_active_plan_version_id=candidate.expected_active_plan_version_id,
+                schedule_hash=content_hash(candidate.schedule),
+                verification_report_hash=content_hash(candidate.verification_report),
+                solver_policy_fingerprint=candidate.solver_policy_fingerprint,
+                publishable=candidate.publishable,
+                restore_transform_manifest_hash=(
+                    candidate.restore_transform_manifest.manifest_hash if candidate.restore_transform_manifest else None
+                ),
+            )
+            candidate_manifest.manifest_hash = _candidate_manifest_hash(candidate_manifest)
+            candidate.candidate_manifest = candidate_manifest
+            if not run.finished_at:
+                raise PublicationConflict("终态求解记录缺少完成时间")
+            result_manifest = RunResultManifest(
+                run_id=run.id,
+                status=run.status,
+                termination_reason=run.termination_reason,
+                solution_found=run.solution_found,
+                candidate_id=candidate.id,
+                candidate_manifest_hash=candidate_manifest.manifest_hash,
+                solver_name=run.solver_name,
+                solver_version=run.solver_version,
+                solver_policy_fingerprint=run.solver_policy_fingerprint,
+                planning_context_hash=run.planning_context_hash,
+                finished_at=run.finished_at,
+            )
+            result_manifest.manifest_hash = _run_result_manifest_hash(result_manifest)
+            run.result_manifest = result_manifest
             con.execute(
-                "INSERT INTO schedule_candidates(id, run_id, scenario_id, publishable, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO schedule_candidates("
+                "id, run_id, scenario_id, publishable, payload, created_at, candidate_manifest_hash, "
+                "scenario_revision, scenario_snapshot_hash, reservation_id, reservation_hash, "
+                "source_plan_version_id, expected_active_plan_version_id, schedule_hash, "
+                "verification_report_hash, solver_policy_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     candidate.id,
                     candidate.run_id,
@@ -4812,11 +6908,21 @@ class Store:
                     int(candidate.publishable),
                     candidate.model_dump_json(),
                     candidate.created_at,
+                    candidate_manifest.manifest_hash,
+                    candidate.scenario_revision,
+                    candidate.scenario_snapshot_hash,
+                    candidate.reservation_id,
+                    candidate.reservation_hash,
+                    candidate.source_plan_version_id,
+                    candidate.expected_active_plan_version_id,
+                    candidate_manifest.schedule_hash,
+                    candidate_manifest.verification_report_hash,
+                    candidate.solver_policy_fingerprint,
                 ),
             )
             con.execute(
-                "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
-                (run.status.value, run.model_dump_json(), run.id),
+                "UPDATE schedule_runs SET status=?, payload=?, result_manifest_hash=?, candidate_id=? WHERE id=?",
+                (run.status.value, run.model_dump_json(), result_manifest.manifest_hash, candidate.id, run.id),
             )
         return run, candidate
 
@@ -4824,18 +6930,22 @@ class Store:
         malformed: DecisionAnalysisIntegrityError | None = None
         run: ScheduleRun | None = None
         with self._lock, self._connect() as con:
-            row = con.execute("SELECT id, payload FROM schedule_runs WHERE id=?", (run_id,)).fetchone()
+            row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (run_id,)).fetchone()
             if row:
                 try:
-                    run = ScheduleRun.model_validate_json(row["payload"])
-                except (TypeError, ValueError):
+                    run = self._load_schedule_run_row(con, row)
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError) as error:
                     self._record_read_isolation(
                         con, "schedule_runs", str(row["id"]), str(row["payload"]), "read isolation: malformed run"
                     )
-                    malformed = DecisionAnalysisIntegrityError(
-                        "求解记录无法解析，已隔离原始证据",
-                        record_id=str(row["id"]),
-                        record_type="SCHEDULE_RUN",
+                    malformed = (
+                        error
+                        if isinstance(error, DecisionAnalysisIntegrityError)
+                        else DecisionAnalysisIntegrityError(
+                            "求解记录无法解析，已隔离原始证据",
+                            record_id=str(row["id"]),
+                            record_type="SCHEDULE_RUN",
+                        )
                     )
         if malformed:
             raise malformed
@@ -4845,12 +6955,12 @@ class Store:
         runs: list[ScheduleRun] = []
         with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT id, payload FROM schedule_runs WHERE scenario_id=? ORDER BY created_at", (scenario_id,)
+                "SELECT * FROM schedule_runs WHERE scenario_id=? ORDER BY created_at", (scenario_id,)
             ).fetchall()
             for row in rows:
                 try:
-                    runs.append(ScheduleRun.model_validate_json(row["payload"]))
-                except (TypeError, ValueError):
+                    runs.append(self._load_schedule_run_row(con, row))
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError):
                     self._record_read_isolation(
                         con, "schedule_runs", str(row["id"]), str(row["payload"]), "read isolation: malformed run"
                     )
@@ -4858,14 +6968,45 @@ class Store:
 
     def save_schedule_candidate(self, candidate: ScheduleCandidate) -> ScheduleCandidate:
         with self._lock, self._connect() as con:
-            existing = con.execute("SELECT payload FROM schedule_candidates WHERE id=?", (candidate.id,)).fetchone()
+            existing = con.execute("SELECT * FROM schedule_candidates WHERE id=?", (candidate.id,)).fetchone()
             if existing:
-                stored = ScheduleCandidate.model_validate_json(existing["payload"])
+                stored = self._load_schedule_candidate_row(con, existing)
                 if stored.model_dump(mode="json") != candidate.model_dump(mode="json"):
                     raise PublicationConflict("已保存的求解候选不可修改")
                 return stored
+            run_row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (candidate.run_id,)).fetchone()
+            if not run_row:
+                raise PublicationConflict("候选方案引用的求解记录不存在")
+            run = self._load_schedule_run_row(con, run_row)
+            if run.input_manifest is None:
+                raise PublicationConflict("求解记录缺少输入清单")
+            manifest = CandidateManifest(
+                candidate_id=candidate.id,
+                run_id=candidate.run_id,
+                run_input_manifest_hash=run.input_manifest.manifest_hash,
+                scenario_id=candidate.scenario_id,
+                scenario_revision=candidate.scenario_revision,
+                scenario_snapshot_hash=candidate.scenario_snapshot_hash,
+                reservation_id=candidate.reservation_id or "",
+                reservation_hash=candidate.reservation_hash or "",
+                source_plan_version_id=candidate.source_plan_version_id,
+                expected_active_plan_version_id=candidate.expected_active_plan_version_id,
+                schedule_hash=content_hash(candidate.schedule),
+                verification_report_hash=content_hash(candidate.verification_report),
+                solver_policy_fingerprint=candidate.solver_policy_fingerprint,
+                publishable=candidate.publishable,
+                restore_transform_manifest_hash=(
+                    candidate.restore_transform_manifest.manifest_hash if candidate.restore_transform_manifest else None
+                ),
+            )
+            manifest.manifest_hash = _candidate_manifest_hash(manifest)
+            candidate.candidate_manifest = manifest
             con.execute(
-                "INSERT INTO schedule_candidates(id, run_id, scenario_id, publishable, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO schedule_candidates("
+                "id, run_id, scenario_id, publishable, payload, created_at, candidate_manifest_hash, "
+                "scenario_revision, scenario_snapshot_hash, reservation_id, reservation_hash, "
+                "source_plan_version_id, expected_active_plan_version_id, schedule_hash, "
+                "verification_report_hash, solver_policy_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     candidate.id,
                     candidate.run_id,
@@ -4873,6 +7014,16 @@ class Store:
                     int(candidate.publishable),
                     candidate.model_dump_json(),
                     candidate.created_at,
+                    manifest.manifest_hash,
+                    candidate.scenario_revision,
+                    candidate.scenario_snapshot_hash,
+                    candidate.reservation_id,
+                    candidate.reservation_hash,
+                    candidate.source_plan_version_id,
+                    candidate.expected_active_plan_version_id,
+                    manifest.schedule_hash,
+                    manifest.verification_report_hash,
+                    candidate.solver_policy_fingerprint,
                 ),
             )
         return candidate
@@ -4881,11 +7032,11 @@ class Store:
         malformed: DecisionAnalysisIntegrityError | None = None
         candidate: ScheduleCandidate | None = None
         with self._lock, self._connect() as con:
-            row = con.execute("SELECT id, payload FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
+            row = con.execute("SELECT * FROM schedule_candidates WHERE id=?", (candidate_id,)).fetchone()
             if row:
                 try:
-                    candidate = ScheduleCandidate.model_validate_json(row["payload"])
-                except (TypeError, ValueError):
+                    candidate = self._load_schedule_candidate_row(con, row)
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError) as error:
                     self._record_read_isolation(
                         con,
                         "schedule_candidates",
@@ -4893,10 +7044,14 @@ class Store:
                         str(row["payload"]),
                         "read isolation: malformed candidate",
                     )
-                    malformed = DecisionAnalysisIntegrityError(
-                        "候选方案记录无法解析，已隔离原始证据",
-                        record_id=str(row["id"]),
-                        record_type="SCHEDULE_CANDIDATE",
+                    malformed = (
+                        error
+                        if isinstance(error, DecisionAnalysisIntegrityError)
+                        else DecisionAnalysisIntegrityError(
+                            "候选方案记录无法解析，已隔离原始证据",
+                            record_id=str(row["id"]),
+                            record_type="SCHEDULE_CANDIDATE",
+                        )
                     )
         if malformed:
             raise malformed
@@ -5040,6 +7195,8 @@ class Store:
                 artifacts = []
             artifact_manifest: list[dict[str, str]] = []
             for artifact in artifacts or []:
+                if isinstance(artifact, CapacityCounterfactualArtifact) and not _capacity_cost_closure_valid(artifact):
+                    raise PublicationConflict("容量反事实证据缺少自包含的成本账本")
                 expected_artifact_hash = content_hash(_artifact_hash_payload(artifact))
                 if artifact.artifact_hash != expected_artifact_hash:
                     raise PublicationConflict("容量反事实证据指纹不一致")
@@ -5092,11 +7249,14 @@ class Store:
             for artifact in artifacts or []:
                 if artifact.analysis_run_id != run.id or artifact.scenario_id != run.scenario_id:
                     raise PublicationConflict("容量反事实证据与经营分析不一致")
+                artifact_payload = artifact.model_dump_json()
+                artifact_blob_hash = _store_artifact_blob(con, artifact_payload)
                 con.execute(
                     """
                     INSERT INTO decision_analysis_artifacts(
-                        id, scenario_id, analysis_run_id, option_id, attestation_requirement, payload, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        id, scenario_id, analysis_run_id, option_id, attestation_requirement,
+                        payload, artifact_blob_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         artifact.id,
@@ -5110,11 +7270,31 @@ class Store:
                             else "TRIAL_OUTCOMES"
                         ),
                         AttestationRequirement.required.value,
-                        artifact.model_dump_json(),
+                        _artifact_blob_reference(artifact_blob_hash),
+                        artifact_blob_hash,
                         artifact.created_at,
                     ),
                 )
         return run
+
+    def interrupt_decision_analysis_run(
+        self,
+        scenario_id: str,
+        analysis_id: str,
+        *,
+        code: str,
+        message: str,
+        failure_stage: str,
+    ) -> DecisionAnalysisRun | None:
+        run = self.get_decision_analysis_run(scenario_id, analysis_id)
+        if run is None or run.status != "RUNNING":
+            return run
+        interrupted = run.model_copy(deep=True)
+        interrupted.status = "INTERRUPTED"
+        interrupted.result = None
+        interrupted.error = {"code": code, "message": message, "failure_stage": failure_stage}
+        interrupted.finished_at = _now()
+        return self.finish_decision_analysis_run(interrupted)
 
     @classmethod
     def _validate_decision_analysis_integrity(
@@ -5247,13 +7427,14 @@ class Store:
             ):
                 return _failed_integrity_copy(checked, "failure manifest mismatch")
         artifact_rows = con.execute(
-            "SELECT id, payload, attestation_requirement FROM decision_analysis_artifacts WHERE analysis_run_id=?",
+            "SELECT id, payload, artifact_blob_hash, attestation_requirement "
+            "FROM decision_analysis_artifacts WHERE analysis_run_id=?",
             (checked.id,),
         ).fetchall()
         actual_artifacts: dict[str, str] = {}
         for row in artifact_rows:
             try:
-                artifact = _parse_decision_artifact(json.loads(row["payload"]))
+                artifact = _parse_decision_artifact(json.loads(_load_artifact_payload(con, row)))
             except (TypeError, ValueError, json.JSONDecodeError):
                 return _failed_integrity_copy(checked, f"artifact {row['id']} is malformed")
             artifact.attestation_requirement = AttestationRequirement(row["attestation_requirement"])
@@ -5265,6 +7446,8 @@ class Store:
                 or artifact.scenario_id != checked.scenario_id
             ):
                 return _failed_integrity_copy(checked, f"artifact {row['id']} relational identity mismatch")
+            if isinstance(artifact, CapacityCounterfactualArtifact) and not _capacity_cost_closure_valid(artifact):
+                return _failed_integrity_copy(checked, f"artifact {row['id']} cost ledger mismatch")
             expected = content_hash(_artifact_hash_payload(artifact))
             if artifact.artifact_hash != expected:
                 return _failed_integrity_copy(checked, f"artifact {row['id']} hash mismatch")
@@ -5371,7 +7554,7 @@ class Store:
         parent: DecisionAnalysisRun,
     ) -> DecisionAnalysisArtifact:
         try:
-            artifact = _parse_decision_artifact(json.loads(row["payload"]))
+            artifact = _parse_decision_artifact(json.loads(_load_artifact_payload(con, row)))
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise DecisionAnalysisIntegrityError(
                 "经营分析证据无法解析",
@@ -5384,6 +7567,8 @@ class Store:
             and artifact.scenario_id == row["scenario_id"]
             and artifact.analysis_run_id == row["analysis_run_id"]
         )
+        if isinstance(artifact, CapacityCounterfactualArtifact) and not _capacity_cost_closure_valid(artifact):
+            relation_valid = False
         expected_hash = content_hash(_artifact_hash_payload(artifact))
         artifact.self_integrity = (
             AnalysisIntegrityStatus.legacy_unattested
@@ -5419,7 +7604,7 @@ class Store:
             parent = self._load_analysis_row(con, parent_row)
             rows = con.execute(
                 """
-                SELECT id, scenario_id, analysis_run_id, payload, attestation_requirement
+                SELECT id, scenario_id, analysis_run_id, payload, artifact_blob_hash, attestation_requirement
                 FROM decision_analysis_artifacts
                 WHERE scenario_id=? AND analysis_run_id=? ORDER BY option_id
                 """,
@@ -5447,7 +7632,7 @@ class Store:
             parent = self._load_analysis_row(con, parent_row)
             row = con.execute(
                 """
-                SELECT id, scenario_id, analysis_run_id, payload, attestation_requirement
+                SELECT id, scenario_id, analysis_run_id, payload, artifact_blob_hash, attestation_requirement
                 FROM decision_analysis_artifacts
                 WHERE scenario_id=? AND analysis_run_id=? AND id=?
                 """,
@@ -5501,7 +7686,7 @@ class Store:
             for artifact_id, artifact_hash in ((trial_id, trial_hash), (scenario_id, scenario_hash)):
                 artifact_row = con.execute(
                     """
-                    SELECT id, scenario_id, analysis_run_id, payload, attestation_requirement
+                    SELECT id, scenario_id, analysis_run_id, payload, artifact_blob_hash, attestation_requirement
                     FROM decision_analysis_artifacts
                     WHERE scenario_id=? AND analysis_run_id=? AND id=?
                     """,
@@ -5514,6 +7699,169 @@ class Store:
                 if artifact.artifact_hash != artifact_hash:
                     return AnalysisIntegrityStatus.failed
         return _effective_integrity(*dependencies) if dependencies else AnalysisIntegrityStatus.failed
+
+    @staticmethod
+    def _risk_comparison_saga_input_hash(
+        scenario_id: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+        before_plan_version_id: str,
+        after_plan_version_id: str,
+    ) -> str:
+        return content_hash(
+            {
+                "policy_version": "FIELD_SERVICE_RISK_COMPARISON_SAGA_V1",
+                "scenario_id": scenario_id,
+                "idempotency_key": idempotency_key,
+                "request_fingerprint": request_fingerprint,
+                "before_plan_version_id": before_plan_version_id,
+                "after_plan_version_id": after_plan_version_id,
+            }
+        )
+
+    @classmethod
+    def _load_risk_comparison_saga_row(cls, row: sqlite3.Row) -> RiskComparisonSaga:
+        try:
+            saga = RiskComparisonSaga.model_validate_json(row["payload"])
+            expected_hash = cls._risk_comparison_saga_input_hash(
+                saga.scenario_id,
+                saga.idempotency_key,
+                saga.request_fingerprint,
+                saga.before_plan_version_id,
+                saga.after_plan_version_id,
+            )
+            if (
+                saga.id != row["id"]
+                or saga.scenario_id != row["scenario_id"]
+                or saga.idempotency_key != row["idempotency_key"]
+                or saga.request_fingerprint != row["request_fingerprint"]
+                or saga.status != row["status"]
+                or saga.input_manifest_hash != row["input_manifest_hash"]
+                or saga.input_manifest_hash != expected_hash
+                or saga.before_analysis_id != row["before_analysis_id"]
+                or saga.after_analysis_id != row["after_analysis_id"]
+                or saga.comparison_id != row["comparison_id"]
+                or saga.created_at != row["created_at"]
+                or saga.updated_at != row["updated_at"]
+            ):
+                raise ValueError("risk comparison saga identity mismatch")
+            return saga
+        except (TypeError, ValueError) as error:
+            raise DecisionAnalysisIntegrityError(
+                "风险比较 Saga 完整性校验失败",
+                record_id=str(row["id"]),
+                record_type="RISK_COMPARISON_SAGA",
+            ) from error
+
+    def reserve_risk_comparison_saga(
+        self,
+        *,
+        scenario_id: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+        before_plan_version_id: str,
+        after_plan_version_id: str,
+    ) -> tuple[RiskComparisonSaga, bool]:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT * FROM risk_comparison_sagas WHERE scenario_id=? AND idempotency_key=?",
+                (scenario_id, idempotency_key),
+            ).fetchone()
+            if row:
+                saga = self._load_risk_comparison_saga_row(row)
+                if saga.request_fingerprint != request_fingerprint:
+                    raise PublicationConflict("风险比较幂等键对应了不同请求", code="IDEMPOTENCY_KEY_REUSED")
+                return saga, False
+            now = _now()
+            input_hash = self._risk_comparison_saga_input_hash(
+                scenario_id,
+                idempotency_key,
+                request_fingerprint,
+                before_plan_version_id,
+                after_plan_version_id,
+            )
+            saga = RiskComparisonSaga(
+                id=f"RCS-{uuid.uuid4().hex[:14]}",
+                scenario_id=scenario_id,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                before_plan_version_id=before_plan_version_id,
+                after_plan_version_id=after_plan_version_id,
+                input_manifest_hash=input_hash,
+                created_at=now,
+                updated_at=now,
+            )
+            con.execute(
+                "INSERT INTO risk_comparison_sagas(id, scenario_id, idempotency_key, request_fingerprint, status, "
+                "input_manifest_hash, before_analysis_id, after_analysis_id, comparison_id, payload, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)",
+                (
+                    saga.id,
+                    saga.scenario_id,
+                    saga.idempotency_key,
+                    saga.request_fingerprint,
+                    saga.status,
+                    saga.input_manifest_hash,
+                    saga.model_dump_json(),
+                    saga.created_at,
+                    saga.updated_at,
+                ),
+            )
+            return saga, True
+
+    def update_risk_comparison_saga(
+        self,
+        saga_id: str,
+        *,
+        status: Literal[
+            "RESERVED",
+            "BEFORE_COMPLETED",
+            "AFTER_COMPLETED",
+            "COMPARISON_COMPLETED",
+            "FAILED",
+        ],
+        before_analysis_id: str | None = None,
+        after_analysis_id: str | None = None,
+        comparison_id: str | None = None,
+        error: dict | None = None,
+    ) -> RiskComparisonSaga:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT * FROM risk_comparison_sagas WHERE id=?", (saga_id,)).fetchone()
+            if not row:
+                raise KeyError(saga_id)
+            saga = self._load_risk_comparison_saga_row(row)
+            if saga.status == "COMPARISON_COMPLETED":
+                return saga
+            saga.status = status
+            saga.before_analysis_id = before_analysis_id or saga.before_analysis_id
+            saga.after_analysis_id = after_analysis_id or saga.after_analysis_id
+            saga.comparison_id = comparison_id or saga.comparison_id
+            saga.error = error
+            saga.updated_at = _now()
+            con.execute(
+                "UPDATE risk_comparison_sagas SET status=?, before_analysis_id=?, after_analysis_id=?, "
+                "comparison_id=?, payload=?, updated_at=? WHERE id=?",
+                (
+                    saga.status,
+                    saga.before_analysis_id,
+                    saga.after_analysis_id,
+                    saga.comparison_id,
+                    saga.model_dump_json(),
+                    saga.updated_at,
+                    saga.id,
+                ),
+            )
+            return saga
+
+    def get_risk_comparison_saga(self, scenario_id: str, saga_id: str) -> RiskComparisonSaga | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM risk_comparison_sagas WHERE scenario_id=? AND id=?",
+                (scenario_id, saga_id),
+            ).fetchone()
+            return self._load_risk_comparison_saga_row(row) if row else None
 
     def save_risk_comparison(
         self,
@@ -5785,14 +8133,118 @@ class Store:
             else None
         )
 
-    def operational_view(self, scenario_id: str) -> ScenarioOperationalView:
+    def _operational_view_in_transaction(
+        self,
+        con: sqlite3.Connection,
+        scenario: ScheduleScenario,
+        plan: PlanVersion | None,
+        execution_context: ExecutionSourceContext,
+    ) -> ScenarioOperationalView:
+        assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
+        unassigned = {item.work_order_id: item for item in plan.selected.unassigned} if plan else {}
+        invalid = set(plan.applicability.blocked_start_assignment_ids) if plan else set()
+        work_order_views: list[OperationalWorkOrderView] = []
+        for order in scenario.work_orders:
+            assignment = assignments.get(order.id)
+            start_blocking_reason: str | None = None
+            complete_blocking_reason: str | None = "WORK_ORDER_NOT_STARTED"
+            complete_allowed = False
+            if order.status is WorkOrderStatus.completed:
+                disposition = CurrentWorkOrderDisposition.completed
+                start_blocking_reason = "WORK_ORDER_ALREADY_COMPLETED"
+                complete_blocking_reason = "WORK_ORDER_ALREADY_COMPLETED"
+            elif order.status is WorkOrderStatus.started:
+                disposition = CurrentWorkOrderDisposition.started
+                start_blocking_reason = "WORK_ORDER_ALREADY_STARTED"
+                start_row = con.execute(
+                    "SELECT * FROM work_order_execution_events "
+                    "WHERE scenario_id=? AND work_order_id=? AND action='start' ORDER BY sequence DESC LIMIT 1",
+                    (scenario.id, order.id),
+                ).fetchone()
+                complete_row = con.execute(
+                    "SELECT id FROM work_order_execution_events "
+                    "WHERE scenario_id=? AND work_order_id=? AND action='complete' LIMIT 1",
+                    (scenario.id, order.id),
+                ).fetchone()
+                if not start_row:
+                    complete_blocking_reason = "VERIFIED_START_EVENT_REQUIRED"
+                elif complete_row:
+                    complete_blocking_reason = "DUPLICATE_COMPLETE_EVENT"
+                else:
+                    self._load_execution_event_row(con, start_row)
+                    complete_allowed = True
+                    complete_blocking_reason = None
+            elif order.id in invalid:
+                disposition = CurrentWorkOrderDisposition.assigned_invalid
+                start_blocking_reason = "INVALID_ASSIGNMENT_CANNOT_START"
+            elif assignment is not None:
+                disposition = CurrentWorkOrderDisposition.assigned_valid
+            elif order.id in unassigned:
+                disposition = CurrentWorkOrderDisposition.plan_unassigned
+                start_blocking_reason = unassigned[order.id].reason.value
+            else:
+                disposition = CurrentWorkOrderDisposition.new_uncovered
+                start_blocking_reason = "NEW_DEMAND_NOT_IN_ACTIVE_PLAN" if plan else "NO_ACTIVE_PLAN"
+            start_allowed = disposition is CurrentWorkOrderDisposition.assigned_valid
+            work_order_views.append(
+                OperationalWorkOrderView(
+                    work_order_id=order.id,
+                    disposition=disposition,
+                    assignment=assignment,
+                    start_allowed=start_allowed,
+                    complete_allowed=complete_allowed,
+                    start_blocking_reason_code=start_blocking_reason,
+                    complete_blocking_reason_code=complete_blocking_reason,
+                    blocking_reason_code=start_blocking_reason,
+                )
+            )
+        active_views = [
+            item for item in work_order_views if item.disposition is not CurrentWorkOrderDisposition.completed
+        ]
+        valid_assigned_count = sum(
+            item.disposition in {CurrentWorkOrderDisposition.assigned_valid, CurrentWorkOrderDisposition.started}
+            for item in active_views
+        )
+        active_demand_count = len(active_views)
+        metrics = OperationalMetrics(
+            active_demand_count=active_demand_count,
+            valid_assigned_count=valid_assigned_count,
+            invalid_assignment_count=sum(
+                item.disposition is CurrentWorkOrderDisposition.assigned_invalid for item in active_views
+            ),
+            plan_unassigned_count=sum(
+                item.disposition is CurrentWorkOrderDisposition.plan_unassigned for item in active_views
+            ),
+            new_uncovered_count=sum(
+                item.disposition is CurrentWorkOrderDisposition.new_uncovered for item in active_views
+            ),
+            current_actionable_coverage_rate=(
+                valid_assigned_count / active_demand_count if active_demand_count else 1.0
+            ),
+        )
+        execution_context_hash = content_hash(execution_context)
+        return ScenarioOperationalView(
+            scenario_id=scenario.id,
+            scenario_revision=scenario.revision,
+            scenario_snapshot_hash=content_hash(scenario),
+            active_plan_version_id=plan.id if plan else None,
+            plan_applicability=plan.applicability if plan else None,
+            execution_watermark=execution_context.execution_event_sequence,
+            execution_context_hash=execution_context_hash,
+            execution_integrity=AnalysisIntegrityStatus.verified,
+            work_orders=work_order_views,
+            current_metrics=metrics,
+        )
+
+    def dispatch_snapshot(self, scenario_id: str) -> DispatchSnapshot:
         with self._lock, self._connect() as con:
+            con.execute("BEGIN")
             scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
             if not scenario_row:
                 raise KeyError(f"scenario {scenario_id} not found")
             scenario = self._load_scenario_head_row(con, scenario_row)
             plan: PlanVersion | None = None
-            active_plan_id = scenario_row["active_plan_version_id"]
+            active_plan_id = str(scenario_row["active_plan_version_id"] or "")
             if active_plan_id:
                 plan_row = con.execute(
                     "SELECT id, scenario_id, number, created_at, payload, attestation_requirement "
@@ -5802,77 +8254,68 @@ class Store:
                 if not plan_row:
                     raise DecisionAnalysisIntegrityError(
                         "活动方案记录不存在",
-                        record_id=str(active_plan_id),
+                        record_id=active_plan_id,
                         record_type="PLAN_VERSION",
                     )
                 plan = self._load_plan_row(con, plan_row)
                 self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
-            assignments = {item.work_order_id: item for item in plan.selected.assignments} if plan else {}
-            unassigned = {item.work_order_id: item for item in plan.selected.unassigned} if plan else {}
-            invalid = set(plan.applicability.invalid_assignment_ids) if plan else set()
-            work_order_views: list[OperationalWorkOrderView] = []
-            for order in scenario.work_orders:
-                assignment = assignments.get(order.id)
-                blocking_reason: str | None = None
-                if order.status is WorkOrderStatus.completed:
-                    disposition = CurrentWorkOrderDisposition.completed
-                    blocking_reason = "WORK_ORDER_ALREADY_COMPLETED"
-                elif order.status is WorkOrderStatus.started:
-                    disposition = CurrentWorkOrderDisposition.started
-                    blocking_reason = "WORK_ORDER_ALREADY_STARTED"
-                elif order.id in invalid:
-                    disposition = CurrentWorkOrderDisposition.assigned_invalid
-                    blocking_reason = "INVALID_ASSIGNMENT_CANNOT_START"
-                elif assignment is not None:
-                    disposition = CurrentWorkOrderDisposition.assigned_valid
-                elif order.id in unassigned:
-                    disposition = CurrentWorkOrderDisposition.plan_unassigned
-                    blocking_reason = unassigned[order.id].reason.value
-                else:
-                    disposition = CurrentWorkOrderDisposition.new_uncovered
-                    blocking_reason = "NEW_DEMAND_NOT_IN_ACTIVE_PLAN" if plan else "NO_ACTIVE_PLAN"
-                work_order_views.append(
-                    OperationalWorkOrderView(
-                        work_order_id=order.id,
-                        disposition=disposition,
-                        assignment=assignment,
-                        start_allowed=disposition is CurrentWorkOrderDisposition.assigned_valid,
-                        blocking_reason_code=blocking_reason,
-                    )
-                )
-            active_views = [
-                item for item in work_order_views if item.disposition is not CurrentWorkOrderDisposition.completed
-            ]
-            valid_assigned_count = sum(
-                item.disposition in {CurrentWorkOrderDisposition.assigned_valid, CurrentWorkOrderDisposition.started}
-                for item in active_views
+            execution_context = self._execution_source_context(con, scenario, active_plan_id or None)
+            operational = self._operational_view_in_transaction(con, scenario, plan, execution_context)
+            revision_rows = con.execute(
+                "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
+                (scenario_id,),
+            ).fetchall()
+            revision_history_issue_count = 0
+            expected_number = 0
+            previous_hash: str | None = None
+            for revision_row in revision_rows:
+                try:
+                    if int(revision_row["number"]) != expected_number:
+                        raise ValueError("revision sequence gap")
+                    revision = self._load_revision_row(con, revision_row, previous_hash)
+                    previous_hash = revision.revision_hash
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError):
+                    revision_history_issue_count += 1
+                    previous_hash = None
+                expected_number += 1
+            if len(revision_rows) != scenario.revision + 1:
+                revision_history_issue_count += abs(len(revision_rows) - (scenario.revision + 1)) or 1
+            revision_history_integrity = (
+                AnalysisIntegrityStatus.verified
+                if revision_history_issue_count == 0
+                else AnalysisIntegrityStatus.failed
             )
-            active_demand_count = len(active_views)
-            metrics = OperationalMetrics(
-                active_demand_count=active_demand_count,
-                valid_assigned_count=valid_assigned_count,
-                invalid_assignment_count=sum(
-                    item.disposition is CurrentWorkOrderDisposition.assigned_invalid for item in active_views
-                ),
-                plan_unassigned_count=sum(
-                    item.disposition is CurrentWorkOrderDisposition.plan_unassigned for item in active_views
-                ),
-                new_uncovered_count=sum(
-                    item.disposition is CurrentWorkOrderDisposition.new_uncovered for item in active_views
-                ),
-                current_actionable_coverage_rate=(
-                    valid_assigned_count / active_demand_count if active_demand_count else 1.0
-                ),
+            token_payload = {
+                "scenario_id": scenario.id,
+                "scenario_revision": scenario.revision,
+                "scenario_snapshot_hash": str(scenario_row["current_snapshot_hash"]),
+                "latest_revision_hash": str(scenario_row["latest_revision_hash"]),
+                "active_plan_version_id": plan.id if plan else None,
+                "active_plan_manifest_hash": plan.publication_manifest_hash if plan else None,
+                "applicability_projection_hash": plan.applicability.projection_hash if plan else None,
+                "execution_watermark": execution_context.execution_event_sequence,
+                "execution_context_hash": operational.execution_context_hash,
+                "revision_head_integrity": AnalysisIntegrityStatus.verified.value,
+                "revision_history_integrity": revision_history_integrity.value,
+                "revision_history_issue_count": revision_history_issue_count,
+            }
+            return DispatchSnapshot(
+                scenario=scenario,
+                scenario_head_snapshot_hash=str(scenario_row["current_snapshot_hash"]),
+                latest_revision_hash=str(scenario_row["latest_revision_hash"]),
+                scenario_proof_origin=RevisionProofOrigin(str(scenario_row["proof_origin"])),
+                revision_head_integrity=AnalysisIntegrityStatus.verified,
+                revision_history_integrity=revision_history_integrity,
+                revision_history_issue_count=revision_history_issue_count,
+                active_plan=plan,
+                operational_view=operational,
+                execution_watermark=execution_context.execution_event_sequence,
+                execution_context_hash=operational.execution_context_hash,
+                snapshot_token=content_hash(token_payload),
             )
-            return ScenarioOperationalView(
-                scenario_id=scenario.id,
-                scenario_revision=scenario.revision,
-                scenario_snapshot_hash=content_hash(scenario),
-                active_plan_version_id=plan.id if plan else None,
-                plan_applicability=plan.applicability if plan else None,
-                work_orders=work_order_views,
-                current_metrics=metrics,
-            )
+
+    def operational_view(self, scenario_id: str) -> ScenarioOperationalView:
+        return self.dispatch_snapshot(scenario_id).operational_view
 
     def latest_plan_version(self, scenario_id: str) -> PlanVersion | None:
         with self._connect() as con:
@@ -5995,9 +8438,18 @@ class Store:
                 artifact = ScheduleArtifact(
                     id=candidate.id, role="candidate", strategy=candidate.profile_id, schedule=candidate.schedule
                 )
+                artifact_payload = artifact.model_dump_json()
+                artifact_blob_hash = _store_artifact_blob(con, artifact_payload)
                 con.execute(
-                    "INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) VALUES (?, NULL, ?, 'candidate', ?, ?)",
-                    (artifact.id, experiment.id, artifact.model_dump_json(), experiment.created_at),
+                    "INSERT OR REPLACE INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, "
+                    "artifact_blob_hash, created_at) VALUES (?, NULL, ?, 'candidate', ?, ?, ?)",
+                    (
+                        artifact.id,
+                        experiment.id,
+                        _artifact_blob_reference(artifact_blob_hash),
+                        artifact_blob_hash,
+                        experiment.created_at,
+                    ),
                 )
 
     def queue_experiment(self, experiment: StrategyExperiment) -> tuple[StrategyExperiment, bool]:
@@ -6019,6 +8471,18 @@ class Store:
             con.execute(
                 "INSERT INTO strategy_experiments(id, scenario_id, payload, created_at) VALUES (?, ?, ?, ?)",
                 (experiment.id, experiment.scenario_id, experiment.model_dump_json(), experiment.created_at),
+            )
+            self._insert_runtime_job(
+                con,
+                job_type="STRATEGY_EXPERIMENT",
+                scenario_id=experiment.scenario_id,
+                input_payload={
+                    "experiment_id": experiment.id,
+                    "time_limit_seconds": experiment.requested_time_limit_seconds,
+                    "experiment_fingerprint": experiment.fingerprint,
+                },
+                dedupe_key=experiment.fingerprint,
+                job_id=f"JOB-EXP-{experiment.id}",
             )
             return experiment, True
 
@@ -6068,10 +8532,90 @@ class Store:
                 return None
             experiment = StrategyExperiment.model_validate_json(row["payload"])
             if experiment.status in {"QUEUED", "RUNNING"}:
-                experiment.status = "CANCEL_REQUESTED"
                 experiment.cancel_requested_at = _now()
+                if experiment.status == "QUEUED":
+                    experiment.status = "CANCELLED"
+                    experiment.error = "实验已在开始前取消"
+                    experiment.progress = 100
+                    experiment.finished_at = experiment.cancel_requested_at
+                else:
+                    experiment.status = "CANCEL_REQUESTED"
                 con.execute(
                     "UPDATE strategy_experiments SET payload=? WHERE id=?",
                     (experiment.model_dump_json(), experiment.id),
                 )
+                job_row = con.execute(
+                    "SELECT * FROM runtime_jobs WHERE id=?",
+                    (f"JOB-EXP-{experiment.id}",),
+                ).fetchone()
+                if job_row:
+                    job = self._load_runtime_job_row(job_row)
+                    if job.status is RuntimeJobStatus.queued:
+                        job.status = RuntimeJobStatus.cancelled
+                        job.progress = 100
+                        job.finished_at = experiment.cancel_requested_at
+                    elif job.status is RuntimeJobStatus.running:
+                        job.status = RuntimeJobStatus.cancel_requested
+                    job.updated_at = experiment.cancel_requested_at or _now()
+                    con.execute(
+                        "UPDATE runtime_jobs SET status=?, progress=?, payload=?, updated_at=?, finished_at=? "
+                        "WHERE id=?",
+                        (
+                            job.status.value,
+                            job.progress,
+                            job.model_dump_json(),
+                            job.updated_at,
+                            job.finished_at,
+                            job.id,
+                        ),
+                    )
             return experiment
+
+    def artifact_blob_stats(self) -> dict[str, int]:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS blob_count, COALESCE(SUM(uncompressed_size), 0) AS uncompressed_bytes, "
+                "COALESCE(SUM(length(compressed_payload)), 0) AS compressed_bytes FROM artifact_blobs"
+            ).fetchone()
+            referenced = con.execute(
+                "SELECT COUNT(DISTINCT artifact_blob_hash) FROM ("
+                "SELECT artifact_blob_hash FROM decision_analysis_artifacts WHERE artifact_blob_hash IS NOT NULL "
+                "UNION ALL SELECT artifact_blob_hash FROM schedule_artifacts WHERE artifact_blob_hash IS NOT NULL)"
+            ).fetchone()[0]
+            return {
+                "blob_count": int(row["blob_count"]),
+                "referenced_blob_count": int(referenced),
+                "uncompressed_bytes": int(row["uncompressed_bytes"]),
+                "compressed_bytes": int(row["compressed_bytes"]),
+            }
+
+    def export_artifact_blob(self, blob_hash: str) -> bytes:
+        with self._connect() as con:
+            return _read_artifact_blob(con, blob_hash)
+
+    def prune_artifact_blobs(self, *, retention_days: int, apply: bool = False) -> list[str]:
+        if retention_days < 0:
+            raise ValueError("retention_days must be non-negative")
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                "SELECT content_hash FROM artifact_blobs b WHERE b.created_at < ? "
+                "AND NOT EXISTS (SELECT 1 FROM decision_analysis_artifacts a "
+                "WHERE a.artifact_blob_hash=b.content_hash) "
+                "AND NOT EXISTS (SELECT 1 FROM schedule_artifacts a WHERE a.artifact_blob_hash=b.content_hash) "
+                "ORDER BY content_hash",
+                (cutoff,),
+            ).fetchall()
+            hashes = [str(row["content_hash"]) for row in rows]
+            if apply and hashes:
+                con.executemany("DELETE FROM artifact_blobs WHERE content_hash=?", ((item,) for item in hashes))
+            return hashes
+
+    def vacuum_artifact_storage(self) -> None:
+        with self._lock:
+            con = sqlite3.connect(self.path, timeout=30)
+            try:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                con.execute("VACUUM")
+            finally:
+                con.close()

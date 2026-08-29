@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "fieldflow-local"
 dynamic = ["version"]
 description = "Local field-service scheduling with FastAPI and React"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 classifiers = [
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
@@ -30,9 +30,20 @@ dev = [
   "pip-audit==2.10.1",
 ]
 
+[project.scripts]
+fieldflow = "backend.cli:main"
+
 [tool.pyright]
 include = ["backend", "scripts"]
-strict = ["backend/hashing.py", "backend/provenance.py"]
+strict = [
+  "backend/applicability.py",
+  "backend/execution.py",
+  "backend/hashing.py",
+  "backend/provenance.py",
+  "backend/report.py",
+  "backend/timeutils.py",
+  "backend/travel.py",
+]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false

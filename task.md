@@ -1,10 +1,43 @@
 # FieldFlow Local 任务记录
 
-更新时间：2026-08-26
+更新时间：2026-08-29
 
 ## 本轮目标
 
-按更新后的 `pro-plan.md` 完成 v0.5.10 Command Trust Closure。发布门禁是规划来源与活动 V 原子预留、当前 Scenario 锚定修订链头、适用性投影绑定当前 D、主界面使用统一 disposition、发布错误保持结构化，以及 Risk V6 的空间和迟到口径可追溯。
+逐条复核 2026-08-29 更新的 `pro-plan.md`，完成合理修复和可安全落地的业务扩展，并在三轮独立审计、全量验证和 GitHub CI 通过后交付。当前先冻结 v0.5.11 正确性，再继续推进持久运行时与现场业务闭环。
+
+## v0.5.11 实施记录
+
+### 第一轮：P0 业务正确性
+
+- [x] Start/Complete 权威拆分：Complete 只依赖已验证 Start Event 与 Booking；覆盖技师班次、技能、位置变化和无活动 Plan 后仍可完成。
+- [x] Emergency Intake Receipt：接收、重放、消费、显式取消和并发同键均绑定真实工单资源；删除活动 Receipt 返回结构化 409。
+- [x] DispatchSnapshot：单次读事务返回 D/V/E、Scenario 链头、Plan、适用性和 Operational View；前端拒绝同 D 不同 V，并通过 BroadcastChannel/focus 重新同步。
+
+### 第二轮：证明链与报告
+
+- [x] RunInput/RunResult/Candidate Manifest、关系列和 SQLite 触发器；发布验证 Artifact 绑定三份清单。
+- [x] RestoreTransformManifest 区分基础 D 与目标 D，恢复不再改写 Run 输入，发布事务重算授权变换。
+- [x] canonical command fingerprint 包含 D/V 前置条件、来源、执行水位和业务参数；Command Manifest 区分关系与载荷证明，坏载荷隔离后只从终态资源重建。
+- [x] v2 baseline/optimize/replan/activate/restore/reattest/实验发布缺少显式活动 V 前置条件时返回 428；reattest 指纹包含 expected active V。
+- [x] 报告分为 `FROZEN_PLAN_REPORT` 与 `CURRENT_OPERATIONAL_REPORT`；当前报告使用 DispatchSnapshot 展示 D/V/E、覆盖、失效 assignment 和执行状态。
+- [x] 当前 revision 链头可用性与完整历史链状态分开返回；无活动 Plan 的 rollback preview 不再拿最新历史 Plan 冒充当前方案。
+
+### 第三轮：决策、供应链和模型化验收
+
+- [x] Risk V7 使用工单/技师集合差归因；SUMMARY_ONLY Artifact 只持久化紧凑配对向量，紧急选人证据按事件 trial 保存。
+- [x] Capacity Artifact 纳入正式/诊断成本、成本账本 hash、成本/容量政策 hash 和参照成本 hash。
+- [x] runtime/dev 锁加入发行文件 hash，安装使用 `--require-hashes`；新增 CycloneDX SBOM、Python `<3.14` 上限，Pyright strict 扩至 7 个核心模块。
+- [x] 新增 v0.5.11 专项状态机/篡改验收，覆盖恢复清单、数据库不可变、v2 428、报告模式、revision 双状态、无活动 Plan 回滚和命令 quarantine。
+- [x] 显式迁移 CLI、持久 Job Queue/Outbox、经营分析与实验求解子进程硬取消、Risk Comparison Saga 和内容寻址 Artifact。
+- [x] 网页经营分析改用持久任务轮询；紧急接单与 REPLAN Job 同事务提交，进程退出后由启动恢复器自动续跑。
+- [x] 核心前端 DTO 改从 OpenAPI 生成类型派生；Benchmark 增加提交基线趋势门禁，mutation 输出逐项得分。
+- [x] v0.7/v0.8/v1 逐项裁决；完成本轮可落地的 CODEOWNERS、SBOM、性能基线、数据保留与隐私说明。未用空表冒充 Visit/库存/资产闭环，也未在缺少真实样本时声称完成风险校准。
+- [x] 第二轮全量回归修复 Command Manifest payload 漏写、Run 终态改写输入身份、handler 直接调用兼容、旧 Artifact 嵌套 Blob 和恢复任务字段存在性五项交叉缺陷。
+- [x] 第三轮重启/取消/损坏审计修复已中断 A 不生成下一 attempt、压缩 Blob 无绝对解码上限、Demo 复用旧临时数据库和 SQLite 辅助连接未关闭。
+- [x] 本地静态检查、OpenAPI/生成类型、runtime/dev/npm 审计、298 项后端测试（覆盖率 87.21%）、8/8 mutation、17 项 React、生产构建、可重复 Demo 与性能趋势通过；Playwright API 生命周期通过，后续本机 Chromium 启动被 macOS VM 资源短缺终止，未进入页面断言。
+- [x] 完成三轮独立缺陷审计，并归档上一版 review state；未伪造不可用的外部 reviewer 评分。
+- [ ] GitHub 推送与 Linux Playwright/完整 CI 监控。
 
 ## v0.5.10 实施记录
 
@@ -104,11 +137,11 @@
 - [x] 三轮独立审计记录已写入本地 `review-stage`；该目录按项目约定不提交。
 - [x] 功能提交 `7b2ee6d`、干净安装修复 `d7a6bf8` 已推送；GitHub Actions #45 的 Python 3.11 与完整 `fieldflow` job 均通过。
 
-## 明确边界
+## 当前未纳入
 
-- Job Queue、Outbox、求解子进程硬取消、迁移维护 CLI、Artifact retention 属于任务书 M1/v0.6；当前没有持久 worker，不能用空路由冒充。
+- Job Queue、Outbox、求解子进程硬取消、迁移维护 CLI 和 Artifact retention 已在 v0.5.11 落地，不再列为后续占位任务。
 - 正式 Booking、工单收件箱、技师端、缺件/失败/再次上门、资产和库存属于 M2/v0.7。
 - 时变旅行、真实多日需求预测、风险历史校准和组合容量属于 M3/v0.8。
 - LICENSE 需要仓库所有者选择 MIT 或 Apache-2.0；GitHub 分支保护属于额外仓库治理操作，本轮不擅自变更。
 
-逐项证据与理由见 `docs/pro-plan-v0.5.8-assessment.md`。
+本轮逐项证据与理由见 `docs/pro-plan-v0.5.11-assessment.md`。

@@ -81,6 +81,19 @@ def reduce_plan_applicability(
     del previous_scenario  # Kept in the contract for future field-level change evidence.
     reduced = current.model_copy(deep=True)
     dependencies = PlanDependencyIndex.from_plan(plan)
+    current_work_order_ids = {order.id for order in updated_scenario.work_orders}
+    pending_work_order_ids = {
+        order.id for order in updated_scenario.work_orders if order.status is WorkOrderStatus.pending
+    }
+    blocked_start_eligible_ids = pending_work_order_ids | (
+        dependencies.assigned_work_order_ids - current_work_order_ids
+    )
+    # Applicability governs whether a future start is still safe. Once service
+    # has started, its verified execution event—not current planning data—is
+    # authoritative for completion.
+    reduced.invalid_assignment_ids = sorted(
+        set(reduced.blocked_start_assignment_ids).intersection(blocked_start_eligible_ids)
+    )
     current_demand_ids = {
         order.id for order in updated_scenario.work_orders if order.status is not WorkOrderStatus.completed
     }
@@ -107,7 +120,9 @@ def reduce_plan_applicability(
     elif impact in {FieldImpact.assignment_feasibility, FieldImpact.execution}:
         reduced.planning_current = False
         reduced.metrics_current = False
-        referenced = dependencies.assigned_work_order_ids.intersection(invalid_assignment_ids or [])
+        referenced = dependencies.assigned_work_order_ids.intersection(invalid_assignment_ids or []).intersection(
+            blocked_start_eligible_ids
+        )
         reduced.invalid_assignment_ids = sorted(set(reduced.invalid_assignment_ids) | referenced)
         if reduced.invalid_assignment_ids:
             reduced.route_executable = False

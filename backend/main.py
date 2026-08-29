@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
 import random
 import re
 import statistics
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +40,7 @@ from .hashing import content_hash
 from .models import (
     ActivatePlanRequest,
     AnalysisIntegrityStatus,
+    CancelEmergencyIntakeRequest,
     CapacityAnalysis,
     CapacityAnalysisRequest,
     CapacityCounterfactualArtifact,
@@ -50,6 +53,7 @@ from .models import (
     DecisionAnalysisRun,
     DecisionAnalysisRunRequest,
     DecisionAnalysisScope,
+    DispatchSnapshot,
     ExecutionSourceContext,
     ExperimentPublishRequest,
     FieldImpact,
@@ -61,8 +65,10 @@ from .models import (
     ManualReassignmentResult,
     OptimizeRequest,
     PairedMetricSummary,
+    PairedTrialVector,
     PlanningContext,
     PlanningReservation,
+    PlanPreconditionRequest,
     PlanUseCase,
     PlanVersion,
     PlanVersionPatch,
@@ -70,13 +76,18 @@ from .models import (
     ReattestationMode,
     ReattestPlanRequest,
     ReplanRequest,
+    ReportMode,
     RestoreRequest,
+    RiskArtifactDetailPolicy,
     RiskComparisonResult,
     RiskComparisonRun,
+    RiskComparisonSaga,
     RiskSimulationRequest,
     RiskSimulationResult,
     RiskTrialOutcomeArtifact,
     RollbackPreview,
+    RuntimeJob,
+    RuntimeJobStatus,
     ScenarioCreate,
     ScenarioOperationalView,
     ScheduleArtifact,
@@ -121,6 +132,7 @@ from .scheduler import (
     replan_schedule,
     scenario_for_profile,
 )
+from .solver_worker import decision_analysis_process, parse_strategy_candidate, strategy_candidate_process
 from .storage import (
     ActivePlanConflict,
     DecisionAnalysisIntegrityError,
@@ -137,15 +149,34 @@ experiment_slots: threading.BoundedSemaphore | None = None
 manual_reassignment_locks: dict[str, tuple[threading.RLock, int]] = {}
 manual_reassignment_locks_guard = threading.Lock()
 EXPERIMENT_QUEUE_CAPACITY = 4
+DECISION_JOB_TYPES = {"COST_ANALYSIS", "CAPACITY_ANALYSIS", "RISK_ANALYSIS"}
 router = APIRouter()
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global experiment_executor, experiment_slots, store
-    store = application.state.store_override or Store(application.state.db_path)
+    active_store: Store = application.state.store_override or Store(application.state.db_path, allow_migration=False)
+    store = active_store
     experiment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fieldflow-strategy")
     experiment_slots = threading.BoundedSemaphore(EXPERIMENT_QUEUE_CAPACITY)
+    for job in active_store.list_recoverable_runtime_jobs("STRATEGY_EXPERIMENT"):
+        if experiment_slots.acquire(blocking=False):
+            experiment_executor.submit(
+                _run_experiment_with_slot,
+                str(job.input_payload.get("experiment_id", "")),
+                job.input_payload.get("time_limit_seconds"),
+                experiment_slots,
+                job.id,
+            )
+            active_store.mark_outbox_dispatched_for_aggregate(job.id)
+    for job in active_store.list_recoverable_runtime_jobs():
+        if job.job_type in DECISION_JOB_TYPES:
+            experiment_executor.submit(_run_decision_job, job.id)
+            active_store.mark_outbox_dispatched_for_aggregate(job.id)
+        elif job.job_type == "REPLAN":
+            experiment_executor.submit(_run_replan_job, job.id)
+            active_store.mark_outbox_dispatched_for_aggregate(job.id)
     try:
         yield
     finally:
@@ -452,15 +483,7 @@ def publication_retry(
     if not 8 <= len(key) <= 120:
         raise HTTPException(422, "Idempotency-Key 长度必须为 8–120 个字符")
     namespaced_key = f"{scenario.id}:{action}:{key}"
-    fingerprint = content_hash(
-        {
-            "scenario_id": scenario.id,
-            "scenario_revision": scenario.revision,
-            "scenario_snapshot_hash": content_hash(scenario),
-            "action": action,
-            "request": request_payload,
-        }
-    )
+    fingerprint = canonical_command_fingerprint(action, scenario, request_payload)
     try:
         existing = require_store().published_for_key(namespaced_key, fingerprint)
     except PublicationConflict as error:
@@ -469,6 +492,60 @@ def publication_retry(
             detail={"code": error.code, "message": str(error), **error.details},
         ) from error
     return namespaced_key, fingerprint, existing
+
+
+def _command_request_payload(value: object) -> object:
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump(mode="json")  # type: ignore[union-attr]
+        fields_set = sorted(getattr(value, "model_fields_set", set()))
+        return {
+            "value": _command_request_payload(dumped),
+            "provided_fields": [
+                field for field in fields_set if field not in {"idempotency_key", "intake_idempotency_key"}
+            ],
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _command_request_payload(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in {"idempotency_key", "intake_idempotency_key"}
+        }
+    if isinstance(value, list | tuple):
+        return [_command_request_payload(item) for item in value]
+    return value
+
+
+def canonical_command_fingerprint(
+    action: str,
+    scenario: ScheduleScenario,
+    request_payload: object,
+) -> str:
+    events = require_store().list_execution_events(scenario.id)
+    execution_watermark = max((event.sequence for event in events), default=0)
+    return content_hash(
+        {
+            "policy_version": "FIELD_SERVICE_COMMAND_FINGERPRINT_V2",
+            "scenario_id": scenario.id,
+            "scenario_revision": scenario.revision,
+            "scenario_snapshot_hash": content_hash(scenario),
+            "execution_watermark": execution_watermark,
+            "action": action,
+            "request": _command_request_payload(request_payload),
+        }
+    )
+
+
+def require_v2_active_plan_precondition(http_request: Request, request_model: object) -> None:
+    if not http_request.url.path.startswith("/api/v2/"):
+        return
+    if "expected_active_plan_version_id" not in getattr(request_model, "model_fields_set", set()):
+        raise HTTPException(
+            428,
+            detail={
+                "code": "ACTIVE_PLAN_PRECONDITION_REQUIRED",
+                "message": "请明确提供 expected_active_plan_version_id；没有活动方案时请传 null",
+            },
+        )
 
 
 def reserve_solve_command(publication_key: str | None, fingerprint: str | None) -> None:
@@ -665,6 +742,7 @@ def start_schedule_run(
     expected_active_plan_version_id: str | None = None,
     check_active_plan: bool = False,
     command_fingerprint: str | None = None,
+    target_scenario: ScheduleScenario | None = None,
 ) -> tuple[PlanningReservation, ScheduleRun]:
     resolved_source_mode = source_mode or ("EXPLICIT" if source else "NONE")
     reservation, run = require_store().reserve_plan_command(
@@ -692,6 +770,7 @@ def start_schedule_run(
         solver_config_hash=solver_config_hash or content_hash(scenario.solver_config),
         run_id=run_id,
         started_at=started_at,
+        target_scenario=target_scenario,
     )
     if reservation.scenario_snapshot_hash != content_hash(scenario):
         raise PublicationConflict(
@@ -867,11 +946,8 @@ def publish_selected(
     run.solution_found = result.solution_found
     run.finished_at = _now()
     run.candidate_id = candidate.id
-    run.solver_name = result.solver_name
     run.solver_version = result.solver_version
-    run.solver_config_hash = result.solver_config_hash
     run.solver_policy_fingerprint = result.solver_policy.fingerprint if result.solver_policy else ""
-    run.requested_time_limit_ms = result.requested_time_limit_ms or run.requested_time_limit_ms
     run.effective_time_limit_ms = result.effective_time_limit_ms or run.effective_time_limit_ms
     require_store().complete_schedule_run(run, candidate)
     if not candidate.publishable:
@@ -963,6 +1039,16 @@ def get_operational_view(scenario_id: str, response: Response) -> ScenarioOperat
     view = require_store().operational_view(scenario_id)
     response.headers["ETag"] = f'"D{view.scenario_revision}"'
     return view
+
+
+@router.get(
+    "/api/scenarios/{scenario_id}/dispatch-snapshot",
+    response_model=DispatchSnapshot,
+)
+def get_dispatch_snapshot(scenario_id: str, response: Response) -> DispatchSnapshot:
+    snapshot = require_store().dispatch_snapshot(scenario_id)
+    response.headers["ETag"] = f'"{snapshot.snapshot_token}"'
+    return snapshot
 
 
 @router.post("/api/scenarios", response_model=ScheduleScenario)
@@ -1241,6 +1327,18 @@ def delete_work_order(
                 "resource_id": work_order_id,
             },
         )
+    active_intake = require_store().active_emergency_intake_receipt(scenario_id, work_order_id)
+    if active_intake:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EMERGENCY_INTAKE_CANCEL_REQUIRED",
+                "message": "该突发工单仍绑定活动接收凭证，请使用显式取消操作",
+                "resource_id": work_order_id,
+                "receipt_id": active_intake.id,
+                "cancel_endpoint": (f"/api/v2/scenarios/{scenario_id}/emergency-intakes/{work_order_id}/cancel"),
+            },
+        )
     active_plan = require_store().active_plan_version(scenario_id)
     is_unassigned_in_active_plan = bool(
         active_plan and any(item.work_order_id == work_order_id for item in active_plan.selected.unassigned)
@@ -1257,6 +1355,44 @@ def delete_work_order(
         ),
         invalid_assignment_ids=[] if is_unassigned_in_active_plan else [work_order_id],
     )
+
+
+@router.post(
+    "/api/v2/scenarios/{scenario_id}/emergency-intakes/{work_order_id}/cancel",
+    response_model=ScheduleScenario,
+)
+def cancel_emergency_intake(
+    scenario_id: str,
+    work_order_id: str,
+    request: CancelEmergencyIntakeRequest,
+) -> ScheduleScenario:
+    fingerprint = content_hash(
+        {
+            "scenario_id": scenario_id,
+            "work_order_id": work_order_id,
+            "expected_revision": request.expected_revision,
+        }
+    )
+    try:
+        return require_store().cancel_emergency_intake(
+            scenario_id,
+            work_order_id,
+            expected_revision=request.expected_revision,
+            idempotency_key=request.idempotency_key,
+            request_fingerprint=fingerprint,
+        )
+    except ScenarioRevisionConflict as error:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "SCENARIO_REVISION_CONFLICT",
+                "message": "业务数据已变化，请刷新后重试",
+                "expected_revision": error.expected,
+                "current_revision": error.current,
+            },
+        ) from error
+    except PublicationConflict as error:
+        raise publication_conflict_to_http(error) from error
 
 
 @router.post("/api/scenarios/{scenario_id}/technicians", response_model=ScheduleScenario, deprecated=True)
@@ -1810,12 +1946,44 @@ def get_schedule_candidate(scenario_id: str, candidate_id: str) -> ScheduleCandi
     return candidate
 
 
+@router.get("/api/v2/scenarios/{scenario_id}/jobs", response_model=list[RuntimeJob])
+def list_runtime_jobs(scenario_id: str) -> list[RuntimeJob]:
+    require_scenario(scenario_id)
+    return require_store().list_runtime_jobs(scenario_id)
+
+
+@router.get("/api/v2/scenarios/{scenario_id}/jobs/{job_id}", response_model=RuntimeJob)
+def get_runtime_job(scenario_id: str, job_id: str) -> RuntimeJob:
+    require_scenario(scenario_id)
+    job = require_store().get_runtime_job(job_id)
+    if not job or job.scenario_id != scenario_id:
+        raise HTTPException(404, "持久任务不存在")
+    return job
+
+
+@router.post("/api/v2/scenarios/{scenario_id}/jobs/{job_id}/cancel", response_model=RuntimeJob)
+def cancel_runtime_job(scenario_id: str, job_id: str) -> RuntimeJob:
+    require_scenario(scenario_id)
+    job = require_store().get_runtime_job(job_id)
+    if not job or job.scenario_id != scenario_id:
+        raise HTTPException(404, "持久任务不存在")
+    try:
+        return require_store().request_runtime_job_cancel(job_id)
+    except KeyError as error:
+        raise HTTPException(404, "持久任务不存在") from error
+
+
 @router.post("/api/scenarios/{scenario_id}/baseline", response_model=ScheduleResult)
+@router.post("/api/v2/scenarios/{scenario_id}/baseline", response_model=ScheduleResult)
 def run_baseline(
     scenario_id: str,
+    http_request: Request,
+    request: PlanPreconditionRequest | None = None,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> ScheduleResult:
     scenario = require_scenario(scenario_id)
+    request = request or PlanPreconditionRequest()
+    require_v2_active_plan_precondition(http_request, request)
     if any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders):
         raise HTTPException(
             409,
@@ -1824,7 +1992,7 @@ def run_baseline(
                 "message": "场景已有执行记录，请使用局部重排延续当前执行位置和容量",
             },
         )
-    publication_key, fingerprint, existing = publication_retry("baseline", scenario, idempotency_key, {})
+    publication_key, fingerprint, existing = publication_retry("baseline", scenario, idempotency_key, request)
     if existing:
         return existing.selected
     reserve_solve_command(publication_key, fingerprint)
@@ -1835,6 +2003,8 @@ def run_baseline(
             "baseline",
             solver_name="fieldflow-greedy",
             command_fingerprint=fingerprint,
+            expected_active_plan_version_id=request.expected_active_plan_version_id,
+            check_active_plan="expected_active_plan_version_id" in request.model_fields_set,
         )
         update_solve_command(
             publication_key,
@@ -1876,10 +2046,22 @@ def run_baseline(
 
 
 @router.post("/api/scenarios/{scenario_id}/optimize", response_model=ScheduleResult)
+@router.post("/api/v2/scenarios/{scenario_id}/optimize", response_model=ScheduleResult)
+def run_optimize_api(
+    scenario_id: str,
+    http_request: Request,
+    request: OptimizeRequest | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> ScheduleResult:
+    resolved = request or OptimizeRequest()
+    require_v2_active_plan_precondition(http_request, resolved)
+    return run_optimize(scenario_id, resolved, idempotency_key)
+
+
 def run_optimize(
     scenario_id: str,
     request: OptimizeRequest | None = None,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = None,
 ) -> ScheduleResult:
     scenario = require_scenario(scenario_id)
     if any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders):
@@ -2047,6 +2229,12 @@ def _run_replan(
                 existing_command["resource_id"] or "",
                 PlanUseCase.replay,
             )
+            if intake_key:
+                require_store().consume_emergency_intake_receipt(
+                    intake_namespace,
+                    intake_key,
+                    plan.id,
+                )
             return plan.selected
         if existing_command and existing_command["status"] == "FAILED":
             payload = existing_command["payload"]
@@ -2062,6 +2250,7 @@ def _run_replan(
                 namespace=intake_namespace,
                 idempotency_key=intake_key,
                 request_fingerprint=intake_fingerprint,
+                replan_job_payload={"request": request.model_dump(mode="json", exclude_unset=True)},
             )
             command_created = require_store().begin_command_record(
                 command_namespace,
@@ -2084,6 +2273,11 @@ def _run_replan(
                         scenario_id,
                         command["resource_id"] or "",
                         PlanUseCase.replay,
+                    )
+                    require_store().consume_emergency_intake_receipt(
+                        intake_namespace,
+                        intake_key,
+                        plan.id,
                     )
                     return plan.selected
                 if command and command["status"] == "FAILED":
@@ -2289,15 +2483,38 @@ def _run_replan(
         raise
     if incoming and idempotency_key and request_fingerprint:
         plan = require_store().active_plan_version(scenario_id)
+        if not plan:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "EMERGENCY_REPLAN_PUBLICATION_MISSING",
+                    "message": "突发重排已返回排程，但没有活动方案记录",
+                },
+            )
+        assert intake_key
+        require_store().consume_emergency_intake_receipt(
+            intake_namespace,
+            intake_key,
+            plan.id,
+        )
         require_store().update_command_record(
             command_namespace,
             idempotency_key,
             request_fingerprint,
             status="COMPLETED",
             resource_type="plan_version",
-            resource_id=plan.id if plan else None,
-            payload={"plan_version_id": plan.id if plan else None, "schedule_id": published.id},
+            resource_id=plan.id,
+            payload={"plan_version_id": plan.id, "schedule_id": published.id},
         )
+        emergency_job_id = f"JOB-EMG-{content_hash({'namespace': intake_namespace, 'key': intake_key})[:16]}"
+        require_store().finish_runtime_job(
+            emergency_job_id,
+            None,
+            status=RuntimeJobStatus.completed,
+            result_resource_type="plan_version",
+            result_resource_id=plan.id,
+        )
+        require_store().mark_outbox_dispatched_for_aggregate(emergency_job_id)
     elif solve_publication_key and request_fingerprint:
         plan = require_store().active_plan_version(scenario_id)
         update_solve_command(
@@ -2312,7 +2529,9 @@ def _run_replan(
 
 
 @router.post("/api/scenarios/{scenario_id}/replan", response_model=ScheduleResult)
-def run_replan(scenario_id: str, request: ReplanRequest) -> ScheduleResult:
+@router.post("/api/v2/scenarios/{scenario_id}/replan", response_model=ScheduleResult)
+def run_replan(scenario_id: str, http_request: Request, request: ReplanRequest) -> ScheduleResult:
+    require_v2_active_plan_precondition(http_request, request)
     return _run_replan(scenario_id, request)
 
 
@@ -2505,6 +2724,53 @@ def create_decision_analysis_run(
     return execute_decision_analysis_run(scenario_id, plan, request, response)
 
 
+@router.post(
+    "/api/v2/scenarios/{scenario_id}/plan-versions/{version_id}/analysis-jobs",
+    response_model=RuntimeJob,
+    status_code=202,
+    responses={200: {"description": "幂等重放已存在的任务"}},
+)
+def queue_decision_analysis_job(
+    scenario_id: str,
+    version_id: str,
+    request: DecisionAnalysisRunRequest,
+    response: Response,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+) -> RuntimeJob:
+    if not 8 <= len(idempotency_key) <= 120:
+        raise HTTPException(422, detail={"code": "INVALID_IDEMPOTENCY_KEY", "message": "幂等键长度须为 8–120"})
+    require_plan_for_use(scenario_id, version_id, PlanUseCase.analyze)
+    job_type: Literal["COST_ANALYSIS", "CAPACITY_ANALYSIS", "RISK_ANALYSIS"]
+    if request.analysis_type == "COST":
+        job_type = "COST_ANALYSIS"
+    elif request.analysis_type == "CAPACITY":
+        job_type = "CAPACITY_ANALYSIS"
+    else:
+        job_type = "RISK_ANALYSIS"
+    try:
+        job, created = require_store().enqueue_runtime_job(
+            job_type=job_type,
+            scenario_id=scenario_id,
+            input_payload={
+                "plan_version_id": version_id,
+                "analysis_request": request.model_dump(mode="json"),
+            },
+            dedupe_key=idempotency_key,
+        )
+    except PublicationConflict as error:
+        raise publication_conflict_to_http(error) from error
+    if created:
+        executor = experiment_executor
+        if executor is None:
+            raise HTTPException(503, detail={"code": "JOB_RUNTIME_UNAVAILABLE", "message": "任务运行器尚未启动"})
+        executor.submit(_run_decision_job, job.id)
+        require_store().mark_outbox_dispatched_for_aggregate(job.id)
+        response.status_code = status.HTTP_202_ACCEPTED
+    else:
+        response.status_code = status.HTTP_200_OK
+    return job
+
+
 def execute_decision_analysis_run(
     scenario_id: str,
     plan: PlanVersion,
@@ -2516,6 +2782,7 @@ def execute_decision_analysis_run(
     force_new: bool = False,
     supersedes_analysis_id: str | None = None,
     on_reserved: Callable[[DecisionAnalysisRun], None] | None = None,
+    resume_interrupted: bool = False,
 ) -> DecisionAnalysisRun:
     plan = require_plan_for_use(scenario_id, plan.id, PlanUseCase.analyze)
     context = context_override or resolve_decision_analysis_context(scenario_id, plan, request.analysis_scope)
@@ -2607,6 +2874,19 @@ def execute_decision_analysis_run(
     elif reserved.status == "RUNNING":
         response.status_code = status.HTTP_202_ACCEPTED
     elif reserved.status in {"FAILED", "INTERRUPTED"}:
+        if resume_interrupted and reserved.status == "INTERRUPTED":
+            return execute_decision_analysis_run(
+                scenario_id,
+                plan,
+                request,
+                response,
+                retry_of=reserved,
+                context_override=context,
+                force_new=True,
+                supersedes_analysis_id=supersedes_analysis_id,
+                on_reserved=on_reserved,
+                resume_interrupted=False,
+            )
         raise HTTPException(
             409,
             {
@@ -2646,6 +2926,15 @@ def execute_decision_analysis_run(
             for option in result.options:
                 if option.diagnostic_schedule is None or option.verification_report is None:
                     continue
+                cost_ledger = {
+                    "policy_version": "FIELD_SERVICE_CAPACITY_COST_LEDGER_V1",
+                    "option_id": option.option_id,
+                    "formal_cost": option.counterfactual_cost,
+                    "diagnostic_cost": option.diagnostic_cost,
+                    "reference_cost_hash": content_hash(result.base_cost),
+                    "cost_policy_hash": result.cost_policy_fingerprint,
+                    "capacity_policy_hash": result.capacity_policy_fingerprint,
+                }
                 artifact = CapacityCounterfactualArtifact(
                     id=f"DAA-{reserved.id}-{option.option_id}",
                     scenario_id=scenario_id,
@@ -2678,6 +2967,12 @@ def execute_decision_analysis_run(
                     external_assignments=option.external_assignments,
                     work_order_dispositions=option.work_order_dispositions,
                     counterfactual_kpis=option.counterfactual_kpis,
+                    formal_cost=option.counterfactual_cost,
+                    diagnostic_cost=option.diagnostic_cost,
+                    cost_ledger_hash=content_hash(cost_ledger),
+                    cost_policy_hash=result.cost_policy_fingerprint,
+                    capacity_policy_hash=result.capacity_policy_fingerprint,
+                    reference_cost_hash=content_hash(result.base_cost),
                     created_at=_now(),
                 )
                 artifact.artifact_hash = content_hash(
@@ -2779,7 +3074,13 @@ def execute_decision_analysis_run(
                 analysis_run_id=reserved.id,
                 scenario_set_hash=result.simulation_scenario_set_hash,
                 detail_policy=risk_request.artifact_detail_policy,
-                metrics=result.trial_metrics,
+                metrics=(
+                    result.trial_metrics
+                    if risk_request.artifact_detail_policy is RiskArtifactDetailPolicy.full_trial_detail
+                    else []
+                ),
+                paired_trial_vectors=result.paired_trial_vectors,
+                emergency_decision_evidence=result.emergency_decision_evidence,
                 created_at=_now(),
             )
             trial_outcome_artifact.artifact_hash = content_hash(
@@ -2824,6 +3125,147 @@ def execute_decision_analysis_run(
     completed.result = result
     completed.finished_at = _now()
     return require_store().finish_decision_analysis_run(completed, artifacts=artifacts)
+
+
+def _run_decision_job(job_id: str) -> None:
+    worker_id = f"decision-worker-{os.getpid()}-{threading.get_ident()}"
+    job = require_store().claim_runtime_job(worker_id, job_id=job_id, lease_seconds=120)
+    if job is None:
+        return
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    trials = int(
+        dict(job.input_payload.get("analysis_request", {})).get("request", {}).get("trials", 0)
+        if isinstance(job.input_payload.get("analysis_request"), dict)
+        else 0
+    )
+    hard_timeout_seconds = max(30.0, min(600.0, 30.0 + trials * 0.15))
+    process = context.Process(
+        target=decision_analysis_process,
+        args=(
+            sender,
+            str(require_store().path),
+            job.scenario_id,
+            str(job.input_payload["plan_version_id"]),
+            dict(job.input_payload["analysis_request"]),
+            hard_timeout_seconds,
+        ),
+        name=f"fieldflow-decision-{job.id}",
+        daemon=True,
+    )
+    process.start()
+    sender.close()
+    deadline = time.monotonic() + hard_timeout_seconds
+    last_heartbeat = time.monotonic()
+    analysis_id: str | None = None
+    try:
+        while True:
+            if receiver.poll(0.1):
+                outcome, payload = receiver.recv()
+                if outcome == "reserved" and isinstance(payload, dict):
+                    analysis_id = str(payload["analysis_id"])
+                    continue
+                process.join(timeout=5)
+                if outcome != "ok" or not isinstance(payload, dict):
+                    detail = payload if isinstance(payload, dict) else {"message": str(payload)}
+                    raise RuntimeError(f"{detail.get('type', 'AnalysisProcessError')}: {detail.get('message', '')}")
+                analysis_id = str(payload["analysis_id"])
+                analysis_status = str(payload["status"])
+                if analysis_status == "COMPLETED":
+                    require_store().finish_runtime_job(
+                        job.id,
+                        worker_id,
+                        status=RuntimeJobStatus.completed,
+                        result_resource_type="decision_analysis",
+                        result_resource_id=analysis_id,
+                    )
+                else:
+                    error_payload = payload.get("error")
+                    require_store().finish_runtime_job(
+                        job.id,
+                        worker_id,
+                        status=RuntimeJobStatus.failed,
+                        result_resource_type="decision_analysis",
+                        result_resource_id=analysis_id,
+                        error=error_payload if isinstance(error_payload, dict) else None,
+                    )
+                return
+            current = require_store().get_runtime_job(job.id)
+            if current and current.status is RuntimeJobStatus.cancel_requested:
+                process.terminate()
+                process.join(timeout=5)
+                if analysis_id:
+                    require_store().interrupt_decision_analysis_run(
+                        job.scenario_id,
+                        analysis_id,
+                        code="JOB_CANCELLED",
+                        message="经营分析任务已取消，计算子进程已终止",
+                        failure_stage="SUBPROCESS_CANCEL",
+                    )
+                require_store().finish_runtime_job(job.id, worker_id, status=RuntimeJobStatus.cancelled)
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                process.terminate()
+                process.join(timeout=5)
+                raise TimeoutError("经营分析子进程超过硬截止时间")
+            if not process.is_alive():
+                process.join(timeout=1)
+                raise RuntimeError(f"经营分析子进程异常退出（exit={process.exitcode}）")
+            if now - last_heartbeat >= 5:
+                require_store().heartbeat_runtime_job(job.id, worker_id, 10, lease_seconds=120)
+                last_heartbeat = now
+    except Exception as error:
+        try:
+            if analysis_id:
+                require_store().interrupt_decision_analysis_run(
+                    job.scenario_id,
+                    analysis_id,
+                    code="ANALYSIS_SUBPROCESS_FAILED",
+                    message=str(error),
+                    failure_stage="SUBPROCESS_RUNTIME",
+                )
+            require_store().finish_runtime_job(
+                job.id,
+                worker_id,
+                status=RuntimeJobStatus.failed,
+                error={"type": type(error).__name__, "message": str(error)},
+            )
+        except (KeyError, PublicationConflict):
+            return
+    finally:
+        receiver.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+
+def _run_replan_job(job_id: str) -> None:
+    worker_id = f"replan-worker-{os.getpid()}-{threading.get_ident()}"
+    job = require_store().claim_runtime_job(worker_id, job_id=job_id, lease_seconds=120)
+    if job is None:
+        return
+    try:
+        request = ReplanRequest.model_validate(job.input_payload["request"])
+        schedule = _run_replan(job.scenario_id, request)
+        plan = require_store().active_plan_version(job.scenario_id)
+        require_store().finish_runtime_job(
+            job.id,
+            worker_id,
+            status=RuntimeJobStatus.completed,
+            result_resource_type="plan_version" if plan else "schedule",
+            result_resource_id=plan.id if plan else schedule.id,
+        )
+    except Exception as error:
+        try:
+            require_store().finish_runtime_job(
+                job.id,
+                worker_id,
+                status=RuntimeJobStatus.failed,
+                error={"type": type(error).__name__, "message": str(error)},
+            )
+        except (KeyError, PublicationConflict):
+            return
 
 
 @router.post(
@@ -3272,24 +3714,74 @@ def compare_plan_risk_paired(
                 "message": "两个方案无法构造同一共同随机场景集，未创建子分析",
             },
         )
+    try:
+        saga, _saga_created = require_store().reserve_risk_comparison_saga(
+            scenario_id=scenario_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+            before_plan_version_id=before_plan.id,
+            after_plan_version_id=after_plan.id,
+        )
+    except PublicationConflict as error:
+        raise publication_conflict_to_http(error) from error
     payload = request.model_dump(mode="json", exclude={"analysis_scope"})
     run_request = TypeAdapter(DecisionAnalysisRunRequest).validate_python(
         {"analysis_type": "RISK", "analysis_scope": request.analysis_scope, "request": payload}
     )
-    before_run = execute_decision_analysis_run(
-        scenario_id,
-        before_plan,
-        run_request,
-        Response(),
-        context_override=before_context,
+    before_run = (
+        require_store().get_decision_analysis_run(scenario_id, saga.before_analysis_id)
+        if saga.before_analysis_id
+        else None
     )
-    after_run = execute_decision_analysis_run(
-        scenario_id,
-        after_plan,
-        run_request,
-        Response(),
-        context_override=after_context,
+    if before_run is None or before_run.status != "COMPLETED":
+        try:
+            before_run = execute_decision_analysis_run(
+                scenario_id,
+                before_plan,
+                run_request,
+                Response(),
+                context_override=before_context,
+            )
+        except Exception as error:
+            require_store().update_risk_comparison_saga(
+                saga.id,
+                status="FAILED",
+                error={"stage": "BEFORE", "type": type(error).__name__, "message": str(error)},
+            )
+            raise
+        saga = require_store().update_risk_comparison_saga(
+            saga.id,
+            status="BEFORE_COMPLETED",
+            before_analysis_id=before_run.id,
+        )
+    after_run = (
+        require_store().get_decision_analysis_run(scenario_id, saga.after_analysis_id)
+        if saga.after_analysis_id
+        else None
     )
+    if after_run is None or after_run.status != "COMPLETED":
+        try:
+            after_run = execute_decision_analysis_run(
+                scenario_id,
+                after_plan,
+                run_request,
+                Response(),
+                context_override=after_context,
+            )
+        except Exception as error:
+            require_store().update_risk_comparison_saga(
+                saga.id,
+                status="FAILED",
+                before_analysis_id=before_run.id,
+                error={"stage": "AFTER", "type": type(error).__name__, "message": str(error)},
+            )
+            raise
+        saga = require_store().update_risk_comparison_saga(
+            saga.id,
+            status="AFTER_COMPLETED",
+            before_analysis_id=before_run.id,
+            after_analysis_id=after_run.id,
+        )
     if (
         before_run.status != "COMPLETED"
         or after_run.status != "COMPLETED"
@@ -3377,8 +3869,30 @@ def compare_plan_risk_paired(
                 "message": "配对风险比较缺少完整的共同场景集证据",
             },
         )
-    before_metrics = sorted(before_artifact.metrics, key=lambda item: item.trial)
-    after_metrics = sorted(after_artifact.metrics, key=lambda item: item.trial)
+
+    def paired_vectors(artifact: RiskTrialOutcomeArtifact) -> list[PairedTrialVector]:
+        if artifact.paired_trial_vectors:
+            return sorted(artifact.paired_trial_vectors, key=lambda item: item.trial)
+        return sorted(
+            [
+                PairedTrialVector(
+                    trial=item.trial,
+                    published_commitment_sla_rate=item.published_commitment_sla_rate,
+                    all_demand_sla_rate=item.all_demand_sla_rate,
+                    total_overtime_minutes=item.total_overtime_minutes,
+                    total_unserved_orders=item.total_unserved_orders,
+                    disrupted=item.disrupted,
+                    emergency_event=item.emergency_event,
+                    emergency_completed=item.emergency_completed,
+                    emergency_on_time=item.emergency_on_time,
+                )
+                for item in artifact.metrics
+            ],
+            key=lambda item: item.trial,
+        )
+
+    before_metrics = paired_vectors(before_artifact)
+    after_metrics = paired_vectors(after_artifact)
     if [item.trial for item in before_metrics] != [item.trial for item in after_metrics]:
         raise HTTPException(
             409,
@@ -3518,16 +4032,31 @@ def compare_plan_risk_paired(
         created_at=_now(),
     )
     try:
-        return require_store().save_risk_comparison(
+        saved = require_store().save_risk_comparison(
             comparison,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
         )
     except PublicationConflict as error:
+        require_store().update_risk_comparison_saga(
+            saga.id,
+            status="FAILED",
+            before_analysis_id=before_run.id,
+            after_analysis_id=after_run.id,
+            error={"stage": "COMPARISON", "type": type(error).__name__, "message": str(error)},
+        )
         raise HTTPException(
             409,
             detail={"code": error.code, "message": str(error), **error.details},
         ) from error
+    require_store().update_risk_comparison_saga(
+        saga.id,
+        status="COMPARISON_COMPLETED",
+        before_analysis_id=before_run.id,
+        after_analysis_id=after_run.id,
+        comparison_id=saved.id,
+    )
+    return saved
 
 
 @router.get(
@@ -3539,6 +4068,17 @@ def get_risk_comparison(scenario_id: str, comparison_id: str) -> RiskComparisonR
     if comparison is None:
         raise HTTPException(404, "风险比较记录不存在")
     return comparison
+
+
+@router.get(
+    "/api/v2/scenarios/{scenario_id}/risk-comparison-sagas/{saga_id}",
+    response_model=RiskComparisonSaga,
+)
+def get_risk_comparison_saga(scenario_id: str, saga_id: str) -> RiskComparisonSaga:
+    saga = require_store().get_risk_comparison_saga(scenario_id, saga_id)
+    if saga is None:
+        raise HTTPException(404, "风险比较 Saga 不存在")
+    return saga
 
 
 def schedule_change_rows(
@@ -3682,11 +4222,14 @@ def build_rollback_preview(
 
 
 @router.post("/api/scenarios/{scenario_id}/plan-versions/{version_id}/activate", response_model=PlanVersion)
+@router.post("/api/v2/scenarios/{scenario_id}/plan-versions/{version_id}/activate", response_model=PlanVersion)
 def activate_plan_version(
     scenario_id: str,
     version_id: str,
+    http_request: Request,
     request: ActivatePlanRequest,
 ) -> PlanVersion:
+    require_v2_active_plan_precondition(http_request, request)
     current = require_scenario(scenario_id)
     if any(order.status is WorkOrderStatus.started for order in current.work_orders):
         raise HTTPException(
@@ -3714,7 +4257,7 @@ def activate_plan_version(
     source_fingerprint = content_hash(source.scenario_snapshot.model_dump(exclude={"revision"}))
     if current_fingerprint != source_fingerprint:
         store = require_store()
-        current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
+        current_plan = store.active_plan_version(scenario_id)
         preview = build_rollback_preview(current, source, current_plan)
         raise HTTPException(
             409,
@@ -3782,11 +4325,17 @@ def activate_plan_version(
     "/api/scenarios/{scenario_id}/plan-versions/{version_id}/reattest",
     response_model=PlanVersion,
 )
+@router.post(
+    "/api/v2/scenarios/{scenario_id}/plan-versions/{version_id}/reattest",
+    response_model=PlanVersion,
+)
 def reattest_plan_version(
     scenario_id: str,
     version_id: str,
+    http_request: Request,
     request: ReattestPlanRequest,
 ) -> PlanVersion:
+    require_v2_active_plan_precondition(http_request, request)
     """Create a new, fully attested V from a view-only legacy plan."""
     current = require_scenario(scenario_id)
     if current.revision != request.expected_revision:
@@ -3853,11 +4402,7 @@ def reattest_plan_version(
         "reattest",
         current,
         request.idempotency_key,
-        {
-            "source_version_id": source.id,
-            "expected_revision": request.expected_revision,
-            "mode": request.mode.value,
-        },
+        {"source_version_id": source.id, "request": request},
     )
     if existing:
         return existing
@@ -3944,7 +4489,7 @@ def rollback_plan_preview(scenario_id: str, version_id: str) -> RollbackPreview:
     source = require_plan_for_use(scenario_id, version_id, PlanUseCase.restore)
     if not source.scenario_snapshot:
         raise HTTPException(404, "方案业务快照不存在")
-    current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
+    current_plan = store.active_plan_version(scenario_id)
     return build_rollback_preview(
         current,
         source,
@@ -3954,7 +4499,14 @@ def rollback_plan_preview(scenario_id: str, version_id: str) -> RollbackPreview:
 
 
 @router.post("/api/scenarios/{scenario_id}/plan-versions/{version_id}/restore", response_model=PlanVersion)
-def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequest) -> PlanVersion:
+@router.post("/api/v2/scenarios/{scenario_id}/plan-versions/{version_id}/restore", response_model=PlanVersion)
+def restore_plan_version(
+    scenario_id: str,
+    version_id: str,
+    http_request: Request,
+    request: RestoreRequest,
+) -> PlanVersion:
+    require_v2_active_plan_precondition(http_request, request)
     current = require_scenario(scenario_id)
     if any(order.status is WorkOrderStatus.started for order in current.work_orders):
         raise HTTPException(
@@ -3993,7 +4545,7 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
             },
         )
     store = require_store()
-    current_plan = store.active_plan_version(scenario_id) or store.latest_plan_version(scenario_id)
+    current_plan = store.active_plan_version(scenario_id)
     preview = build_rollback_preview(
         current,
         source,
@@ -4052,6 +4604,11 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         if "expected_active_plan_version_id" in request.model_fields_set
         else preview.current_plan_version_id
     )
+    if not source.scenario_snapshot:
+        raise HTTPException(409, detail={"code": "SOURCE_PLAN_SNAPSHOT_MISSING", "message": "来源方案快照缺失"})
+    restored = source.scenario_snapshot.model_copy(deep=True)
+    restored.id = scenario_id
+    restored.revision = current.revision + 1
     reservation, run = start_schedule_run(
         current,
         "restore",
@@ -4061,14 +4618,15 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         expected_active_plan_version_id=expected_active_plan_id,
         check_active_plan=True,
         command_fingerprint=fingerprint,
+        target_scenario=restored,
     )
     current = reservation.scenario_snapshot
     source = reservation.source_plan or source
-    if not source.scenario_snapshot:
-        raise HTTPException(409, detail={"code": "SOURCE_PLAN_SNAPSHOT_MISSING", "message": "来源方案快照缺失"})
-    restored = source.scenario_snapshot.model_copy(deep=True)
-    restored.id = scenario_id
-    restored.revision = current.revision + 1
+    if reservation.target_scenario_hash != content_hash(restored):
+        raise HTTPException(
+            409,
+            detail={"code": "RESTORE_TRANSFORM_CHANGED", "message": "恢复目标在命令预留后发生变化"},
+        )
     selected = source.selected.model_copy(deep=True)
     selected.id = f"SCH-{scenario_id}-restore-{uuid.uuid4().hex[:8]}"
     selected.created_at = _now()
@@ -4090,10 +4648,6 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         )
     else:
         selected = normalize_schedule(restored, selected, provider=require_store().travel_provider)
-    run.scenario_revision = restored.revision
-    run.scenario_snapshot_hash = content_hash(restored)
-    run.solver_config_hash = selected.solver_config_hash
-    run = require_store().save_schedule_run(run)
     verification = validate_result(
         restored,
         selected,
@@ -4115,6 +4669,11 @@ def restore_plan_version(scenario_id: str, version_id: str, request: RestoreRequ
         verification_report=verification,
         publishable=verification.publishable,
         created_at=_now(),
+        restore_transform_manifest=(
+            reservation.restore_transform_manifest.model_copy(deep=True)
+            if reservation.restore_transform_manifest
+            else None
+        ),
     )
     run.status = run_status_for_result(selected)
     run.solution_found = selected.solution_found
@@ -4420,7 +4979,78 @@ def mark_pareto_candidates(candidates: list[StrategyCandidate]) -> None:
         candidate.pareto_optimal = not dominated_by
 
 
-def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
+def solve_experiment_candidate(
+    experiment_id: str,
+    scenario: ScheduleScenario,
+    profile: StrategyProfile,
+) -> ScheduleResult:
+    provider = require_store().travel_provider
+    strategy_key = profile.id if profile.builtin else "custom"
+    if optimized_schedule.__module__ != "backend.scheduler" or type(provider).__name__ != "EuclideanTravelTimeProvider":
+        effective = scenario_for_profile(scenario, profile)
+        baseline = baseline_schedule(effective, 0, strategy_key, provider=provider)
+        result = optimized_schedule(
+            effective,
+            0,
+            previous=baseline,
+            time_limit_seconds=profile.time_limit_seconds,
+            strategy=strategy_key,
+            provider=provider,
+        )
+        result = bind_solver_policy(result, effective, profile, strategy_key, scenario)
+        return normalize_schedule(
+            scenario,
+            result,
+            provider=provider,
+            solver_config_hash=content_hash(effective.solver_config),
+        )
+
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=strategy_candidate_process,
+        args=(sender, scenario.model_dump(mode="json"), profile.model_dump(mode="json")),
+        name=f"fieldflow-solver-{experiment_id}-{profile.id}",
+        daemon=True,
+    )
+    process.start()
+    sender.close()
+    deadline = time.monotonic() + profile.time_limit_seconds + 15
+    try:
+        while True:
+            if receiver.poll(0.1):
+                status_name, payload = receiver.recv()
+                process.join(timeout=2)
+                if status_name == "ok":
+                    return parse_strategy_candidate(str(payload))
+                assert isinstance(payload, dict)
+                raise RuntimeError(f"{payload.get('type', 'SolverError')}: {payload.get('message', '')}")
+            latest = require_store().get_experiment(experiment_id)
+            if latest and latest.status == "CANCEL_REQUESTED":
+                process.terminate()
+                process.join(timeout=5)
+                raise InterruptedError("策略实验已取消，求解子进程已终止")
+            if time.monotonic() >= deadline:
+                process.terminate()
+                process.join(timeout=5)
+                raise TimeoutError("求解子进程超过硬截止时间")
+            if not process.is_alive():
+                process.join(timeout=1)
+                raise RuntimeError(f"求解子进程异常退出（exit={process.exitcode}）")
+    finally:
+        receiver.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+
+def _run_experiment(
+    experiment_id: str,
+    override_limit: float | None,
+    *,
+    job: RuntimeJob | None = None,
+    worker_id: str | None = None,
+) -> None:
     experiment = require_store().get_experiment(experiment_id)
     if not experiment or not experiment.scenario_snapshot:
         return
@@ -4451,7 +5081,6 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
             if override_limit is not None:
                 profile.time_limit_seconds = override_limit
             effective = scenario_for_profile(scenario, profile)
-            strategy_key = profile.id if profile.builtin else "custom"
             reservation, run = start_schedule_run(
                 scenario,
                 "experiment",
@@ -4469,29 +5098,8 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                 ),
             )
             scenario = reservation.scenario_snapshot
-            effective = scenario_for_profile(scenario, profile)
             try:
-                baseline = baseline_schedule(
-                    effective,
-                    0,
-                    strategy_key,
-                    provider=require_store().travel_provider,
-                )
-                result = optimized_schedule(
-                    effective,
-                    0,
-                    previous=baseline,
-                    time_limit_seconds=profile.time_limit_seconds,
-                    strategy=strategy_key,
-                    provider=require_store().travel_provider,
-                )
-                result = bind_solver_policy(result, effective, profile, strategy_key, scenario)
-                result = normalize_schedule(
-                    scenario,
-                    result,
-                    provider=require_store().travel_provider,
-                    solver_config_hash=content_hash(effective.solver_config),
-                )
+                result = solve_experiment_candidate(experiment_id, scenario, profile)
                 verification = verify_schedule(scenario, result, provider=require_store().travel_provider)
                 schedule_candidate = ScheduleCandidate(
                     id=f"CAND-{uuid.uuid4().hex[:12]}",
@@ -4515,11 +5123,8 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                 run.solution_found = result.solution_found
                 run.finished_at = _now()
                 run.candidate_id = schedule_candidate.id
-                run.solver_name = result.solver_name
                 run.solver_version = result.solver_version
-                run.solver_config_hash = result.solver_config_hash
                 run.solver_policy_fingerprint = result.solver_policy.fingerprint if result.solver_policy else ""
-                run.requested_time_limit_ms = result.requested_time_limit_ms or run.requested_time_limit_ms
                 run.effective_time_limit_ms = result.effective_time_limit_ms or run.effective_time_limit_ms
                 require_store().complete_schedule_run(run, schedule_candidate)
                 candidate = StrategyCandidate(
@@ -4536,6 +5141,16 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                 if not schedule_candidate.publishable:
                     codes = ", ".join(item.code for item in verification.errors) or "NOT_PUBLISHABLE"
                     experiment.candidate_errors[profile.id] = f"候选未通过发布校验：{codes}"
+            except InterruptedError:
+                experiment.status = "CANCELLED"
+                experiment.error = "实验已由用户取消，运行中的求解进程已终止"
+                experiment.cancel_requested_at = _now()
+                experiment.finished_at = _now()
+                experiment.progress = 100
+                experiment.candidates = candidates
+                fail_schedule_run(run, "EXPERIMENT_CANCELLED")
+                require_store().save_experiment(experiment)
+                return
             except Exception as error:
                 fail_schedule_run(run, f"{type(error).__name__}: {error}")
                 experiment.candidate_errors[profile.id] = f"{type(error).__name__}: {error}"
@@ -4550,6 +5165,8 @@ def _run_experiment(experiment_id: str, override_limit: float | None) -> None:
                 require_store().save_experiment(experiment)
                 return
             require_store().save_experiment(experiment)
+            if job and worker_id:
+                require_store().heartbeat_runtime_job(job.id, worker_id, experiment.progress, lease_seconds=60)
         publishable_candidates = [item for item in candidates if item.publishable]
         if publishable_candidates:
             mark_pareto_candidates(publishable_candidates)
@@ -4597,9 +5214,40 @@ def _run_experiment_with_slot(
     experiment_id: str,
     override_limit: float | None,
     slot: threading.BoundedSemaphore,
+    job_id: str | None = None,
 ) -> None:
+    worker_id = f"local-{os.getpid()}-{threading.get_ident()}"
     try:
-        _run_experiment(experiment_id, override_limit)
+        resolved_job_id = job_id or f"JOB-EXP-{experiment_id}"
+        job = require_store().claim_runtime_job(worker_id, job_id=resolved_job_id, lease_seconds=60)
+        if job is None:
+            return
+        _run_experiment(experiment_id, override_limit, job=job, worker_id=worker_id)
+        experiment = require_store().get_experiment(experiment_id)
+        if not experiment:
+            require_store().finish_runtime_job(
+                job.id,
+                worker_id,
+                status=RuntimeJobStatus.failed,
+                error={"code": "EXPERIMENT_MISSING", "message": "策略实验记录不存在"},
+            )
+        elif experiment.status in {"COMPLETED", "COMPLETED_WITH_ERRORS"}:
+            require_store().finish_runtime_job(
+                job.id,
+                worker_id,
+                status=RuntimeJobStatus.completed,
+                result_resource_type="strategy_experiment",
+                result_resource_id=experiment.id,
+            )
+        elif experiment.status == "CANCELLED":
+            require_store().finish_runtime_job(job.id, worker_id, status=RuntimeJobStatus.cancelled)
+        else:
+            require_store().finish_runtime_job(
+                job.id,
+                worker_id,
+                status=RuntimeJobStatus.failed,
+                error={"code": "EXPERIMENT_FAILED", "message": experiment.error or "策略实验失败"},
+            )
     finally:
         slot.release()
 
@@ -4679,7 +5327,9 @@ def create_strategy_experiment(scenario_id: str, request: StrategyExperimentRequ
             queued.id,
             request.time_limit_seconds,
             slot,
+            f"JOB-EXP-{queued.id}",
         )
+        require_store().mark_outbox_dispatched_for_aggregate(f"JOB-EXP-{queued.id}")
     except Exception as error:
         slot.release()
         queued.status = "FAILED"
@@ -4714,7 +5364,14 @@ def cancel_strategy_experiment(scenario_id: str, experiment_id: str) -> Strategy
 
 
 @router.post("/api/scenarios/{scenario_id}/strategy-experiments/{experiment_id}/publish", response_model=PlanVersion)
-def publish_strategy_candidate(scenario_id: str, experiment_id: str, request: ExperimentPublishRequest) -> PlanVersion:
+@router.post("/api/v2/scenarios/{scenario_id}/strategy-experiments/{experiment_id}/publish", response_model=PlanVersion)
+def publish_strategy_candidate(
+    scenario_id: str,
+    experiment_id: str,
+    http_request: Request,
+    request: ExperimentPublishRequest,
+) -> PlanVersion:
+    require_v2_active_plan_precondition(http_request, request)
     scenario = require_scenario(scenario_id)
     if any(order.status is not WorkOrderStatus.pending for order in scenario.work_orders):
         raise HTTPException(
@@ -4875,14 +5532,24 @@ def version_report(scenario_id: str, version_id: str) -> HTMLResponse:
     require_frozen_plan_integrity(plan)
     safe_scenario_id = safe_filename_component(scenario_id)
     return HTMLResponse(
-        build_report(plan.scenario_snapshot, plan.selected),
+        build_report(
+            plan.scenario_snapshot,
+            plan.selected,
+            mode=ReportMode.frozen_plan,
+            plan=plan,
+            proof_status=plan.effective_integrity,
+        ),
         headers={"Content-Disposition": f'inline; filename="fieldflow-{safe_scenario_id}-V{plan.number:03d}.html"'},
     )
 
 
 @router.get("/api/scenarios/{scenario_id}/report", response_class=HTMLResponse)
-def report(scenario_id: str, schedule_id: str | None = None) -> HTMLResponse:
-    scenario = require_scenario(scenario_id)
+def report(
+    scenario_id: str,
+    schedule_id: str | None = None,
+    mode: Annotated[ReportMode, Query()] = ReportMode.current_operational,
+) -> HTMLResponse:
+    require_scenario(scenario_id)
     if schedule_id:
         plan = next(
             (
@@ -4911,10 +5578,36 @@ def report(scenario_id: str, schedule_id: str | None = None) -> HTMLResponse:
         raise HTTPException(404, "当前没有可导出的方案")
     if plan:
         require_frozen_plan_integrity(plan)
-    snapshot = plan.scenario_snapshot if plan and plan.scenario_snapshot else scenario
+    if mode is ReportMode.current_operational:
+        snapshot = require_store().dispatch_snapshot(scenario_id)
+        if not snapshot.active_plan or not plan or snapshot.active_plan.id != plan.id:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "OPERATIONAL_REPORT_REQUIRES_ACTIVE_PLAN",
+                    "message": "当前运营报告只能针对同一事务快照中的活动方案生成",
+                },
+            )
+        report_scenario = snapshot.scenario
+        operational_view = snapshot.operational_view
+        execution_watermark = snapshot.execution_watermark
+    else:
+        if not plan or not plan.scenario_snapshot:
+            raise HTTPException(404, "冻结方案报告缺少发布快照")
+        report_scenario = plan.scenario_snapshot
+        operational_view = None
+        execution_watermark = 0
     safe_scenario_id = safe_filename_component(scenario_id)
     return HTMLResponse(
-        build_report(snapshot, result),
+        build_report(
+            report_scenario,
+            result,
+            mode=mode,
+            plan=plan,
+            operational_view=operational_view,
+            execution_watermark=execution_watermark,
+            proof_status=plan.effective_integrity if plan else AnalysisIntegrityStatus.failed,
+        ),
         headers={"Content-Disposition": f'inline; filename="fieldflow-{safe_scenario_id}-V{result.version:03d}.html"'},
     )
 

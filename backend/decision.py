@@ -30,12 +30,14 @@ from .models import (
     DecisionAnalysisContext,
     DecisionAnalysisScope,
     DecisionCostPolicy,
+    EmergencyDecisionEvidence,
     EmergencyDecisionInformationSet,
     EmergencyDispatchPolicy,
     EmergencyLocationPolicy,
     EmergencyResponderSelectionPolicy,
     ExternalAssignment,
     LaborCostMode,
+    PairedTrialVector,
     PlanCostBreakdown,
     PlanVersion,
     Point,
@@ -105,6 +107,7 @@ class _RiskRouteState:
     emergency_dispatch_location: Point | None = None
     work_order_late_minutes: dict[str, int | None] = field(default_factory=dict)
     work_order_outcomes: dict[str, SimulatedWorkOrderOutcome] = field(default_factory=dict)
+    work_order_window_violation_by_id: dict[str, bool] = field(default_factory=dict)
 
 
 class _RiskTrialOutcome(TypedDict):
@@ -128,6 +131,9 @@ class _RiskTrialOutcome(TypedDict):
     emergency_sla_failure: bool
     work_order_late_minutes: dict[str, int | None]
     work_order_outcomes: dict[str, SimulatedWorkOrderOutcome]
+    work_order_window_violation_by_id: dict[str, bool]
+    technician_overtime_breach_by_id: dict[str, bool]
+    technician_overtime_minutes_by_id: dict[str, int]
 
 
 class DecisionAnalysisError(ValueError):
@@ -173,6 +179,18 @@ def _core_kpi_payload(schedule: ScheduleResult) -> dict[str, object]:
     ):
         payload.pop(key, None)
     return payload
+
+
+def _publication_verification_artifact_hash(plan: PlanVersion) -> str | None:
+    artifact = plan.publication_verification_artifact
+    if artifact is None:
+        return None
+    payload = artifact.model_dump(exclude={"artifact_hash"}, mode="json")
+    if artifact.policy_version == "FIELD_SERVICE_PUBLICATION_VERIFICATION_V2":
+        for field in ("run_input_manifest_hash", "run_result_manifest_hash", "candidate_manifest_hash"):
+            if not payload.get(field):
+                payload.pop(field, None)
+    return content_hash(payload)
 
 
 def _validate_analysis_input(
@@ -303,8 +321,9 @@ def _validate_analysis_input(
             )
     verification_artifact = plan.publication_verification_artifact
     if verification_artifact is not None:
-        artifact_hash = content_hash(verification_artifact.model_dump(exclude={"artifact_hash"}, mode="json"))
-        if artifact_hash != verification_artifact.artifact_hash:
+        artifact_hash = _publication_verification_artifact_hash(plan)
+        full_artifact_hash = content_hash(verification_artifact.model_dump(exclude={"artifact_hash"}, mode="json"))
+        if verification_artifact.artifact_hash not in {artifact_hash, full_artifact_hash}:
             raise DecisionAnalysisError(
                 "PUBLICATION_VERIFICATION_ARTIFACT_HASH_MISMATCH",
                 "发布验证证据与冻结指纹不一致",
@@ -1907,6 +1926,8 @@ def simulate_plan_risk(
     emergency_newly_late_totals: list[int] = []
     emergency_lateness_increased_totals: list[int] = []
     trial_metrics: list[RiskTrialMetric] = []
+    paired_trial_vectors: list[PairedTrialVector] = []
+    emergency_decision_evidence: list[EmergencyDecisionEvidence] = []
 
     def trial_outcome(
         trial: int,
@@ -1995,6 +2016,9 @@ def simulate_plan_risk(
             state.location = order.location
             state.predecessor_id = order.id
             state.next_assignment_index += 1
+            window_violation = start > order.window_end
+            state.work_order_window_violation_by_id[order.id] = window_violation
+            state.window_failure = state.window_failure or window_violation
             if no_show:
                 state.unserved += 1
                 state.no_show_failure = True
@@ -2015,7 +2039,6 @@ def simulate_plan_risk(
                 late_minutes=late,
                 technician_id=state.technician_id,
             )
-            state.window_failure = state.window_failure or start > order.window_end
 
         def finish_route(state: _RiskRouteState) -> None:
             route = routes.get(state.technician_id, [])
@@ -2211,6 +2234,7 @@ def simulate_plan_risk(
         states: dict[str, _RiskRouteState] = {}
         unserved = initially_unserved
         work_order_late_minutes: dict[str, int | None] = {}
+        work_order_window_violation_by_id: dict[str, bool] = {}
         work_order_outcomes: dict[str, SimulatedWorkOrderOutcome] = {
             item.work_order_id: SimulatedWorkOrderOutcome(
                 work_order_id=item.work_order_id,
@@ -2290,6 +2314,7 @@ def simulate_plan_risk(
                 finish_route(state)
             work_order_late_minutes.update(state.work_order_late_minutes)
             work_order_outcomes.update(state.work_order_outcomes)
+            work_order_window_violation_by_id.update(state.work_order_window_violation_by_id)
 
         on_time = sum(state.on_time for state in states.values())
         published_total_late = sum(state.total_late for state in states.values())
@@ -2300,6 +2325,13 @@ def simulate_plan_risk(
         no_show_failure = any(state.no_show_failure for state in states.values())
         window_failure = any(state.window_failure for state in states.values())
         overtime_failure = any(state.overtime_failure for state in states.values())
+        technician_overtime_minutes_by_id = {
+            technician_id: state.total_overtime for technician_id, state in states.items()
+        }
+        technician_overtime_breach_by_id = {
+            technician_id: state.total_overtime > technicians[technician_id].overtime_limit
+            for technician_id, state in states.items()
+        }
         emergency_completed = bool(emergency_target and states[emergency_target].emergency_completed)
         emergency_on_time = bool(emergency_target and states[emergency_target].emergency_on_time)
         return {
@@ -2326,6 +2358,9 @@ def simulate_plan_risk(
             and (emergency_target is None or not emergency_on_time),
             "work_order_late_minutes": work_order_late_minutes,
             "work_order_outcomes": work_order_outcomes,
+            "work_order_window_violation_by_id": work_order_window_violation_by_id,
+            "technician_overtime_breach_by_id": technician_overtime_breach_by_id,
+            "technician_overtime_minutes_by_id": technician_overtime_minutes_by_id,
         }
 
     for trial in range(request.trials):
@@ -2349,10 +2384,34 @@ def simulate_plan_risk(
         no_show_failure = bool(outcome["no_show_failure"])
         window_failure = bool(outcome["window_failure"])
         overtime_failure = bool(outcome["overtime_failure"])
-        emergency_caused_window = emergency_event and window_failure and not bool(baseline_outcome["window_failure"])
-        emergency_caused_overtime = (
-            emergency_event and overtime_failure and not bool(baseline_outcome["overtime_failure"])
+        baseline_window_ids = {
+            work_order_id
+            for work_order_id, violated in baseline_outcome["work_order_window_violation_by_id"].items()
+            if violated
+        }
+        outcome_window_ids = {
+            work_order_id
+            for work_order_id, violated in outcome["work_order_window_violation_by_id"].items()
+            if violated
+        }
+        new_window_failure_ids = sorted(outcome_window_ids - baseline_window_ids)
+        baseline_overtime_breach_ids = {
+            technician_id
+            for technician_id, breached in baseline_outcome["technician_overtime_breach_by_id"].items()
+            if breached
+        }
+        outcome_overtime_breach_ids = {
+            technician_id for technician_id, breached in outcome["technician_overtime_breach_by_id"].items() if breached
+        }
+        new_overtime_breach_ids = sorted(outcome_overtime_breach_ids - baseline_overtime_breach_ids)
+        overtime_worsened_ids = sorted(
+            technician_id
+            for technician_id in baseline_overtime_breach_ids & outcome_overtime_breach_ids
+            if outcome["technician_overtime_minutes_by_id"].get(technician_id, 0)
+            > baseline_outcome["technician_overtime_minutes_by_id"].get(technician_id, 0)
         )
+        emergency_caused_window = emergency_event and bool(new_window_failure_ids)
+        emergency_caused_overtime = emergency_event and bool(new_overtime_breach_ids or overtime_worsened_ids)
         emergency_caused_unserved = emergency_event and int(outcome["unserved"]) > int(baseline_outcome["unserved"])
         emergency_caused_sla = emergency_event and (
             int(outcome["on_time"]) < int(baseline_outcome["on_time"])
@@ -2456,46 +2515,77 @@ def simulate_plan_risk(
             emergency_newly_unserved_totals.append(emergency_newly_unserved)
             emergency_newly_late_totals.append(emergency_newly_late)
             emergency_lateness_increased_totals.append(emergency_lateness_increased)
-        trial_metrics.append(
-            RiskTrialMetric(
+        disrupted = bool(
+            absence_failure or no_show_failure or window_failure or overtime_failure or emergency_caused_failure
+        )
+        metric = RiskTrialMetric(
+            trial=trial,
+            sla_on_time_rate=published_sla_rate,
+            published_commitment_sla_rate=published_sla_rate,
+            all_demand_sla_rate=all_demand_sla_rate,
+            emergency_event=emergency_event,
+            emergency_completed=bool(outcome["emergency_completed"]),
+            emergency_on_time=bool(outcome["emergency_on_time"]),
+            emergency_technician_id=outcome["emergency_technician_id"],
+            emergency_dispatch_time=outcome["emergency_dispatch_time"],
+            emergency_finish_time=outcome["emergency_finish_time"],
+            emergency_route_terminal_time=outcome["emergency_route_terminal_time"],
+            emergency_dispatch_location=outcome["emergency_dispatch_location"],
+            emergency_decision_information_set=outcome["emergency_decision_information_set"],
+            emergency_incremental_late_minutes=emergency_incremental_late,
+            emergency_incremental_overtime_minutes=emergency_incremental_overtime,
+            emergency_incremental_unserved_orders=emergency_incremental_unserved,
+            emergency_affected_work_order_count=emergency_affected_orders,
+            emergency_disposition_changed_count=emergency_disposition_changed,
+            emergency_newly_unserved_count=emergency_newly_unserved,
+            emergency_newly_late_count=emergency_newly_late,
+            emergency_lateness_increased_count=emergency_lateness_increased,
+            published_work_total_late_minutes=int(outcome["published_total_late"]),
+            all_demand_total_late_minutes=int(outcome["total_late"]),
+            emergency_late_minutes=(
+                int(outcome["emergency_late"]) if emergency_event and bool(outcome["emergency_completed"]) else None
+            ),
+            work_order_outcomes=(
+                [outcome["work_order_outcomes"][item] for item in sorted(outcome["work_order_outcomes"])]
+                if request.artifact_detail_policy is RiskArtifactDetailPolicy.full_trial_detail
+                else []
+            ),
+            total_overtime_minutes=int(outcome["total_overtime"]),
+            total_unserved_orders=int(outcome["unserved"]),
+            disrupted=disrupted,
+            work_order_window_violation_by_id=outcome["work_order_window_violation_by_id"],
+            technician_overtime_breach_by_id=outcome["technician_overtime_breach_by_id"],
+            technician_overtime_minutes_by_id=outcome["technician_overtime_minutes_by_id"],
+            new_window_failure_ids=new_window_failure_ids,
+            new_overtime_breach_technician_ids=new_overtime_breach_ids,
+            overtime_worsened_technician_ids=overtime_worsened_ids,
+        )
+        trial_metrics.append(metric)
+        paired_trial_vectors.append(
+            PairedTrialVector(
                 trial=trial,
-                sla_on_time_rate=published_sla_rate,
                 published_commitment_sla_rate=published_sla_rate,
                 all_demand_sla_rate=all_demand_sla_rate,
+                total_overtime_minutes=int(outcome["total_overtime"]),
+                total_unserved_orders=int(outcome["unserved"]),
+                disrupted=disrupted,
                 emergency_event=emergency_event,
                 emergency_completed=bool(outcome["emergency_completed"]),
                 emergency_on_time=bool(outcome["emergency_on_time"]),
-                emergency_technician_id=outcome["emergency_technician_id"],
-                emergency_dispatch_time=outcome["emergency_dispatch_time"],
-                emergency_finish_time=outcome["emergency_finish_time"],
-                emergency_route_terminal_time=outcome["emergency_route_terminal_time"],
-                emergency_dispatch_location=outcome["emergency_dispatch_location"],
-                emergency_decision_information_set=outcome["emergency_decision_information_set"],
-                emergency_incremental_late_minutes=emergency_incremental_late,
-                emergency_incremental_overtime_minutes=emergency_incremental_overtime,
-                emergency_incremental_unserved_orders=emergency_incremental_unserved,
-                emergency_affected_work_order_count=emergency_affected_orders,
-                emergency_disposition_changed_count=emergency_disposition_changed,
-                emergency_newly_unserved_count=emergency_newly_unserved,
-                emergency_newly_late_count=emergency_newly_late,
-                emergency_lateness_increased_count=emergency_lateness_increased,
-                published_work_total_late_minutes=int(outcome["published_total_late"]),
-                all_demand_total_late_minutes=int(outcome["total_late"]),
-                emergency_late_minutes=(
-                    int(outcome["emergency_late"]) if emergency_event and bool(outcome["emergency_completed"]) else None
-                ),
-                work_order_outcomes=(
-                    [outcome["work_order_outcomes"][item] for item in sorted(outcome["work_order_outcomes"])]
-                    if request.artifact_detail_policy is RiskArtifactDetailPolicy.full_trial_detail
-                    else []
-                ),
-                total_overtime_minutes=int(outcome["total_overtime"]),
-                total_unserved_orders=int(outcome["unserved"]),
-                disrupted=bool(
-                    absence_failure or no_show_failure or window_failure or overtime_failure or emergency_caused_failure
-                ),
             )
         )
+        if emergency_event:
+            emergency_decision_evidence.append(
+                EmergencyDecisionEvidence(
+                    trial=trial,
+                    emergency_technician_id=outcome["emergency_technician_id"],
+                    emergency_dispatch_time=outcome["emergency_dispatch_time"],
+                    emergency_finish_time=outcome["emergency_finish_time"],
+                    emergency_route_terminal_time=outcome["emergency_route_terminal_time"],
+                    emergency_dispatch_location=outcome["emergency_dispatch_location"],
+                    information_set=outcome["emergency_decision_information_set"],
+                )
+            )
 
     input_hash = expected_input_hash or canonical_decision_input_hash(
         plan, "RISK", {"request": request, "resolved_seed": seed}, context, provider
@@ -2680,4 +2770,6 @@ def simulate_plan_risk(
             "发布承诺 SLA 只覆盖原计划工单；全需求 SLA 另将每个实际发生的紧急需求计入分母。",
         ],
         trial_metrics=trial_metrics,
+        paired_trial_vectors=paired_trial_vectors,
+        emergency_decision_evidence=emergency_decision_evidence,
     )

@@ -14,7 +14,7 @@ from backend.fixtures import get_fixture
 from backend.hashing import content_hash
 from backend.models import ScheduleCandidate, ScheduleRunStatus
 from backend.scheduler import baseline_schedule
-from backend.storage import PublicationConflict, ScenarioRevisionConflict, Store
+from backend.storage import SCHEMA_VERSION, PublicationConflict, ScenarioRevisionConflict, Store
 from backend.verification import verify_schedule
 
 
@@ -972,7 +972,7 @@ def test_legacy_history_is_backed_up_before_one_time_rebuild(tmp_path):
     with closing(sqlite3.connect(database)) as migrated, migrated:
         assert migrated.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 0
         assert migrated.execute("SELECT active_plan_version_id FROM scenarios WHERE id='main'").fetchone()[0] is None
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store.list_plan_versions("main") == []
 
@@ -987,7 +987,7 @@ def test_schema_versions_1_through_15_converge_to_current_schema(tmp_path, legac
     migrated = Store(database)
     assert migrated.get_scenario("main") is not None
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert "publication_key" in {row[1] for row in connection.execute("PRAGMA table_info(command_keys)").fetchall()}
@@ -1011,10 +1011,11 @@ def test_relational_schema_enforces_foreign_keys_and_artifact_parent(tmp_path):
         assert connection.execute("PRAGMA foreign_key_list(schedule_artifacts)").fetchall()
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("INSERT INTO publication_keys VALUES ('orphan', 'x', 'missing-plan', 'now')")
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                "INSERT INTO schedule_artifacts VALUES ('bad-parent', NULL, NULL, 'candidate', '{}', 'now')"
-            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) "
+                    "VALUES ('bad-parent', NULL, NULL, 'candidate', '{}', 'now')"
+                )
 
 
 def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
@@ -1032,7 +1033,8 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute(
-            "INSERT INTO schedule_artifacts VALUES ('orphan-artifact', 'missing-plan', NULL, 'candidate', '{}', 'now')"
+            "INSERT INTO schedule_artifacts(id, plan_version_id, experiment_id, role, payload, created_at) "
+            "VALUES ('orphan-artifact', 'missing-plan', NULL, 'candidate', '{}', 'now')"
         )
         connection.execute("PRAGMA user_version=3")
 
@@ -1042,7 +1044,7 @@ def test_v3_to_v4_migration_preserves_plan_history(tmp_path):
     assert migrated_store.active_plan_version("main").id == published.id
     assert list(tmp_path.glob("preserve-v3.legacy-*.db"))
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT source_id FROM migration_orphans WHERE source_table='schedule_artifacts'"
