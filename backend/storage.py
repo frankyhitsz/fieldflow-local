@@ -5086,8 +5086,13 @@ class Store:
         error: dict | None = None,
         generation: int | None = None,
     ) -> RuntimeJob:
-        if status not in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
-            raise ValueError("runtime job finish requires a terminal status")
+        if status not in {
+            RuntimeJobStatus.completed,
+            RuntimeJobStatus.failed,
+            RuntimeJobStatus.cancelled,
+            RuntimeJobStatus.interrupted,
+        }:
+            raise ValueError("runtime job finish requires a terminal or interrupted attempt status")
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
@@ -5110,11 +5115,17 @@ class Store:
                 status = RuntimeJobStatus.cancelled
             if status is not RuntimeJobStatus.completed:
                 self._interrupt_job_analysis(
-                    con, job, "JOB_CANCELLED" if status is RuntimeJobStatus.cancelled else "JOB_FAILED"
+                    con,
+                    job,
+                    "JOB_CANCELLED"
+                    if status is RuntimeJobStatus.cancelled
+                    else "SERVICE_STOPPING"
+                    if status is RuntimeJobStatus.interrupted
+                    else "JOB_FAILED",
                 )
             now = _now()
             job.status = status
-            job.progress = 100
+            job.progress = 0 if status is RuntimeJobStatus.interrupted else 100
             if result_resource_id is None:
                 binding = con.execute(
                     "SELECT analysis_id FROM job_analysis_bindings WHERE job_id=? AND generation=? AND owns_computation=1",
@@ -5129,13 +5140,35 @@ class Store:
             job.lease_expires_at = None
             job.heartbeat_at = now
             job.updated_at = now
-            job.finished_at = now
+            job.finished_at = None if status is RuntimeJobStatus.interrupted else now
+            if job.job_type == "STRATEGY_EXPERIMENT" and status in {
+                RuntimeJobStatus.interrupted,
+                RuntimeJobStatus.cancelled,
+            }:
+                experiment_row = con.execute(
+                    "SELECT payload FROM strategy_experiments WHERE id=?",
+                    (job.input_payload.get("experiment_id"),),
+                ).fetchone()
+                if experiment_row:
+                    experiment = StrategyExperiment.model_validate_json(experiment_row["payload"])
+                    if experiment.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
+                        experiment.status = "QUEUED" if status is RuntimeJobStatus.interrupted else "CANCELLED"
+                        experiment.progress = job.progress
+                        experiment.finished_at = job.finished_at
+                        experiment.error = (
+                            "服务退出，等待重新运行" if status is RuntimeJobStatus.interrupted else "实验已由用户取消"
+                        )
+                        con.execute(
+                            "UPDATE strategy_experiments SET payload=? WHERE id=?",
+                            (experiment.model_dump_json(), experiment.id),
+                        )
             con.execute(
-                "UPDATE runtime_jobs SET status=?, progress=100, lease_owner=NULL, lease_expires_at=NULL, "
+                "UPDATE runtime_jobs SET status=?, progress=?, lease_owner=NULL, lease_expires_at=NULL, "
                 "heartbeat_at=?, result_resource_type=?, result_resource_id=?, payload=?, updated_at=?, finished_at=? "
                 "WHERE id=?",
                 (
                     job.status.value,
+                    job.progress,
                     job.heartbeat_at,
                     job.result_resource_type,
                     job.result_resource_id,

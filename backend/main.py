@@ -165,6 +165,10 @@ router = APIRouter()
 runtime_stopping = threading.Event()
 
 
+class ServiceStopping(BaseException):
+    """Stop an attempt without turning shutdown into a user cancellation."""
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     if not APPLICATION_INSTANCE_LOCK.acquire(blocking=False):
@@ -3380,9 +3384,18 @@ def _execute_decision_job(job: RuntimeJob, worker_id: str) -> None:
                 raise RuntimeError("JOB_MISSING")
             if current.status in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
                 return
-            if current.status is RuntimeJobStatus.cancel_requested or runtime_stopping.is_set():
+            if current.status is RuntimeJobStatus.cancel_requested:
                 stop_process(process)
                 require_store().finish_runtime_job(job.id, worker_id, status=RuntimeJobStatus.cancelled)
+                return
+            if runtime_stopping.is_set():
+                stop_process(process)
+                require_store().finish_runtime_job(
+                    job.id,
+                    worker_id,
+                    status=RuntimeJobStatus.interrupted,
+                    error={"code": "SERVICE_STOPPING", "message": "服务退出，任务将在重启后续跑"},
+                )
                 return
             if not follower and receiver.poll(0.1):
                 outcome, payload = receiver.recv()
@@ -3539,6 +3552,13 @@ def _run_replan_job(job_id: str) -> None:
                 status=RuntimeJobStatus.completed,
                 result_resource_type="plan_version",
                 result_resource_id=plan.id,
+            )
+        except ServiceStopping:
+            require_store().finish_runtime_job(
+                job.id,
+                worker_id,
+                status=RuntimeJobStatus.interrupted,
+                error={"code": "SERVICE_STOPPING", "message": "服务退出，任务将在重启后续跑"},
             )
         except Exception as error:
             try:
@@ -5347,12 +5367,10 @@ def _solve_in_process(target, arguments: tuple, limit: float) -> ScheduleResult:
             authority = CURRENT_JOB.get()
             if authority is not None:
                 current = require_store().get_runtime_job(authority.job_id)
-                if (
-                    current is None
-                    or current.status in {RuntimeJobStatus.cancel_requested, RuntimeJobStatus.cancelled}
-                    or runtime_stopping.is_set()
-                ):
+                if current is None or current.status in {RuntimeJobStatus.cancel_requested, RuntimeJobStatus.cancelled}:
                     raise InterruptedError("JOB_CANCELLED")
+                if runtime_stopping.is_set():
+                    raise ServiceStopping()
                 if current.lease_owner != authority.owner or current.attempt_number != authority.generation:
                     raise InterruptedError("JOB_LEASE_LOST")
                 if time.monotonic() - heartbeat >= 5:
@@ -5456,6 +5474,10 @@ def _run_experiment(
             return
         scenario = experiment.scenario_snapshot
         experiment.status = "RUNNING"
+        experiment.error = experiment.finished_at = None
+        experiment.progress = 0
+        experiment.candidates = []
+        experiment.candidate_errors = {}
         require_store().save_experiment(experiment)
         profiles = experiment.profile_snapshots
         candidates: list[StrategyCandidate] = []
@@ -5648,6 +5670,13 @@ def _run_experiment_with_slot(
                 status=RuntimeJobStatus.failed,
                 error={"code": "EXPERIMENT_FAILED", "message": experiment.error or "策略实验失败"},
             )
+    except ServiceStopping:
+        require_store().finish_runtime_job(
+            resolved_job_id,
+            worker_id,
+            status=RuntimeJobStatus.interrupted,
+            error={"code": "SERVICE_STOPPING", "message": "服务退出，任务将在重启后续跑"},
+        )
     except Exception as error:
         if token is not None:
             try:

@@ -2,6 +2,7 @@ import importlib
 import sqlite3
 import time
 from contextlib import closing
+from threading import Event
 
 import pytest
 from fastapi import Response
@@ -261,6 +262,11 @@ def test_interrupted_analysis_job_restarts_as_next_attempt(monkeypatch, tmp_path
         request = TypeAdapter(main_module.DecisionAnalysisRunRequest).validate_python(
             {"analysis_type": "RISK", "request": {"seed": 89, "trials": 50}}
         )
+        # This case models a queued job plus a crashed synchronous A owner.
+        # Do not let the live dispatcher race that deliberately orphaned owner.
+        slots = main_module.experiment_slots
+        for _ in range(3):
+            assert slots.acquire(timeout=10)
         job, created = main_module.require_store().enqueue_runtime_job(
             job_type="RISK_ANALYSIS",
             scenario_id="main",
@@ -272,14 +278,19 @@ def test_interrupted_analysis_job_restarts_as_next_attempt(monkeypatch, tmp_path
         def crash_after_reservation(_run):
             raise SimulatedProcessExit("after A reservation")
 
-        with pytest.raises(SimulatedProcessExit):
-            main_module.execute_decision_analysis_run(
-                "main",
-                plan,
-                request,
-                Response(),
-                on_reserved=crash_after_reservation,
-            )
+        try:
+            with pytest.raises(SimulatedProcessExit):
+                main_module.execute_decision_analysis_run(
+                    "main",
+                    plan,
+                    request,
+                    Response(),
+                    on_reserved=crash_after_reservation,
+                )
+        finally:
+            main_module.runtime_stopping.set()
+            for _ in range(3):
+                slots.release()
 
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:
@@ -289,3 +300,88 @@ def test_interrupted_analysis_job_restarts_as_next_attempt(monkeypatch, tmp_path
         assert [item["status"] for item in runs] == ["INTERRUPTED", "COMPLETED"]
         assert [item["attempt_number"] for item in runs] == [1, 2]
         assert runs[0]["logical_analysis_id"] == runs[1]["logical_analysis_id"]
+
+
+@pytest.mark.parametrize(
+    "job_type", ["COST_ANALYSIS", "RISK_ANALYSIS", "CAPACITY_ANALYSIS", "OPTIMIZE", "REPLAN", "STRATEGY_EXPERIMENT"]
+)
+def test_service_shutdown_interrupts_started_job_and_restart_resumes(monkeypatch, tmp_path, job_type):
+    monkeypatch.setenv("FIELDFLOW_DB", str(tmp_path / "shutdown.db"))
+    import backend.main as module
+
+    module = importlib.reload(module)
+    started, resume = Event(), Event()
+    with TestClient(module.app) as client:
+        assert client.post("/api/scenarios/main/baseline").status_code == 200
+        plan = module.require_store().active_plan_version("main")
+        process_type = type(module.multiprocessing.get_context("spawn").Process())
+        original_start = process_type.start
+
+        def held_start(process):
+            original_start(process)
+            started.set()
+            assert resume.wait(15)
+
+        monkeypatch.setattr(process_type, "start", held_start)
+        if job_type.endswith("_ANALYSIS"):
+            body = {"analysis_type": job_type.removesuffix("_ANALYSIS")}
+            if job_type == "RISK_ANALYSIS":
+                body["request"] = {"trials": 50}
+            response = client.post(
+                f"/api/v2/scenarios/main/plan-versions/{plan.id}/analysis-jobs",
+                json=body,
+                headers={"Idempotency-Key": "shutdown-analysis"},
+            )
+            assert response.status_code == 202, response.text
+            identifier = response.json()["id"]
+        elif job_type == "STRATEGY_EXPERIMENT":
+            response = client.post(
+                "/api/scenarios/main/strategy-experiments", json={"profile_ids": ["balanced"], "time_limit_seconds": 1}
+            )
+            assert response.status_code == 202, response.text
+            identifier = f"JOB-EXP-{response.json()['id']}"
+        else:
+            request = {"time_limit_seconds": 1, "expected_active_plan_version_id": plan.id}
+            if job_type == "REPLAN":
+                request.update(planning_time=600, idempotency_key="shutdown-replan")
+            job, _ = module.require_store().enqueue_runtime_job(
+                job_type=job_type,
+                scenario_id="main",
+                input_payload={"request": request, "idempotency_key": "shutdown-plan"},
+            )
+            identifier = job.id
+        try:
+            assert started.wait(15)
+            module.runtime_stopping.set()
+        finally:
+            resume.set()
+        interrupted = wait_for_job_status(client, identifier, {"INTERRUPTED", "FAILED", "CANCELLED"})
+        assert interrupted["status"] == "INTERRUPTED", interrupted
+        assert interrupted["lease_owner"] is None and interrupted["finished_at"] is None
+        if job_type == "STRATEGY_EXPERIMENT":
+            assert module.require_store().get_experiment(response.json()["id"]).status == "QUEUED"
+    monkeypatch.setattr(process_type, "start", original_start)
+    module = importlib.reload(module)
+    with TestClient(module.app) as client:
+        completed = wait_for_job_status(client, identifier, {"COMPLETED", "FAILED", "CANCELLED"})
+        assert completed["status"] == "COMPLETED", completed
+        assert completed["attempt_number"] == 2
+        if job_type == "STRATEGY_EXPERIMENT":
+            experiment = module.require_store().get_experiment(response.json()["id"])
+            assert experiment.status == "COMPLETED" and experiment.error is None
+
+
+def test_explicit_cancel_remains_terminal_during_shutdown(tmp_path):
+    store = Store(tmp_path / "cancel-during-shutdown.db")
+    job, _ = store.enqueue_runtime_job(job_type="RISK_ANALYSIS", scenario_id="main", input_payload={})
+    claimed = store.claim_runtime_job("owner", job_id=job.id)
+    store.request_runtime_job_cancel(job.id)
+    result = store.finish_runtime_job(
+        job.id,
+        "owner",
+        status=RuntimeJobStatus.interrupted,
+        generation=claimed.attempt_number,
+    )
+    assert result.status is RuntimeJobStatus.cancelled
+    assert result.finished_at is not None
+    assert store.claim_runtime_job("next-owner", job_id=job.id) is None
