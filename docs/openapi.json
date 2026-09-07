@@ -33,6 +33,63 @@
         "title": "ActivatePlanRequest",
         "type": "object"
       },
+      "ActiveBookingView": {
+        "properties": {
+          "actual_start_at": {
+            "title": "Actual Start At",
+            "type": "integer"
+          },
+          "booking_id": {
+            "title": "Booking Id",
+            "type": "string"
+          },
+          "planned_finish_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Finish At"
+          },
+          "planned_start_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Start At"
+          },
+          "start_event_id": {
+            "title": "Start Event Id",
+            "type": "string"
+          },
+          "technician_id": {
+            "title": "Technician Id",
+            "type": "string"
+          },
+          "work_order_id": {
+            "title": "Work Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "booking_id",
+          "start_event_id",
+          "work_order_id",
+          "technician_id",
+          "actual_start_at",
+          "planned_start_at",
+          "planned_finish_at"
+        ],
+        "title": "ActiveBookingView",
+        "type": "object"
+      },
       "AdditionalTechnicianCostMode": {
         "enum": [
           "WAGE_ONLY",
@@ -1571,6 +1628,13 @@
             },
             "title": "Delta",
             "type": "object"
+          },
+          "incomparable_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Incomparable Reasons",
+            "type": "array"
           },
           "modified_work_orders": {
             "items": {
@@ -3546,6 +3610,16 @@
       },
       "OperationalWorkOrderView": {
         "properties": {
+          "active_booking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ActiveBookingView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "assignment": {
             "anyOf": [
               {
@@ -10607,7 +10681,7 @@
   "info": {
     "description": "本地现场服务排程接口",
     "title": "FieldFlow API",
-    "version": "0.5.11"
+    "version": "0.5.12"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -11512,6 +11586,29 @@
               "title": "Scenario Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -11725,6 +11822,29 @@
             "schema": {
               "title": "Version Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
             }
           }
         ],
@@ -12782,6 +12902,22 @@
               "title": "Scenario Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
           }
         ],
         "requestBody": {
@@ -13631,6 +13767,120 @@
         "summary": "Get Technicians"
       }
     },
+    "/api/v2/scenarios/{scenario_id}/analysis-runs/{analysis_id}/rerun-current-jobs": {
+      "post": {
+        "operationId": "queue_analysis_rerun_api_v2_scenarios__scenario_id__analysis_runs__analysis_id__rerun_current_jobs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "analysis_id",
+            "required": true,
+            "schema": {
+              "title": "Analysis Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeJob"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Queue Analysis Rerun"
+      }
+    },
+    "/api/v2/scenarios/{scenario_id}/analysis-runs/{analysis_id}/retry-jobs": {
+      "post": {
+        "operationId": "queue_analysis_retry_api_v2_scenarios__scenario_id__analysis_runs__analysis_id__retry_jobs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_id",
+            "required": true,
+            "schema": {
+              "title": "Scenario Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "analysis_id",
+            "required": true,
+            "schema": {
+              "title": "Analysis Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeJob"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Queue Analysis Retry"
+      }
+    },
     "/api/v2/scenarios/{scenario_id}/baseline": {
       "post": {
         "operationId": "run_baseline_api_v2_scenarios__scenario_id__baseline_post",
@@ -13772,6 +14022,29 @@
             "schema": {
               "title": "Scenario Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
             }
           }
         ],

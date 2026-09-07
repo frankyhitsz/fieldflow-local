@@ -1,23 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import sys
 import tempfile
+import uuid
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .database_lock import database_access
 from .storage import SCHEMA_VERSION, Store
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def default_database() -> Path:
-    return Path(os.getenv("FIELDFLOW_DB", ROOT / "fieldflow.db")).resolve()
+    return Path(os.getenv("FIELDFLOW_DB", Path.cwd() / "fieldflow.db")).resolve()
 
 
 def database_status(path: Path) -> dict[str, object]:
@@ -53,19 +55,48 @@ def verified(path: Path, *, require_current_schema: bool) -> dict[str, object]:
         raise RuntimeError(f"数据库完整性检查失败：{json.dumps(status, ensure_ascii=False)}")
     if require_current_schema and status["schema_version"] != SCHEMA_VERSION:
         raise RuntimeError(f"数据库 schema v{status['schema_version']}，应用要求 v{SCHEMA_VERSION}")
+    if isinstance(status["schema_version"], int) and status["schema_version"] > SCHEMA_VERSION:
+        raise RuntimeError("数据库来自更新版本，当前应用不支持验证或降级")
+    status["physical_integrity"] = "VERIFIED"
+    status["schema_compatibility"] = "CURRENT" if status["schema_version"] == SCHEMA_VERSION else "MIGRATION_REQUIRED"
+    status["domain_integrity"] = "NOT_CHECKED_LEGACY"
+    if status["schema_version"] == SCHEMA_VERSION:
+        status["domain_integrity"] = Store(path).audit_domain_integrity()
+        if status["domain_integrity"] != "VERIFIED":
+            raise RuntimeError(f"领域完整性检查失败：{json.dumps(status, ensure_ascii=False)}")
+    status["restorable"] = True
     return status
 
 
+def sync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def sqlite_backup(source: Path, destination: Path) -> None:
+    if source.resolve() == destination.resolve() or (destination.exists() and os.path.samefile(source, destination)):
+        raise ValueError("备份源和目标不能是同一文件")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(source)) as source_connection:
+    with destination.open("xb"):
+        pass
+    with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as source_connection:
         with closing(sqlite3.connect(destination)) as destination_connection:
-            source_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             source_connection.backup(destination_connection)
+            destination_connection.execute("PRAGMA journal_mode=DELETE")
+    sync_file(destination)
+    sync_directory(destination.parent)
 
 
 def timestamped_backup_path(database: Path, label: str) -> Path:
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid.uuid4().hex[:10]
     return database.with_name(f"{database.stem}.{label}-{stamp}{database.suffix}")
 
 
@@ -75,12 +106,34 @@ def migrate_copy(source: Path, destination: Path) -> dict[str, object]:
     return verified(destination, require_current_schema=True)
 
 
-def atomic_replace(database: Path, migrated: Path) -> None:
+def atomic_replace(database: Path, migrated: Path, safety_backup: Path | None = None) -> None:
+    # The caller holds the maintenance lock. Let SQLite reconcile its sidecars
+    # before changing the inode; never unlink a WAL behind an open connection.
+    if database.exists():
+        with closing(sqlite3.connect(database)) as connection:
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint and checkpoint[0]:
+                raise RuntimeError("DATABASE_IN_USE: checkpoint 未完成，拒绝替换")
+            connection.execute("PRAGMA journal_mode=DELETE")
+    sync_file(migrated)
+    journal = database.with_name(database.name + ".maintenance.json")
+    record = {
+        "phase": "PREPARED",
+        "database": str(database),
+        "candidate_path": str(migrated),
+        "safety_backup": str(safety_backup) if safety_backup else None,
+        "candidate_hash": hashlib.sha256(migrated.read_bytes()).hexdigest(),
+        "previous_hash": hashlib.sha256(database.read_bytes()).hexdigest() if database.exists() else None,
+    }
+    journal.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    sync_file(journal)
+    sync_directory(database.parent)
     os.replace(migrated, database)
-    for suffix in ("-wal", "-shm"):
-        sidecar = database.with_name(database.name + suffix)
-        if sidecar.exists():
-            sidecar.unlink()
+    sync_directory(database.parent)
+    record["phase"] = "COMMITTED"
+    journal.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    sync_file(journal)
+    sync_directory(database.parent)
 
 
 def command_inspect(database: Path) -> int:
@@ -109,6 +162,11 @@ def command_dry_run(database: Path) -> int:
 
 
 def command_apply(database: Path) -> int:
+    with database_access(database, exclusive=True):
+        return _command_apply(database)
+
+
+def _command_apply(database: Path) -> int:
     before = verified(database, require_current_schema=False)
     if before["schema_version"] == SCHEMA_VERSION:
         print(json.dumps({**before, "changed": False}, ensure_ascii=False, indent=2))
@@ -126,7 +184,7 @@ def command_apply(database: Path) -> int:
     candidate.unlink()
     try:
         after = migrate_copy(database, candidate)
-        atomic_replace(database, candidate)
+        atomic_replace(database, candidate, backup)
     except Exception:
         candidate.unlink(missing_ok=True)
         raise
@@ -140,9 +198,16 @@ def command_verify(database: Path) -> int:
 
 
 def command_restore(database: Path, backup: Path, force: bool) -> int:
+    with database_access(database, exclusive=True):
+        return _command_restore(database, backup, force)
+
+
+def _command_restore(database: Path, backup: Path, force: bool) -> int:
     if not force:
         raise RuntimeError("restore 会替换当前数据库；请在确认停机和备份路径后添加 --force")
     backup = backup.resolve()
+    if database.resolve() == backup or (database.exists() and os.path.samefile(database, backup)):
+        raise ValueError("恢复源和目标不能是同一文件")
     verified(backup, require_current_schema=False)
     if database.exists():
         safety_backup = timestamped_backup_path(database, "pre-restore")
@@ -157,10 +222,11 @@ def command_restore(database: Path, backup: Path, force: bool) -> int:
     )
     candidate = Path(candidate_file.name)
     candidate_file.close()
+    candidate.unlink()
     try:
-        shutil.copy2(backup, candidate)
+        sqlite_backup(backup, candidate)
         verified(candidate, require_current_schema=False)
-        atomic_replace(database, candidate)
+        atomic_replace(database, candidate, safety_backup)
     except Exception:
         candidate.unlink(missing_ok=True)
         raise
@@ -206,9 +272,10 @@ def command_artifact_prune(database: Path, retention_days: int, apply: bool) -> 
 
 
 def command_artifact_vacuum(database: Path) -> int:
-    store = artifact_store(database)
-    before = database.stat().st_size
-    store.vacuum_artifact_storage()
+    with database_access(database, exclusive=True):
+        store = artifact_store(database)
+        before = database.stat().st_size
+        store.vacuum_artifact_storage()
     print(json.dumps({"size_before": before, "size_after": database.stat().st_size}, ensure_ascii=False, indent=2))
     return 0
 

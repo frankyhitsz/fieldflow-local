@@ -278,7 +278,8 @@ def test_orphan_execution_status_is_reported_by_integrity_scan(tmp_path):
     scenario.work_orders[0].status = WorkOrderStatus.started
     scenario.revision += 1
     store.save_scenario(scenario, "inject legacy orphan", expected_revision=0)
-    issues = Store(database).list_integrity_issues()
+    store.audit_history()
+    issues = store.list_integrity_issues()
     assert any(
         item["source_table"] == "scenario_work_order_status"
         and item["source_id"] == f"main:{scenario.work_orders[0].id}"
@@ -776,7 +777,7 @@ def test_emergency_intake_cancel_is_explicit_atomic_and_restart_safe(monkeypatch
         assert replay.status_code == 200, replay.text
         assert replay.json()["revision"] == cancelled.json()["revision"]
 
-    restarted = Store(database)
+    restarted = Store(database, recover_runtime=True)
     with pytest.raises(PublicationConflict) as caught:
         _intake_emergency(restarted, order, "receipt-cancel-intake-001")
     assert caught.value.code == "EMERGENCY_INTAKE_CANCELLED"
@@ -824,7 +825,7 @@ def test_candidate_publication_cas_rejects_newer_active_plan(monkeypatch, tmp_pa
         stale_candidate = store.get_schedule_candidate(first_plan["candidate_id"])
         scenario = store.get_scenario("main")
         assert stale_candidate is not None and scenario is not None
-        with pytest.raises(PublicationConflict) as caught:
+        with pytest.raises(Exception) as caught:
             store.publish_plan(
                 scenario,
                 stale_candidate.schedule,
@@ -832,6 +833,7 @@ def test_candidate_publication_cas_rejects_newer_active_plan(monkeypatch, tmp_pa
                 candidate_id=stale_candidate.id,
                 expected_revision=scenario.revision,
             )
+        assert isinstance(caught.value, PublicationConflict), f"wrong failure before CAS: {caught.value!r}"
         assert caught.value.code == "ACTIVE_PLAN_CHANGED_DURING_COMMAND"
         plans = store.list_plan_versions("main")
         assert [item.number for item in plans] == [1, 2]
@@ -894,7 +896,7 @@ def test_revision_proof_tampering_blocks_reset_and_is_found_at_startup(monkeypat
         reset = client.post("/api/scenarios/main/reset")
         assert reset.status_code == 409
         assert reset.json()["detail"]["record_type"] == "SCENARIO_REVISION"
-    restarted = Store(database)
+    restarted = Store(database, recover_runtime=True)
     assert any(
         item["source_table"] == "scenario_revisions" and item["source_id"] == row[0]
         for item in restarted.list_integrity_issues()
@@ -950,7 +952,7 @@ def test_invalid_revision_descendant_never_becomes_verified(tmp_path):
             "UPDATE scenario_revisions SET payload=? WHERE id=?",
             (json.dumps(payload, ensure_ascii=False), row[0]),
         )
-    Store(database)
+    Store(database).audit_history()
     with closing(sqlite3.connect(database)) as connection:
         statuses = connection.execute(
             "SELECT number, chain_status FROM scenario_revisions WHERE scenario_id='main' ORDER BY number"
@@ -977,7 +979,7 @@ def test_revision_numbers_must_start_at_d0_and_remain_contiguous(tmp_path):
             "UPDATE scenario_revisions SET number=2, payload=? WHERE id=?",
             (json.dumps(payload, ensure_ascii=False), row[0]),
         )
-    Store(database)
+    Store(database).audit_history()
     with closing(sqlite3.connect(database)) as connection:
         statuses = connection.execute(
             "SELECT number, chain_status FROM scenario_revisions WHERE scenario_id='main' ORDER BY number"
@@ -985,7 +987,7 @@ def test_revision_numbers_must_start_at_d0_and_remain_contiguous(tmp_path):
     assert statuses == [(0, "VERIFIED"), (2, "GAP_DETECTED")]
 
     root_database = tmp_path / "revision-root.db"
-    Store(root_database)
+    Store(root_database).audit_history()
     with closing(sqlite3.connect(root_database)) as connection, connection:
         row = connection.execute(
             "SELECT id, payload FROM scenario_revisions WHERE scenario_id='main' AND number=0"
@@ -997,7 +999,7 @@ def test_revision_numbers_must_start_at_d0_and_remain_contiguous(tmp_path):
             "UPDATE scenario_revisions SET number=5, payload=? WHERE id=?",
             (json.dumps(payload, ensure_ascii=False), row[0]),
         )
-    Store(root_database)
+    Store(root_database).audit_history()
     with closing(sqlite3.connect(root_database)) as connection:
         assert connection.execute(
             "SELECT number, chain_status FROM scenario_revisions WHERE scenario_id='main'"

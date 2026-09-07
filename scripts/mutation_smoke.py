@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,6 +91,31 @@ MUTATIONS = (
 )
 
 
+def classify_pytest_result(returncode: int, report: Path) -> tuple[str, int]:
+    """Only executed test assertions prove a kill; runner failures prove nothing."""
+    try:
+        cases = ET.parse(report).getroot().findall(".//testcase")
+    except (OSError, ET.ParseError):
+        return "HARNESS_ERROR", 0
+    executed = [case for case in cases if case.find("skipped") is None]
+    failures = [failure for case in executed for failure in case.findall("failure")]
+    if not executed or any(case.find("error") is not None for case in cases):
+        return "HARNESS_ERROR", len(executed)
+    if returncode == 0 and not failures:
+        return "SURVIVED", len(executed)
+    if (
+        returncode == 1
+        and failures
+        and all(
+            "AssertionError" in (failure.get("message", "") + (failure.text or ""))
+            or "DID NOT RAISE" in (failure.get("message", "") + (failure.text or ""))
+            for failure in failures
+        )
+    ):
+        return "KILLED", len(executed)
+    return "HARNESS_ERROR", len(executed)
+
+
 def run_mutation(mutation: Mutation) -> bool:
     with tempfile.TemporaryDirectory(prefix="fieldflow-mutation-") as directory:
         root = Path(directory)
@@ -100,12 +126,19 @@ def run_mutation(mutation: Mutation) -> bool:
         source = target.read_text(encoding="utf-8")
         if source.count(mutation.before) != 1:
             raise RuntimeError(f"mutation anchor drifted: {mutation.name}")
-        target.write_text(source.replace(mutation.before, mutation.after), encoding="utf-8")
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(root)
         environment["FIELDFLOW_DB"] = str(root / "mutation.db")
-        completed = subprocess.run(
-            [
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        report_root = ROOT / ".mutation-results" / mutation.name
+        report_root.mkdir(parents=True, exist_ok=True)
+        selected = 0
+        for phase in ("baseline", "mutant"):
+            if phase == "mutant":
+                target.write_text(source.replace(mutation.before, mutation.after), encoding="utf-8")
+            report = report_root / f"{phase}.xml"
+            report.unlink(missing_ok=True)
+            command = [
                 sys.executable,
                 "-m",
                 "pytest",
@@ -114,14 +147,27 @@ def run_mutation(mutation: Mutation) -> bool:
                 "-k",
                 mutation.expression,
                 "--tb=short",
-            ],
-            cwd=root,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return completed.returncode != 0
+                f"--junitxml={report}",
+            ]
+            try:
+                completed = subprocess.run(
+                    command, cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=120
+                )
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(f"HARNESS_ERROR {mutation.name}: {phase} timed out") from error
+            (report_root / f"{phase}.log").write_text(completed.stdout + completed.stderr, encoding="utf-8")
+            status, count = classify_pytest_result(completed.returncode, report)
+            if status == "HARNESS_ERROR" or (phase == "baseline" and status != "SURVIVED"):
+                raise RuntimeError(
+                    f"HARNESS_ERROR {mutation.name}: {phase}, exit={completed.returncode}; see {report_root}"
+                )
+            if phase == "baseline":
+                selected = count
+            elif count != selected:
+                raise RuntimeError(f"HARNESS_ERROR {mutation.name}: selected test count changed")
+            else:
+                return status == "KILLED"
+        return False
 
 
 def main() -> int:

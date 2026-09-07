@@ -377,15 +377,25 @@ def test_experiment_partial_failure_and_queue_capacity_are_explicit(monkeypatch,
 
         assert main_module.experiment_slots is not None
         slots = main_module.experiment_slots
-        acquired = [slots.acquire(blocking=False) for _ in range(main_module.EXPERIMENT_QUEUE_CAPACITY)]
+        acquired = [slots.acquire(blocking=False) for _ in range(3)]
         assert all(acquired)
         try:
+            queued_ids = []
+            for limit in (1, 2, 3, 4):
+                queued = client.post(
+                    "/api/scenarios/main/strategy-experiments",
+                    json={"profile_ids": ["balanced"], "time_limit_seconds": limit},
+                )
+                assert queued.status_code == 202
+                queued_ids.append(queued.json()["id"])
             full = client.post(
                 "/api/scenarios/main/strategy-experiments",
-                json={"profile_ids": ["balanced"]},
+                json={"profile_ids": ["balanced"], "time_limit_seconds": 5},
             )
             assert full.status_code == 429
         finally:
+            for identifier in queued_ids:
+                client.post(f"/api/v2/scenarios/main/jobs/JOB-EXP-{identifier}/cancel")
             for _ in acquired:
                 slots.release()
 

@@ -885,6 +885,7 @@ class Comparison(BaseModel):
     delta: dict[str, float | int | None]
     changed_orders: list[dict[str, Any]]
     comparable: bool = True
+    incomparable_reasons: list[str] = Field(default_factory=list)
     raw_objective_comparable: bool = False
     raw_objective_comparison_reason: str = ""
     same_scenario_snapshot: bool = True
@@ -1051,12 +1052,23 @@ class ErrorDetail(BaseModel):
     reservation_id: str | None = None
 
 
+class ActiveBookingView(BaseModel):
+    booking_id: str
+    start_event_id: str
+    work_order_id: str
+    technician_id: str
+    actual_start_at: int
+    planned_start_at: int | None
+    planned_finish_at: int | None
+
+
 class OperationalWorkOrderView(BaseModel):
     work_order_id: Identifier
     disposition: CurrentWorkOrderDisposition
     assignment: ScheduleAssignment | None = None
     start_allowed: bool = False
     complete_allowed: bool = False
+    active_booking: ActiveBookingView | None = None
     start_blocking_reason_code: str | None = None
     complete_blocking_reason_code: str | None = None
     # Compatibility alias for clients before the start/complete authority split.

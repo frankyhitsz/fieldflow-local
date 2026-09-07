@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
+import weakref
 import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,7 +19,9 @@ from .applicability import (
 )
 from .fixtures import all_fixtures
 from .hashing import content_hash
+from .job_authority import CURRENT_JOB
 from .models import (
+    ActiveBookingView,
     AnalysisFailureManifest,
     AnalysisIntegrityStatus,
     AnalysisReservationManifest,
@@ -85,13 +88,37 @@ from .models import (
 from .planning import assignment_planning_fingerprint, assignment_source_fingerprint
 from .provenance import build_decision_input_manifest, build_plan_manifest_payload
 from .timeutils import service_ready_at
-from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider
+from .travel import DEFAULT_TRAVEL_PROVIDER, TravelTimeProvider, freeze_travel_provider
 from .verification import verify_schedule
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 _ARTIFACT_BLOB_CODEC = "ZLIB_JSON_V1"
 _MAX_ARTIFACT_BLOB_BYTES = 64 * 1024 * 1024
+
+
+def _check_json_structure(raw: str | bytes) -> None:
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    depth = nodes = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            nodes += 1
+            if depth > 128 or nodes > 250_000:
+                raise ValueError("artifact JSON exceeds structure limits")
+        elif char in "]}":
+            depth -= 1
+
 
 _INTEGRITY_RANK = {
     AnalysisIntegrityStatus.failed: 0,
@@ -136,6 +163,24 @@ def _artifact_hash_payload(artifact: DecisionAnalysisArtifact) -> dict:
             "reference_cost_hash",
         ):
             payload.pop(field, None)
+    if (
+        isinstance(artifact, RiskTrialOutcomeArtifact)
+        and artifact.metric_policy_version == "FIELD_SERVICE_RISK_TRIAL_METRICS_V6"
+    ):
+        # v0.5.10 signed the original fields, including non-empty nested metrics.
+        # Presentation defaults must never become retroactive signed facts.
+        for field in ("metric_policy_version", "paired_trial_vectors", "emergency_decision_evidence"):
+            payload.pop(field, None)
+        for metric in payload["metrics"]:
+            for field in (
+                "work_order_window_violation_by_id",
+                "technician_overtime_breach_by_id",
+                "technician_overtime_minutes_by_id",
+                "new_window_failure_ids",
+                "new_overtime_breach_technician_ids",
+                "overtime_worsened_technician_ids",
+            ):
+                metric.pop(field, None)
     return payload
 
 
@@ -278,7 +323,23 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def emergency_job_id(namespace: str, intake_key: str, payload: dict) -> str:
+    return (
+        "JOB-EMG-"
+        + content_hash(
+            {
+                "namespace": namespace,
+                "intake_key": intake_key,
+                "command_key": payload.get("request", {}).get("idempotency_key") or content_hash(payload),
+            }
+        )[:20]
+    )
+
+
 def _store_artifact_blob(con: sqlite3.Connection, payload: str) -> str:
+    if len(payload.encode("utf-8")) > _MAX_ARTIFACT_BLOB_BYTES:
+        raise ValueError("artifact payload exceeds the 64 MiB storage limit")
+    _check_json_structure(payload)
     value = json.loads(payload)
     canonical_payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     raw = canonical_payload.encode("utf-8")
@@ -295,12 +356,7 @@ def _store_artifact_blob(con: sqlite3.Connection, payload: str) -> str:
         "SELECT codec, compressed_payload, uncompressed_size FROM artifact_blobs WHERE content_hash=?",
         (blob_hash,),
     ).fetchone()
-    if (
-        not stored
-        or stored["codec"] != _ARTIFACT_BLOB_CODEC
-        or int(stored["uncompressed_size"]) != len(raw)
-        or zlib.decompress(stored["compressed_payload"]) != raw
-    ):
+    if not stored or _read_artifact_blob(con, blob_hash) != raw:
         raise sqlite3.IntegrityError("artifact blob hash collision or stored content mismatch")
     return blob_hash
 
@@ -318,20 +374,27 @@ def _read_artifact_blob(con: sqlite3.Connection, blob_hash: str) -> bytes:
         raise ValueError("artifact blob is missing or uses an unsupported codec")
     if not 0 <= int(blob["uncompressed_size"]) <= _MAX_ARTIFACT_BLOB_BYTES:
         raise ValueError("artifact blob declares an invalid uncompressed size")
+    if len(blob["compressed_payload"]) > _MAX_ARTIFACT_BLOB_BYTES + 65536:
+        raise ValueError("artifact compressed payload exceeds the storage limit")
     try:
         decompressor = zlib.decompressobj()
         raw = decompressor.decompress(blob["compressed_payload"], _MAX_ARTIFACT_BLOB_BYTES + 1)
-        value = json.loads(raw)
-    except (TypeError, zlib.error, json.JSONDecodeError) as error:
+    except (TypeError, zlib.error) as error:
         raise ValueError("artifact blob cannot be decoded") from error
     if (
         len(raw) > _MAX_ARTIFACT_BLOB_BYTES
         or not decompressor.eof
         or decompressor.unused_data
         or len(raw) != int(blob["uncompressed_size"])
-        or content_hash(value) != blob_hash
     ):
         raise ValueError("artifact blob integrity check failed")
+    try:
+        _check_json_structure(raw)
+        value = json.loads(raw)
+        if content_hash(value) != blob_hash:
+            raise ValueError("artifact blob content hash mismatch")
+    except (ValueError, RecursionError) as error:
+        raise ValueError("artifact blob JSON cannot be verified") from error
     return raw
 
 
@@ -518,7 +581,9 @@ def _parse_decision_artifact(payload: object) -> DecisionAnalysisArtifact:
     if artifact_type == "SIMULATION_SCENARIO_SET":
         return SimulationScenarioSetArtifact.model_validate(payload)
     if artifact_type == "RISK_TRIAL_OUTCOMES":
-        return RiskTrialOutcomeArtifact.model_validate(payload)
+        original = dict(payload)
+        original.setdefault("metric_policy_version", "FIELD_SERVICE_RISK_TRIAL_METRICS_V6")
+        return RiskTrialOutcomeArtifact.model_validate(original)
     return CapacityCounterfactualArtifact.model_validate(payload)
 
 
@@ -681,15 +746,72 @@ class Store:
         travel_provider: TravelTimeProvider = DEFAULT_TRAVEL_PROVIDER,
         *,
         allow_migration: bool = True,
-        recover_runtime: bool = True,
+        recover_runtime: bool = False,
     ):
         self.path = str(path)
         self.travel_provider = travel_provider
         self._lock = threading.RLock()
-        self._init(allow_migration=allow_migration, recover_runtime=recover_runtime)
+        self._history_checks: dict[str, tuple[tuple, int]] = {}
+        self._observer: sqlite3.Connection | None = None
+        self._observer_identity: tuple[int, int] | None = None
+        from .database_lock import database_access
+
+        needs_migration = False
+        if allow_migration and Path(self.path).exists():
+            with self._connect() as con:
+                version = int(con.execute("PRAGMA user_version").fetchone()[0])
+                needs_migration = version != SCHEMA_VERSION
+        if needs_migration:
+            with database_access(self.path, exclusive=True):
+                self._init(allow_migration=allow_migration, recover_runtime=recover_runtime)
+        else:
+            self._init(allow_migration=allow_migration, recover_runtime=recover_runtime)
+
+    def _database_generation(self) -> tuple:
+        stat = Path(self.path).stat()
+        identity = (stat.st_dev, stat.st_ino)
+        if self._observer is None or identity != self._observer_identity:
+            if self._observer is not None:
+                self._observer.close()
+            self._observer = sqlite3.connect(self.path, check_same_thread=False)
+            weakref.finalize(self, self._observer.close)
+            self._observer_identity = identity
+            self._history_checks.clear()
+        return (*identity, self._observer.execute("PRAGMA data_version").fetchone()[0])
+
+    def _revision_history_issues(self, con: sqlite3.Connection, scenario: ScheduleScenario, generation: tuple) -> int:
+        cached = self._history_checks.get(scenario.id)
+        if cached and cached[0] == generation:
+            return cached[1]
+        rows = con.execute(
+            "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario.id,)
+        ).fetchall()
+        issues, previous_hash = 0, None
+        for expected_number, row in enumerate(rows):
+            try:
+                if int(row["number"]) != expected_number:
+                    raise ValueError("revision sequence gap")
+                previous_hash = self._load_revision_row(con, row, previous_hash).revision_hash
+            except (DecisionAnalysisIntegrityError, TypeError, ValueError):
+                issues += 1
+                previous_hash = None
+        issues += abs(len(rows) - scenario.revision - 1)
+        # Another connection may commit during this read transaction. Never
+        # cache a proof against a generation different from the one inspected.
+        if self._database_generation() == generation:
+            self._history_checks[scenario.id] = (generation, issues)
+        return issues
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        from .database_lock import database_access
+
+        with database_access(self.path):
+            with self._unlocked_connect() as connection:
+                yield connection
+
+    @contextmanager
+    def _unlocked_connect(self) -> Iterator[sqlite3.Connection]:
         con = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout = 5000")
@@ -907,6 +1029,10 @@ class Store:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as con:
             version = int(con.execute("PRAGMA user_version").fetchone()[0])
+            if version == SCHEMA_VERSION:
+                if recover_runtime:
+                    self._recover_runtime()
+                return
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"database schema v{version} is newer than this application supports (v{SCHEMA_VERSION})"
@@ -923,8 +1049,22 @@ class Store:
             con.execute("PRAGMA journal_mode = WAL")
             if version < SCHEMA_VERSION:
                 self._backup_legacy(con)
+                for trigger in (
+                    "protect_referenced_blob",
+                    "check_schedule_blob_insert",
+                    "check_schedule_blob_update",
+                    "check_decision_blob_insert",
+                ):
+                    con.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             con.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS job_analysis_bindings (
+                    job_id TEXT NOT NULL REFERENCES runtime_jobs(id),
+                    generation INTEGER NOT NULL,
+                    analysis_id TEXT NOT NULL REFERENCES decision_analysis_runs(id),
+                    owns_computation INTEGER NOT NULL CHECK(owns_computation IN (0, 1)),
+                    PRIMARY KEY(job_id, generation)
+                );
                 CREATE TABLE IF NOT EXISTS scenarios (
                     id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
@@ -1170,6 +1310,7 @@ class Store:
                     payload TEXT NOT NULL,
                     command_manifest_hash TEXT,
                     command_manifest_payload TEXT,
+                    proof_origin TEXT NOT NULL DEFAULT 'NATIVE_ATTESTED',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(namespace, key)
@@ -1501,6 +1642,12 @@ class Store:
                         ),
                     )
             command_columns = {row[1] for row in con.execute("PRAGMA table_info(command_keys)")}
+            if "proof_origin" not in command_columns:
+                con.execute("ALTER TABLE command_keys ADD COLUMN proof_origin TEXT NOT NULL DEFAULT 'NATIVE_ATTESTED'")
+                con.execute(
+                    "UPDATE command_keys SET proof_origin=?",
+                    ("MIGRATION_BACKFILLED" if version < 25 else "ORIGIN_NOT_RECORDED",),
+                )
             if "publication_key" not in command_columns:
                 con.execute("ALTER TABLE command_keys ADD COLUMN publication_key TEXT")
                 con.execute("UPDATE command_keys SET publication_key=key WHERE namespace='schedule-solve'")
@@ -2324,9 +2471,13 @@ class Store:
                             receipt.updated_at,
                         ),
                     )
-            for command in con.execute(
-                "SELECT * FROM command_keys WHERE command_manifest_hash IS NULL OR command_manifest_payload IS NULL"
-            ).fetchall():
+            for command in (
+                con.execute(
+                    "SELECT * FROM command_keys WHERE command_manifest_hash IS NULL OR command_manifest_payload IS NULL"
+                ).fetchall()
+                if version < 25
+                else []
+            ):
                 source_id = f"{command['namespace']}:{command['key']}"
                 try:
                     manifest = _build_command_manifest(
@@ -2480,6 +2631,23 @@ class Store:
                 CREATE TRIGGER IF NOT EXISTS prevent_artifact_blob_change
                 BEFORE UPDATE OF payload, artifact_blob_hash ON decision_analysis_artifacts
                 BEGIN SELECT RAISE(ABORT, 'decision artifact content is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS check_schedule_blob_insert
+                BEFORE INSERT ON schedule_artifacts
+                WHEN NEW.artifact_blob_hash IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifact_blobs WHERE content_hash=NEW.artifact_blob_hash)
+                BEGIN SELECT RAISE(ABORT, 'artifact blob reference is missing'); END;
+                CREATE TRIGGER IF NOT EXISTS check_schedule_blob_update
+                BEFORE UPDATE OF artifact_blob_hash ON schedule_artifacts
+                WHEN NEW.artifact_blob_hash IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifact_blobs WHERE content_hash=NEW.artifact_blob_hash)
+                BEGIN SELECT RAISE(ABORT, 'artifact blob reference is missing'); END;
+                CREATE TRIGGER IF NOT EXISTS check_decision_blob_insert
+                BEFORE INSERT ON decision_analysis_artifacts
+                WHEN NEW.artifact_blob_hash IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifact_blobs WHERE content_hash=NEW.artifact_blob_hash)
+                BEGIN SELECT RAISE(ABORT, 'artifact blob reference is missing'); END;
+                CREATE TRIGGER IF NOT EXISTS protect_referenced_blob
+                BEFORE DELETE ON artifact_blobs
+                WHEN EXISTS(SELECT 1 FROM schedule_artifacts WHERE artifact_blob_hash=OLD.content_hash)
+                  OR EXISTS(SELECT 1 FROM decision_analysis_artifacts WHERE artifact_blob_hash=OLD.content_hash)
+                BEGIN SELECT RAISE(ABORT, 'referenced artifact blob cannot be deleted'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_legacy_risk_comparison_insert
                 BEFORE INSERT ON risk_comparison_runs
                 WHEN NEW.attestation_requirement='LEGACY_MIGRATED'
@@ -2522,6 +2690,24 @@ class Store:
                 )
                 """
             )
+        if recover_runtime:
+            self._recover_runtime()
+        self.seed_fixtures()
+        self.seed_profiles()
+        self._scan_revision_integrity()
+        self._scan_execution_status_integrity()
+
+    def _recover_runtime(self) -> None:
+        from .database_lock import database_access
+
+        with database_access(self.path, coordinator=True):
+            self._recover_runtime_owned()
+
+    def _recover_runtime_owned(self) -> None:
+        """Called by the owning coordinator after exclusive coordinator admission."""
+        recover_runtime = True
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             interrupted_jobs = (
                 con.execute("SELECT * FROM runtime_jobs WHERE status IN ('RUNNING', 'CANCEL_REQUESTED')").fetchall()
                 if recover_runtime
@@ -2589,21 +2775,36 @@ class Store:
                     (experiment.model_dump_json(), experiment.id),
                 )
             interrupted = (
-                con.execute("SELECT payload FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')").fetchall()
+                con.execute("SELECT * FROM schedule_runs WHERE status IN ('QUEUED', 'RUNNING')").fetchall()
                 if recover_runtime
                 else []
             )
             for row in interrupted:
                 try:
-                    run = ScheduleRun.model_validate_json(row["payload"])
-                except (TypeError, ValueError):
+                    run = self._load_schedule_run_row(con, row)
+                except (TypeError, ValueError, DecisionAnalysisIntegrityError):
                     continue
                 run.status = ScheduleRunStatus.failed
                 run.termination_reason = "APPLICATION_RESTARTED"
                 run.finished_at = _now()
+                run.solution_found = False
+                result = RunResultManifest(
+                    run_id=run.id,
+                    status=run.status,
+                    termination_reason=run.termination_reason,
+                    solution_found=False,
+                    candidate_id=run.candidate_id,
+                    solver_name=run.solver_name,
+                    solver_version=run.solver_version,
+                    solver_policy_fingerprint=run.solver_policy_fingerprint,
+                    planning_context_hash=run.planning_context_hash,
+                    finished_at=run.finished_at,
+                )
+                result.manifest_hash = _run_result_manifest_hash(result)
+                run.result_manifest = result
                 con.execute(
-                    "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
-                    (run.status.value, run.model_dump_json(), run.id),
+                    "UPDATE schedule_runs SET status=?, payload=?, result_manifest_hash=? WHERE id=?",
+                    (run.status.value, run.model_dump_json(), result.manifest_hash, run.id),
                 )
             interrupted_analyses = (
                 con.execute("SELECT id, payload, attestation_requirement FROM decision_analysis_runs").fetchall()
@@ -2660,6 +2861,17 @@ class Store:
                 else []
             )
             for command in abandoned_commands:
+                try:
+                    self._load_command_row(command)
+                except DecisionAnalysisIntegrityError:
+                    self._record_read_isolation(
+                        con,
+                        "command_keys",
+                        f"{command['namespace']}:{command['key']}",
+                        str(command["payload"]),
+                        "recovery rejected invalid prior command proof",
+                    )
+                    continue
                 publication = con.execute(
                     "SELECT plan_version_id FROM publication_keys WHERE key=?",
                     (command["publication_key"] or command["key"],),
@@ -2685,8 +2897,10 @@ class Store:
                             "reconciled": True,
                         },
                     )
-        self.seed_fixtures()
-        self.seed_profiles()
+
+        self.audit_history()
+
+    def audit_history(self) -> None:
         self._scan_revision_integrity()
         self._scan_execution_status_integrity()
 
@@ -3620,6 +3834,7 @@ class Store:
                 "publication_key": row["publication_key"],
                 "payload": payload,
                 "command_manifest_hash": manifest.manifest_hash,
+                "proof_origin": row["proof_origin"],
             }
         except DecisionAnalysisIntegrityError:
             raise
@@ -3749,6 +3964,7 @@ class Store:
         payload: dict,
         publication_key: str | None = None,
     ) -> None:
+        Store._load_command_row(row)
         updated_at = _now()
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         resolved_publication_key = publication_key or row["publication_key"]
@@ -3878,6 +4094,23 @@ class Store:
                     code="EMERGENCY_INTAKE_RECEIPT_MISSING",
                 )
             receipt = self._load_emergency_intake_receipt_row(row)
+            if receipt.status is EmergencyIntakeStatus.consumed and receipt.replan_plan_version_id == plan_version_id:
+                return receipt
+            if receipt.status is EmergencyIntakeStatus.consumed:
+                plan_row = con.execute(
+                    "SELECT * FROM plan_versions WHERE id=? AND scenario_id=?", (plan_version_id, receipt.scenario_id)
+                ).fetchone()
+                plan = self._load_plan_row(con, plan_row) if plan_row else None
+                if (
+                    plan is None
+                    or plan.scenario_snapshot is None
+                    or receipt.work_order_id not in {item.id for item in plan.scenario_snapshot.work_orders}
+                ):
+                    raise PublicationConflict("该方案没有包含接收的工单", code="EMERGENCY_INTAKE_PLAN_MISMATCH")
+                self._require_loaded_plan_for_use(plan, PlanUseCase.replay)
+                # Receipt records the first consumption. Later planning commands
+                # have their own immutable Plan / Job result identities.
+                return receipt
             if receipt.status is EmergencyIntakeStatus.cancelled:
                 raise PublicationConflict(
                     "突发工单接收已取消",
@@ -3906,14 +4139,6 @@ class Store:
                     code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
                     details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
                 )
-            if receipt.status is EmergencyIntakeStatus.consumed:
-                if receipt.replan_plan_version_id != plan_version_id:
-                    raise PublicationConflict(
-                        "突发接收凭证已绑定另一个重排方案",
-                        code="EMERGENCY_INTAKE_PLAN_MISMATCH",
-                        details={"receipt_id": receipt.id},
-                    )
-                return receipt
             receipt.status = EmergencyIntakeStatus.consumed
             receipt.replan_plan_version_id = plan_version_id
             receipt.updated_at = _now()
@@ -4047,6 +4272,14 @@ class Store:
                     evaluated_scenario=scenario,
                 )
             self._insert_revision(con, scenario, f"取消突发工单接收 {work_order_id}")
+            for job_row in con.execute(
+                "SELECT * FROM runtime_jobs WHERE scenario_id=? AND job_type='REPLAN' AND status IN ('QUEUED','INTERRUPTED','RUNNING','CANCEL_REQUESTED')",
+                (scenario_id,),
+            ).fetchall():
+                queued = self._load_runtime_job_row(job_row)
+                incoming = queued.input_payload.get("request", {}).get("emergency_order") or {}
+                if incoming.get("id") == work_order_id:
+                    self._cancel_runtime_job_in_transaction(con, job_row)
             receipt.status = EmergencyIntakeStatus.cancelled
             receipt.updated_at = _now()
             receipt.receipt_hash = _emergency_intake_receipt_hash(receipt)
@@ -4123,13 +4356,13 @@ class Store:
                         code="EMERGENCY_INTAKE_RESOURCE_MISSING",
                         details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
                     )
-                if content_hash(current_order) != receipt.work_order_hash:
+                if replan_job_payload is None and content_hash(current_order) != receipt.work_order_hash:
                     raise PublicationConflict(
                         "突发工单接收后内容已变化，不能按原请求重放",
                         code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
                         details={"receipt_id": receipt.id, "work_order_id": receipt.work_order_id},
                     )
-                if current_order.model_dump(mode="json") != order.model_dump(mode="json"):
+                if content_hash(order) != receipt.work_order_hash:
                     raise PublicationConflict(
                         "重放请求中的突发工单与接收凭证不一致",
                         code="EMERGENCY_INTAKE_RESOURCE_CHANGED",
@@ -4141,8 +4374,8 @@ class Store:
                         job_type="REPLAN",
                         scenario_id=scenario_id,
                         input_payload=replan_job_payload,
-                        dedupe_key=receipt.id,
-                        job_id=f"JOB-EMG-{receipt.id.removeprefix('EIR-')}",
+                        dedupe_key=emergency_job_id(namespace, idempotency_key, replan_job_payload),
+                        job_id=emergency_job_id(namespace, idempotency_key, replan_job_payload),
                     )
                 return scenario, False
             command = con.execute(
@@ -4250,8 +4483,8 @@ class Store:
                     job_type="REPLAN",
                     scenario_id=scenario_id,
                     input_payload=replan_job_payload,
-                    dedupe_key=receipt.id,
-                    job_id=f"JOB-EMG-{receipt.id.removeprefix('EIR-')}",
+                    dedupe_key=emergency_job_id(namespace, idempotency_key, replan_job_payload),
+                    job_id=emergency_job_id(namespace, idempotency_key, replan_job_payload),
                 )
             payload = json.dumps(
                 {"work_order_id": order.id, "scenario_revision": scenario.revision},
@@ -4291,6 +4524,7 @@ class Store:
             ).fetchone()
             if not row:
                 raise PublicationConflict("幂等命令记录不存在")
+            self._load_command_row(row)
             if row["request_fingerprint"] != fingerprint:
                 raise PublicationConflict("相同幂等键对应了不同请求")
             terminal_statuses = {"COMPLETED", "FAILED", "FAILED_AFTER_LOCK", "FAILED_CONTEXT_CHANGED"}
@@ -4350,6 +4584,7 @@ class Store:
                 (namespace, key),
             ).fetchone()
             if row:
+                self._load_command_row(row)
                 if row["request_fingerprint"] != fingerprint:
                     raise PublicationConflict("相同幂等键对应了不同请求")
                 if row["status"] == "FAILED_RETRYABLE":
@@ -4493,6 +4728,14 @@ class Store:
                         details={"job_id": stored.id},
                     )
                 return stored, False
+        queued_count = con.execute(
+            "SELECT COUNT(*) FROM runtime_jobs WHERE status IN ('QUEUED', 'RUNNING', 'INTERRUPTED', 'CANCEL_REQUESTED')"
+        ).fetchone()[0]
+        experiment_count = con.execute(
+            "SELECT COUNT(*) FROM runtime_jobs WHERE job_type='STRATEGY_EXPERIMENT' AND status IN ('QUEUED', 'RUNNING', 'INTERRUPTED', 'CANCEL_REQUESTED')"
+        ).fetchone()[0]
+        if queued_count >= 64 or (job_type == "STRATEGY_EXPERIMENT" and experiment_count >= 4):
+            raise PublicationConflict("后台任务队列已满，请等待现有任务完成", code="JOB_QUEUE_FULL")
         now = _now()
         resolved_id = job_id or f"JOB-{uuid.uuid4().hex[:16]}"
         job = RuntimeJob(
@@ -4548,6 +4791,106 @@ class Store:
         )
         return job, True
 
+    def _assert_job_authority(self, con: sqlite3.Connection, *, allow_cancel: bool = False) -> RuntimeJob | None:
+        authority = CURRENT_JOB.get()
+        if authority is None:
+            return None
+        row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (authority.job_id,)).fetchone()
+        job = self._load_runtime_job_row(row) if row else None
+        if (
+            job is None
+            or job.lease_owner != authority.owner
+            or job.attempt_number != authority.generation
+            or not job.lease_expires_at
+            or job.lease_expires_at <= _now()
+            or job.status
+            not in (
+                {RuntimeJobStatus.running, RuntimeJobStatus.cancel_requested}
+                if allow_cancel
+                else {RuntimeJobStatus.running}
+            )
+        ):
+            raise PublicationConflict("任务已取消或执行租约已失效，拒绝写入结果", code="JOB_LEASE_LOST")
+        return job
+
+    @staticmethod
+    def _commit_job_result(
+        con: sqlite3.Connection,
+        job: RuntimeJob,
+        resource_type: str,
+        resource_id: str,
+        *,
+        failed: bool = False,
+        cancelled: bool = False,
+        error: dict | None = None,
+    ) -> None:
+        job.status = (
+            RuntimeJobStatus.cancelled
+            if cancelled
+            else RuntimeJobStatus.failed
+            if failed
+            else RuntimeJobStatus.completed
+        )
+        job.error = error
+        job.progress = 100
+        job.result_resource_type, job.result_resource_id = resource_type, resource_id
+        job.finished_at = job.updated_at = _now()
+        job.lease_owner = job.lease_expires_at = None
+        con.execute(
+            "UPDATE runtime_jobs SET status=?, progress=100, result_resource_type=?, result_resource_id=?, lease_owner=NULL, lease_expires_at=NULL, finished_at=?, updated_at=?, payload=? WHERE id=?",
+            (
+                job.status.value,
+                resource_type,
+                resource_id,
+                job.finished_at,
+                job.updated_at,
+                job.model_dump_json(),
+                job.id,
+            ),
+        )
+
+    def _bind_job_analysis(self, con: sqlite3.Connection, analysis_id: str, *, owns: bool) -> None:
+        job = self._assert_job_authority(con)
+        if job is not None:
+            con.execute(
+                "INSERT INTO job_analysis_bindings(job_id,generation,analysis_id,owns_computation) VALUES (?,?,?,?) ON CONFLICT(job_id,generation) DO UPDATE SET analysis_id=excluded.analysis_id, owns_computation=excluded.owns_computation",
+                (job.id, job.attempt_number, analysis_id, int(owns)),
+            )
+
+    def bound_job_analysis(self, job: RuntimeJob) -> tuple[str, bool] | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT analysis_id,owns_computation FROM job_analysis_bindings WHERE job_id=? AND generation=?",
+                (job.id, job.attempt_number),
+            ).fetchone()
+            return (str(row[0]), bool(row[1])) if row else None
+
+    def _interrupt_job_analysis(self, con: sqlite3.Connection, job: RuntimeJob, code: str) -> None:
+        row = con.execute(
+            "SELECT a.* FROM decision_analysis_runs a JOIN job_analysis_bindings b ON b.analysis_id=a.id WHERE b.job_id=? AND b.generation=? AND b.owns_computation=1",
+            (job.id, job.attempt_number),
+        ).fetchone()
+        if row is None or row["status"] != "RUNNING":
+            return
+        analysis = self._load_analysis_row(con, row)
+        if analysis.effective_integrity is AnalysisIntegrityStatus.failed:
+            raise PublicationConflict("任务引用的分析证明失效", code="ANALYSIS_INTEGRITY_FAILED")
+        analysis.status = "INTERRUPTED"
+        analysis.finished_at = _now()
+        analysis.error = {"code": code, "message": "原执行任务已停止，结果未提交"}
+        analysis.failure_manifest = AnalysisFailureManifest(
+            status="INTERRUPTED",
+            error_hash=content_hash(analysis.error),
+            error_code=code,
+            failure_stage="JOB_SUPERVISOR",
+            finished_at=analysis.finished_at,
+        )
+        analysis.analysis_manifest_hash = content_hash(_analysis_manifest_payload(analysis))
+        con.execute(
+            "UPDATE decision_analysis_runs SET status='INTERRUPTED',finished_at=?,analysis_manifest_hash=?,payload=? WHERE id=? AND status='RUNNING'",
+            (analysis.finished_at, analysis.analysis_manifest_hash, analysis.model_dump_json(), analysis.id),
+        )
+
     def enqueue_runtime_job(
         self,
         *,
@@ -4582,11 +4925,11 @@ class Store:
             row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
             return self._load_runtime_job_row(row) if row else None
 
-    def list_runtime_jobs(self, scenario_id: str, *, limit: int = 100) -> list[RuntimeJob]:
+    def list_runtime_jobs(self, scenario_id: str, *, limit: int = 100, offset: int = 0) -> list[RuntimeJob]:
         with self._connect() as con:
             rows = con.execute(
-                "SELECT * FROM runtime_jobs WHERE scenario_id=? ORDER BY created_at DESC LIMIT ?",
-                (scenario_id, limit),
+                "SELECT * FROM runtime_jobs WHERE scenario_id=? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (scenario_id, limit, offset),
             ).fetchall()
             return [self._load_runtime_job_row(row) for row in rows]
 
@@ -4602,7 +4945,46 @@ class Store:
                 rows = con.execute(
                     "SELECT * FROM runtime_jobs WHERE status IN ('QUEUED', 'INTERRUPTED') ORDER BY created_at"
                 ).fetchall()
-            return [self._load_runtime_job_row(row) for row in rows]
+            jobs = []
+            for row in rows:
+                try:
+                    jobs.append(self._load_runtime_job_row(row))
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError) as error:
+                    self._record_read_isolation(
+                        con, "runtime_jobs", row["id"], row["payload"], f"job dispatch isolation: {error}"
+                    )
+            return jobs
+
+    def reap_expired_jobs(self) -> None:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            for row in con.execute(
+                "SELECT * FROM runtime_jobs WHERE status IN ('RUNNING','CANCEL_REQUESTED') AND lease_expires_at<?",
+                (_now(),),
+            ).fetchall():
+                try:
+                    job = self._load_runtime_job_row(row)
+                    self._interrupt_job_analysis(con, job, "JOB_LEASE_EXPIRED")
+                except (DecisionAnalysisIntegrityError, TypeError, ValueError) as error:
+                    self._record_read_isolation(
+                        con, "runtime_jobs", row["id"], row["payload"], f"job lease isolation: {error}"
+                    )
+                    continue
+                job.status = (
+                    RuntimeJobStatus.cancelled
+                    if job.status is RuntimeJobStatus.cancel_requested
+                    else RuntimeJobStatus.failed
+                    if job.attempt_number >= 3
+                    else RuntimeJobStatus.interrupted
+                )
+                job.error = {"code": "JOB_LEASE_EXPIRED", "message": "原任务租约已到期"}
+                job.lease_owner = job.lease_expires_at = None
+                job.updated_at = _now()
+                job.finished_at = None if job.status is RuntimeJobStatus.interrupted else job.updated_at
+                con.execute(
+                    "UPDATE runtime_jobs SET status=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=?,finished_at=?,payload=? WHERE id=?",
+                    (job.status.value, job.updated_at, job.finished_at, job.model_dump_json(), job.id),
+                )
 
     def claim_runtime_job(
         self,
@@ -4631,6 +5013,7 @@ class Store:
                 return None
             if job.status is RuntimeJobStatus.running and job.lease_expires_at and job.lease_expires_at >= now:
                 return None
+            self._interrupt_job_analysis(con, job, "JOB_LEASE_EXPIRED")
             job.status = RuntimeJobStatus.running
             job.lease_owner = worker_id
             job.heartbeat_at = now
@@ -4653,14 +5036,24 @@ class Store:
             )
             return job
 
-    def heartbeat_runtime_job(self, job_id: str, worker_id: str, progress: int, lease_seconds: int = 30) -> RuntimeJob:
+    def heartbeat_runtime_job(
+        self, job_id: str, worker_id: str, progress: int, lease_seconds: int = 30, *, generation: int | None = None
+    ) -> RuntimeJob:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 raise KeyError(job_id)
             job = self._load_runtime_job_row(row)
-            if job.status is not RuntimeJobStatus.running or job.lease_owner != worker_id:
+            authority = CURRENT_JOB.get()
+            expected_generation = generation if generation is not None else authority.generation if authority else None
+            if (
+                job.status is not RuntimeJobStatus.running
+                or job.lease_owner != worker_id
+                or job.attempt_number != expected_generation
+                or not job.lease_expires_at
+                or job.lease_expires_at <= _now()
+            ):
                 raise PublicationConflict(
                     "任务租约已失效",
                     code="JOB_LEASE_LOST",
@@ -4691,6 +5084,7 @@ class Store:
         result_resource_type: str | None = None,
         result_resource_id: str | None = None,
         error: dict | None = None,
+        generation: int | None = None,
     ) -> RuntimeJob:
         if status not in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
             raise ValueError("runtime job finish requires a terminal status")
@@ -4702,11 +5096,32 @@ class Store:
             job = self._load_runtime_job_row(row)
             if job.status in {RuntimeJobStatus.completed, RuntimeJobStatus.failed, RuntimeJobStatus.cancelled}:
                 return job
-            if worker_id is not None and job.lease_owner not in {None, worker_id}:
+            authority = CURRENT_JOB.get()
+            expected_generation = generation if generation is not None else authority.generation if authority else None
+            if (
+                worker_id is None
+                or job.lease_owner != worker_id
+                or expected_generation != job.attempt_number
+                or not job.lease_expires_at
+                or job.lease_expires_at <= _now()
+            ):
                 raise PublicationConflict("任务租约已被其他 worker 接管", code="JOB_LEASE_LOST")
+            if job.status is RuntimeJobStatus.cancel_requested:
+                status = RuntimeJobStatus.cancelled
+            if status is not RuntimeJobStatus.completed:
+                self._interrupt_job_analysis(
+                    con, job, "JOB_CANCELLED" if status is RuntimeJobStatus.cancelled else "JOB_FAILED"
+                )
             now = _now()
             job.status = status
             job.progress = 100
+            if result_resource_id is None:
+                binding = con.execute(
+                    "SELECT analysis_id FROM job_analysis_bindings WHERE job_id=? AND generation=? AND owns_computation=1",
+                    (job.id, job.attempt_number),
+                ).fetchone()
+                if binding:
+                    result_resource_type, result_resource_id = "decision_analysis", binding["analysis_id"]
             job.result_resource_type = result_resource_type
             job.result_resource_id = result_resource_id
             job.error = error
@@ -4738,24 +5153,43 @@ class Store:
             row = con.execute("SELECT * FROM runtime_jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 raise KeyError(job_id)
-            job = self._load_runtime_job_row(row)
-            if job.status is RuntimeJobStatus.queued:
-                terminal = RuntimeJobStatus.cancelled
-            elif job.status is RuntimeJobStatus.running:
-                terminal = RuntimeJobStatus.cancel_requested
-            else:
-                return job
-            now = _now()
-            job.status = terminal
-            job.updated_at = now
-            if terminal is RuntimeJobStatus.cancelled:
-                job.progress = 100
-                job.finished_at = now
-            con.execute(
-                "UPDATE runtime_jobs SET status=?, progress=?, payload=?, updated_at=?, finished_at=? WHERE id=?",
-                (job.status.value, job.progress, job.model_dump_json(), now, job.finished_at, job.id),
-            )
+            return self._cancel_runtime_job_in_transaction(con, row)
+
+    def _cancel_runtime_job_in_transaction(self, con: sqlite3.Connection, row: sqlite3.Row) -> RuntimeJob:
+        job = self._load_runtime_job_row(row)
+        if job.status in {RuntimeJobStatus.queued, RuntimeJobStatus.interrupted}:
+            terminal = RuntimeJobStatus.cancelled
+        elif job.status is RuntimeJobStatus.running:
+            terminal = RuntimeJobStatus.cancel_requested
+        else:
             return job
+        now = _now()
+        job.status = terminal
+        self._interrupt_job_analysis(con, job, "JOB_CANCELLED")
+        if job.job_type == "STRATEGY_EXPERIMENT":
+            experiment_row = con.execute(
+                "SELECT payload FROM strategy_experiments WHERE id=?", (job.input_payload.get("experiment_id"),)
+            ).fetchone()
+            if experiment_row:
+                experiment = StrategyExperiment.model_validate_json(experiment_row["payload"])
+                if experiment.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
+                    experiment.status = "CANCELLED" if terminal is RuntimeJobStatus.cancelled else "CANCEL_REQUESTED"
+                    experiment.cancel_requested_at = now
+                    if terminal is RuntimeJobStatus.cancelled:
+                        experiment.progress, experiment.finished_at = 100, now
+                    con.execute(
+                        "UPDATE strategy_experiments SET payload=? WHERE id=?",
+                        (experiment.model_dump_json(), experiment.id),
+                    )
+        job.updated_at = now
+        if terminal is RuntimeJobStatus.cancelled:
+            job.progress = 100
+            job.finished_at = now
+        con.execute(
+            "UPDATE runtime_jobs SET status=?, progress=?, payload=?, updated_at=?, finished_at=? WHERE id=?",
+            (job.status.value, job.progress, job.model_dump_json(), now, job.finished_at, job.id),
+        )
+        return job
 
     def list_pending_outbox(self, limit: int = 100) -> list[OutboxEvent]:
         with self._connect() as con:
@@ -5718,6 +6152,7 @@ class Store:
     ) -> PlanVersion:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            job = self._assert_job_authority(con)
             if idempotency_key:
                 publication = con.execute(
                     "SELECT request_fingerprint, plan_version_id FROM publication_keys WHERE key=?", (idempotency_key,)
@@ -6227,6 +6662,45 @@ class Store:
                     "INSERT INTO publication_keys(key, request_fingerprint, plan_version_id, created_at) VALUES (?, ?, ?, ?)",
                     (idempotency_key, request_fingerprint or "", plan.id, plan.created_at),
                 )
+                for command in con.execute(
+                    "SELECT * FROM command_keys WHERE publication_key=?", (idempotency_key,)
+                ).fetchall():
+                    command_payload = self._load_command_row(command)["payload"]
+                    self._update_command_row(
+                        con,
+                        command,
+                        status="PLAN_PUBLISHED"
+                        if str(command["namespace"]).endswith(":manual-reassignment")
+                        else "COMPLETED",
+                        resource_type="plan_version",
+                        resource_id=plan.id,
+                        payload={**command_payload, "plan_version_id": plan.id, "schedule_id": chosen.id},
+                    )
+            if action == "replan":
+                demand_ids = {order.id for order in scenario.work_orders}
+                for receipt_row in con.execute(
+                    "SELECT * FROM emergency_intake_receipts WHERE scenario_id=? AND status='ACTIVE'", (scenario.id,)
+                ).fetchall():
+                    receipt = self._load_emergency_intake_receipt_row(receipt_row)
+                    if receipt.work_order_id not in demand_ids:
+                        continue
+                    receipt.status = EmergencyIntakeStatus.consumed
+                    receipt.replan_plan_version_id = plan.id
+                    receipt.updated_at = _now()
+                    receipt.receipt_hash = _emergency_intake_receipt_hash(receipt)
+                    con.execute(
+                        "UPDATE emergency_intake_receipts SET status=?,replan_plan_version_id=?,receipt_hash=?,payload=?,updated_at=? WHERE id=?",
+                        (
+                            receipt.status.value,
+                            plan.id,
+                            receipt.receipt_hash,
+                            receipt.model_dump_json(),
+                            receipt.updated_at,
+                            receipt.id,
+                        ),
+                    )
+            if job is not None:
+                self._commit_job_result(con, job, "plan_version", plan.id)
             if experiment_id or experiment_candidate_id:
                 if not experiment_id or not experiment_candidate_id:
                     raise PublicationConflict("实验发布缺少实验或候选标识")
@@ -6274,6 +6748,7 @@ class Store:
         """Freeze every planning input and create its run in one SQLite write snapshot."""
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._assert_job_authority(con)
             scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
             if not scenario_row:
                 raise KeyError(f"scenario {scenario_id} not found")
@@ -6420,8 +6895,9 @@ class Store:
                     run.status = ScheduleRunStatus.running
                     run.termination_reason = None
                     run.finished_at = None
+                    run.result_manifest = None
                     con.execute(
-                        "UPDATE schedule_runs SET status=?, payload=? WHERE id=?",
+                        "UPDATE schedule_runs SET status=?, payload=?, result_manifest_hash=NULL WHERE id=?",
                         (run.status.value, run.model_dump_json(), run.id),
                     )
                 return reservation, run
@@ -6657,8 +7133,17 @@ class Store:
                     record_type="SCHEDULE_RUN",
                 )
         relational_result_hash = row["result_manifest_hash"]
+        if run.status not in {ScheduleRunStatus.running, ScheduleRunStatus.queued} and relational_result_hash is None:
+            raise DecisionAnalysisIntegrityError("求解终态缺少结果清单", record_id=run.id, record_type="SCHEDULE_RUN")
         if relational_result_hash is not None:
             result = run.result_manifest
+            candidate = (
+                con.execute(
+                    "SELECT candidate_manifest_hash FROM schedule_candidates WHERE id=?", (run.candidate_id,)
+                ).fetchone()
+                if run.candidate_id
+                else None
+            )
             if (
                 result is None
                 or result.manifest_hash != str(relational_result_hash)
@@ -6667,7 +7152,17 @@ class Store:
                 or result.status is not run.status
                 or result.candidate_id != run.candidate_id
                 or result.finished_at != run.finished_at
+                or result.termination_reason != run.termination_reason
+                or result.solution_found != run.solution_found
+                or result.solver_name != run.solver_name
+                or result.solver_version != run.solver_version
+                or result.solver_policy_fingerprint != run.solver_policy_fingerprint
+                or result.planning_context_hash != run.planning_context_hash
                 or row["candidate_id"] != run.candidate_id
+                or (
+                    result.candidate_manifest_hash is not None
+                    and (candidate is None or candidate["candidate_manifest_hash"] != result.candidate_manifest_hash)
+                )
             ):
                 raise DecisionAnalysisIntegrityError(
                     "求解记录结果清单校验失败",
@@ -6730,6 +7225,9 @@ class Store:
     def save_schedule_run(self, run: ScheduleRun) -> ScheduleRun:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._assert_job_authority(
+                con, allow_cancel=run.status in {ScheduleRunStatus.failed, ScheduleRunStatus.cancelled}
+            )
             existing_row = con.execute(
                 "SELECT * FROM schedule_runs WHERE id=?",
                 (run.id,),
@@ -6835,6 +7333,7 @@ class Store:
             raise PublicationConflict("完成求解记录前必须设置终态和对应候选")
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._assert_job_authority(con)
             run_row = con.execute("SELECT * FROM schedule_runs WHERE id=?", (run.id,)).fetchone()
             if not run_row:
                 raise PublicationConflict("求解记录不存在")
@@ -7100,7 +7599,9 @@ class Store:
                     (run.plan_version_id, run.analysis_type, run.input_hash),
                 ).fetchone()
                 if existing:
-                    return (self._load_analysis_row(con, existing), False)
+                    existing_run = self._load_analysis_row(con, existing)
+                    self._bind_job_analysis(con, existing_run.id, owns=False)
+                    return (existing_run, False)
             plan_row = con.execute(
                 "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE id=? AND scenario_id=?",
                 (run.plan_version_id, run.scenario_id),
@@ -7163,6 +7664,7 @@ class Store:
                 "INSERT INTO decision_analysis_attempts(logical_analysis_id, attempt_number, analysis_run_id) VALUES (?, ?, ?)",
                 (saved.logical_analysis_id, saved.attempt_number, saved.id),
             )
+            self._bind_job_analysis(con, saved.id, owns=True)
             return saved, True
 
     def finish_decision_analysis_run(
@@ -7175,6 +7677,13 @@ class Store:
             raise PublicationConflict("经营分析只能结束为完成、失败或中断")
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            job = self._assert_job_authority(con, allow_cancel=run.status == "INTERRUPTED")
+            binding = con.execute(
+                "SELECT job_id,generation FROM job_analysis_bindings WHERE analysis_id=? AND owns_computation=1",
+                (run.id,),
+            ).fetchone()
+            if binding and (job is None or binding["job_id"] != job.id or binding["generation"] != job.attempt_number):
+                raise PublicationConflict("分析结果需要原任务代际的提交权限", code="JOB_LEASE_LOST")
             row = con.execute(
                 """
                 SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
@@ -7297,6 +7806,28 @@ class Store:
                         artifact_blob_hash,
                         artifact.created_at,
                     ),
+                )
+            if job is not None and run.status in {"COMPLETED", "FAILED"}:
+                operation = job.input_payload.get("operation")
+                if operation:
+                    namespace = (
+                        f"{run.scenario_id}:analysis-{'retry' if operation['mode'] == 'retry' else 'rerun-current'}"
+                    )
+                    command = con.execute(
+                        "SELECT * FROM command_keys WHERE namespace=? AND key=?",
+                        (namespace, operation["idempotency_key"]),
+                    ).fetchone()
+                    if command:
+                        self._update_command_row(
+                            con,
+                            command,
+                            status="COMPLETED",
+                            resource_type="decision_analysis_run",
+                            resource_id=run.id,
+                            payload={**self._load_command_row(command)["payload"], "analysis_id": run.id},
+                        )
+                self._commit_job_result(
+                    con, job, "decision_analysis", run.id, failed=run.status == "FAILED", error=run.error
                 )
         return run
 
@@ -7519,6 +8050,9 @@ class Store:
         self,
         scenario_id: str,
         plan_version_id: str,
+        *,
+        limit: int = -1,
+        offset: int = 0,
     ) -> list[DecisionAnalysisRun]:
         runs: list[DecisionAnalysisRun] = []
         with self._lock, self._connect() as con:
@@ -7527,9 +8061,9 @@ class Store:
                 SELECT id, scenario_id, number, plan_version_id, analysis_type, created_at, payload, attestation_requirement,
                        input_hash, status, started_at, finished_at, analysis_manifest_hash
                 FROM decision_analysis_runs
-                WHERE scenario_id=? AND plan_version_id=? ORDER BY number
+                WHERE scenario_id=? AND plan_version_id=? ORDER BY number DESC LIMIT ? OFFSET ?
                 """,
-                (scenario_id, plan_version_id),
+                (scenario_id, plan_version_id, limit, offset),
             ).fetchall()
             for row in rows:
                 try:
@@ -7542,7 +8076,7 @@ class Store:
                         str(row["payload"]),
                         f"read isolation: {error.record_type}",
                     )
-        return runs
+        return list(reversed(runs))
 
     def get_verified_decision_analysis_run(
         self,
@@ -7563,8 +8097,10 @@ class Store:
             ).fetchone()
             return self._load_analysis_row(con, row) if row else None
 
-    def list_decision_analysis_runs(self, scenario_id: str, plan_version_id: str) -> list[DecisionAnalysisRun]:
-        return self.list_verified_decision_analysis_runs(scenario_id, plan_version_id)
+    def list_decision_analysis_runs(
+        self, scenario_id: str, plan_version_id: str, *, limit: int = -1, offset: int = 0
+    ) -> list[DecisionAnalysisRun]:
+        return self.list_verified_decision_analysis_runs(scenario_id, plan_version_id, limit=limit, offset=offset)
 
     def get_decision_analysis_run(self, scenario_id: str, analysis_id: str) -> DecisionAnalysisRun | None:
         return self.get_verified_decision_analysis_run(scenario_id, analysis_id)
@@ -8083,12 +8619,18 @@ class Store:
         self,
         scenario_id: str,
         include_snapshots: bool = False,
+        *,
+        limit: int = -1,
+        offset: int = 0,
+        newest: bool = False,
     ) -> tuple[list[PlanVersion], list[dict[str, str]]]:
         warnings: list[dict[str, str]] = []
         with self._lock, self._connect() as con:
             rows = con.execute(
-                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? ORDER BY number",
-                (scenario_id,),
+                "SELECT id, scenario_id, number, created_at, payload, attestation_requirement FROM plan_versions WHERE scenario_id=? ORDER BY number "
+                + ("DESC " if newest else "ASC ")
+                + "LIMIT ? OFFSET ?",
+                (scenario_id, limit, offset),
             ).fetchall()
             plans = []
             for row in rows:
@@ -8114,7 +8656,7 @@ class Store:
                     plan.scenario_snapshot = None
                     plan.artifacts = []
                 plans.append(plan)
-        return plans, warnings
+        return (list(reversed(plans)) if newest else plans), warnings
 
     def list_plan_versions(self, scenario_id: str, include_snapshots: bool = False) -> list[PlanVersion]:
         plans, _warnings = self.list_plan_versions_with_warnings(scenario_id, include_snapshots)
@@ -8169,6 +8711,7 @@ class Store:
         work_order_views: list[OperationalWorkOrderView] = []
         for order in scenario.work_orders:
             assignment = assignments.get(order.id)
+            active_booking = None
             start_blocking_reason: str | None = None
             complete_blocking_reason: str | None = "WORK_ORDER_NOT_STARTED"
             complete_allowed = False
@@ -8194,7 +8737,16 @@ class Store:
                 elif complete_row:
                     complete_blocking_reason = "DUPLICATE_COMPLETE_EVENT"
                 else:
-                    self._load_execution_event_row(con, start_row)
+                    start_event = self._load_execution_event_row(con, start_row)
+                    active_booking = ActiveBookingView(
+                        booking_id=start_event.booking_id,
+                        start_event_id=start_event.id,
+                        work_order_id=order.id,
+                        technician_id=start_event.technician_id,
+                        actual_start_at=start_event.occurred_at,
+                        planned_start_at=start_event.planned_start_at,
+                        planned_finish_at=start_event.planned_finish_at,
+                    )
                     complete_allowed = True
                     complete_blocking_reason = None
             elif order.id in invalid:
@@ -8216,6 +8768,7 @@ class Store:
                     assignment=assignment,
                     start_allowed=start_allowed,
                     complete_allowed=complete_allowed,
+                    active_booking=active_booking,
                     start_blocking_reason_code=start_blocking_reason,
                     complete_blocking_reason_code=complete_blocking_reason,
                     blocking_reason_code=start_blocking_reason,
@@ -8261,6 +8814,7 @@ class Store:
 
     def dispatch_snapshot(self, scenario_id: str) -> DispatchSnapshot:
         with self._lock, self._connect() as con:
+            generation = self._database_generation()
             con.execute("BEGIN")
             scenario_row = con.execute("SELECT * FROM scenarios WHERE id=?", (scenario_id,)).fetchone()
             if not scenario_row:
@@ -8284,25 +8838,7 @@ class Store:
                 self._require_loaded_plan_for_use(plan, PlanUseCase.execute)
             execution_context = self._execution_source_context(con, scenario, active_plan_id or None)
             operational = self._operational_view_in_transaction(con, scenario, plan, execution_context)
-            revision_rows = con.execute(
-                "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number",
-                (scenario_id,),
-            ).fetchall()
-            revision_history_issue_count = 0
-            expected_number = 0
-            previous_hash: str | None = None
-            for revision_row in revision_rows:
-                try:
-                    if int(revision_row["number"]) != expected_number:
-                        raise ValueError("revision sequence gap")
-                    revision = self._load_revision_row(con, revision_row, previous_hash)
-                    previous_hash = revision.revision_hash
-                except (DecisionAnalysisIntegrityError, TypeError, ValueError):
-                    revision_history_issue_count += 1
-                    previous_hash = None
-                expected_number += 1
-            if len(revision_rows) != scenario.revision + 1:
-                revision_history_issue_count += abs(len(revision_rows) - (scenario.revision + 1)) or 1
+            revision_history_issue_count = self._revision_history_issues(con, scenario, generation)
             revision_history_integrity = (
                 AnalysisIntegrityStatus.verified
                 if revision_history_issue_count == 0
@@ -8376,6 +8912,19 @@ class Store:
             row = con.execute("SELECT payload FROM schedules WHERE id=?", (schedule_id,)).fetchone()
         return ScheduleResult.model_validate_json(row["payload"]) if row else None
 
+    def plan_for_schedule(self, scenario_id: str, schedule_id: str) -> PlanVersion:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT p.* FROM plan_versions p JOIN schedules s ON s.scenario_id=p.scenario_id AND s.version=p.number WHERE s.id=? AND p.scenario_id=?",
+                (schedule_id, scenario_id),
+            ).fetchone()
+            if row is None:
+                raise PublicationConflict("排程没有对应的正式方案", code="PUBLICATION_OUTCOME_MISSING")
+            plan = self._require_loaded_plan_for_use(self._load_plan_row(con, row), PlanUseCase.replay)
+            if plan.selected.id != schedule_id:
+                raise PublicationConflict("发布结果身份不一致", code="PUBLICATION_OUTCOME_MISMATCH")
+            return plan
+
     def latest_schedule(
         self, scenario_id: str, kind: str | None = None, scenario_revision: int | None = None
     ) -> ScheduleResult | None:
@@ -8439,11 +8988,12 @@ class Store:
     def save_experiment(self, experiment: StrategyExperiment) -> None:
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            job = self._assert_job_authority(con, allow_cancel=True)
             row = con.execute("SELECT payload FROM strategy_experiments WHERE id=?", (experiment.id,)).fetchone()
             if row:
                 current = StrategyExperiment.model_validate_json(row["payload"])
                 terminal = {"CANCELLED", "COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "INTERRUPTED"}
-                if current.status in terminal and experiment.status != current.status:
+                if current.status in terminal:
                     return
                 if current.status == "CANCEL_REQUESTED":
                     if experiment.status in terminal:
@@ -8475,6 +9025,17 @@ class Store:
                     ),
                 )
 
+            if job is not None and experiment.status in {"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"}:
+                self._commit_job_result(
+                    con,
+                    job,
+                    "strategy_experiment",
+                    experiment.id,
+                    failed=experiment.status == "FAILED",
+                    cancelled=experiment.status == "CANCELLED",
+                    error={"message": experiment.error} if experiment.error else None,
+                )
+
     def queue_experiment(self, experiment: StrategyExperiment) -> tuple[StrategyExperiment, bool]:
         """Persist a queued experiment, coalescing an identical active request."""
         with self._lock, self._connect() as con:
@@ -8485,6 +9046,10 @@ class Store:
             ).fetchall()
             for row in rows:
                 existing = StrategyExperiment.model_validate_json(row["payload"])
+                if existing.id == experiment.id:
+                    if existing.fingerprint != experiment.fingerprint:
+                        raise PublicationConflict("实验命令键已用于不同输入", code="IDEMPOTENCY_KEY_REUSED")
+                    return existing, False
                 if (
                     existing.status in {"QUEUED", "RUNNING"}
                     and existing.fingerprint
@@ -8503,8 +9068,9 @@ class Store:
                     "experiment_id": experiment.id,
                     "time_limit_seconds": experiment.requested_time_limit_seconds,
                     "experiment_fingerprint": experiment.fingerprint,
+                    "travel_provider": freeze_travel_provider(self.travel_provider),
                 },
-                dedupe_key=experiment.fingerprint,
+                dedupe_key=experiment.id,
                 job_id=f"JOB-EXP-{experiment.id}",
             )
             return experiment, True
@@ -8548,6 +9114,9 @@ class Store:
 
     def request_experiment_cancel(self, experiment_id: str) -> StrategyExperiment | None:
         """Atomically record cooperative cancellation without clobbering a terminal result."""
+        if self.get_runtime_job(f"JOB-EXP-{experiment_id}") is not None:
+            self.request_runtime_job_cancel(f"JOB-EXP-{experiment_id}")
+            return self.get_experiment(experiment_id)
         with self._lock, self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT payload FROM strategy_experiments WHERE id=?", (experiment_id,)).fetchone()
@@ -8612,6 +9181,53 @@ class Store:
                 "compressed_bytes": int(row["compressed_bytes"]),
             }
 
+    def audit_domain_integrity(self) -> str | list[dict[str, str]]:
+        """Explicit read-only full-history verification, distinct from SQLite checks."""
+        failures: list[dict[str, str]] = []
+        with self._connect() as con:
+            con.execute("BEGIN")
+            for row in con.execute("SELECT * FROM scenarios").fetchall():
+                try:
+                    scenario = self._load_scenario_head_row(con, row)
+                    previous = None
+                    revisions = con.execute(
+                        "SELECT * FROM scenario_revisions WHERE scenario_id=? ORDER BY number", (scenario.id,)
+                    ).fetchall()
+                    if len(revisions) != scenario.revision + 1:
+                        raise ValueError("revision count mismatch")
+                    for number, revision_row in enumerate(revisions):
+                        if revision_row["number"] != number:
+                            raise ValueError("revision sequence gap")
+                        previous = self._load_revision_row(con, revision_row, previous).revision_hash
+                    self._execution_source_context(con, scenario, row["active_plan_version_id"])
+                except (ValueError, RuntimeError) as error:
+                    failures.append({"table": "scenarios", "id": row["id"], "reason": str(error)})
+            loaders = (
+                ("plan_versions", self._load_plan_row),
+                ("decision_analysis_runs", self._load_analysis_row),
+                ("risk_comparison_runs", self._load_risk_comparison_row),
+                ("schedule_runs", self._load_schedule_run_row),
+            )
+            for table, loader in loaders:
+                for row in con.execute(f"SELECT * FROM {table}").fetchall():
+                    try:
+                        value = loader(con, row)
+                        if getattr(value, "effective_integrity", None) is AnalysisIntegrityStatus.failed:
+                            raise ValueError("record proof or dependency failed")
+                    except (ValueError, RuntimeError) as error:
+                        failures.append({"table": table, "id": row["id"], "reason": str(error)})
+            for row in con.execute("SELECT * FROM command_keys").fetchall():
+                try:
+                    self._load_command_row(row)
+                except (ValueError, RuntimeError) as error:
+                    failures.append({"table": "command_keys", "id": row["key"], "reason": str(error)})
+            for row in con.execute("SELECT content_hash FROM artifact_blobs").fetchall():
+                try:
+                    _read_artifact_blob(con, row["content_hash"])
+                except ValueError as error:
+                    failures.append({"table": "artifact_blobs", "id": row["content_hash"], "reason": str(error)})
+        return failures or "VERIFIED"
+
     def export_artifact_blob(self, blob_hash: str) -> bytes:
         with self._connect() as con:
             return _read_artifact_blob(con, blob_hash)
@@ -8621,6 +9237,7 @@ class Store:
             raise ValueError("retention_days must be non-negative")
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
         with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
             rows = con.execute(
                 "SELECT content_hash FROM artifact_blobs b WHERE b.created_at < ? "
                 "AND NOT EXISTS (SELECT 1 FROM decision_analysis_artifacts a "

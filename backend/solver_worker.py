@@ -6,18 +6,34 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .database_lock import database_access
 from .hashing import content_hash
-from .models import ScheduleResult, ScheduleScenario, StrategyProfile
+from .job_authority import JobAuthority, job_authority
+from .models import PlanningContext, ScheduleResult, ScheduleScenario, StrategyProfile
 from .normalization import normalize_schedule
 from .scheduler import (
     baseline_schedule,
     build_solver_policy_snapshot,
     optimized_schedule,
+    replan_schedule,
     scenario_for_profile,
 )
-from .travel import EuclideanTravelTimeProvider
+from .travel import DEFAULT_TRAVEL_PROVIDER, restore_travel_provider
 
 PROCESS_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def stop_process(process) -> None:
+    if process is None or process.pid is None:
+        return
+    if process.is_alive():
+        process.terminate()
+    process.join(timeout=2)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=2)
+    if process.is_alive():
+        raise RuntimeError("CHILD_PROCESS_DID_NOT_STOP")
 
 
 def _apply_resource_limits(time_limit_seconds: float) -> None:
@@ -59,13 +75,15 @@ def process_exceeds_memory_limit(pid: int | None, *, limit_bytes: int = PROCESS_
     return resident is not None and resident > limit_bytes
 
 
-def solve_strategy_candidate_payload(scenario_payload: dict[str, Any], profile_payload: dict[str, Any]) -> str:
+def solve_strategy_candidate_payload(
+    scenario_payload: dict[str, Any], profile_payload: dict[str, Any], provider_payload: dict | None = None
+) -> str:
     scenario = ScheduleScenario.model_validate(scenario_payload)
     profile = StrategyProfile.model_validate(profile_payload)
     _apply_resource_limits(profile.time_limit_seconds)
     effective = scenario_for_profile(scenario, profile)
     strategy_key = profile.id if profile.builtin else "custom"
-    provider = EuclideanTravelTimeProvider()
+    provider = restore_travel_provider(provider_payload) if provider_payload else DEFAULT_TRAVEL_PROVIDER
     baseline = baseline_schedule(effective, 0, strategy_key, provider=provider)
     result = optimized_schedule(
         effective,
@@ -99,9 +117,32 @@ def strategy_candidate_process(
     connection: multiprocessing.connection.Connection,
     scenario_payload: dict[str, Any],
     profile_payload: dict[str, Any],
+    provider_payload: dict | None = None,
 ) -> None:
     try:
-        connection.send(("ok", solve_strategy_candidate_payload(scenario_payload, profile_payload)))
+        connection.send(("ok", solve_strategy_candidate_payload(scenario_payload, profile_payload, provider_payload)))
+    except BaseException as error:
+        connection.send(("error", {"type": type(error).__name__, "message": str(error)}))
+    finally:
+        connection.close()
+
+
+def replan_candidate_process(
+    connection, scenario_payload, previous_payload, planning_time, limit, strategy, context_payload, provider_payload
+) -> None:
+    try:
+        _apply_resource_limits(limit)
+        result = replan_schedule(
+            ScheduleScenario.model_validate(scenario_payload),
+            0,
+            ScheduleResult.model_validate(previous_payload),
+            planning_time,
+            limit,
+            strategy,
+            planning_context=PlanningContext.model_validate(context_payload),
+            provider=restore_travel_provider(provider_payload),
+        )
+        connection.send(("ok", result.model_dump_json()))
     except BaseException as error:
         connection.send(("error", {"type": type(error).__name__, "message": str(error)}))
     finally:
@@ -115,6 +156,9 @@ def decision_analysis_process(
     plan_version_id: str,
     request_payload: dict[str, Any],
     cpu_time_limit_seconds: float,
+    authority: JobAuthority,
+    provider_payload: dict,
+    operation: dict | None = None,
 ) -> None:
     try:
         _apply_resource_limits(cpu_time_limit_seconds)
@@ -124,18 +168,32 @@ def decision_analysis_process(
         from .models import DecisionAnalysisRunRequest, PlanUseCase
         from .storage import Store
 
-        child_store = Store(database_path, allow_migration=False, recover_runtime=False)
+        child_store = Store(
+            database_path,
+            travel_provider=restore_travel_provider(provider_payload),
+            allow_migration=False,
+            recover_runtime=False,
+        )
         main_module.store = child_store
         request = main_module.TypeAdapter(DecisionAnalysisRunRequest).validate_python(request_payload)
         plan = main_module.require_plan_for_use(scenario_id, plan_version_id, PlanUseCase.analyze)
-        run = main_module.execute_decision_analysis_run(
-            scenario_id,
-            plan,
-            request,
-            Response(),
-            on_reserved=lambda reserved: connection.send(("reserved", {"analysis_id": reserved.id})),
-            resume_interrupted=True,
-        )
+        with database_access(database_path), job_authority(authority):
+            if operation:
+                handler = (
+                    main_module.retry_decision_analysis_run
+                    if operation["mode"] == "retry"
+                    else main_module.rerun_decision_analysis_current
+                )
+                run = handler(scenario_id, operation["analysis_id"], Response(), operation["idempotency_key"])
+            else:
+                run = main_module.execute_decision_analysis_run(
+                    scenario_id,
+                    plan,
+                    request,
+                    Response(),
+                    on_reserved=lambda reserved: connection.send(("reserved", {"analysis_id": reserved.id})),
+                    resume_interrupted=True,
+                )
         connection.send(("ok", {"analysis_id": run.id, "status": run.status, "error": run.error}))
     except BaseException as error:
         connection.send(("error", {"type": type(error).__name__, "message": str(error)}))

@@ -62,7 +62,7 @@ def test_child_store_does_not_run_application_restart_recovery(tmp_path):
     assert still_running.status is RuntimeJobStatus.running
     assert still_running.lease_owner == "parent-worker"
 
-    Store(database, allow_migration=False)
+    Store(database, allow_migration=False, recover_runtime=True)
     interrupted = store.get_runtime_job(job.id)
     assert interrupted is not None and interrupted.status is RuntimeJobStatus.interrupted
 
@@ -92,10 +92,10 @@ def test_runtime_job_lease_outbox_and_terminal_invariants(tmp_path):
     assert claimed.status is RuntimeJobStatus.running
     assert claimed.attempt_number == 1
     assert store.claim_runtime_job("worker-b", job_id=job.id) is None
-    heartbeat = store.heartbeat_runtime_job(job.id, "worker-a", 45)
+    heartbeat = store.heartbeat_runtime_job(job.id, "worker-a", 45, generation=claimed.attempt_number)
     assert heartbeat.progress == 45
     with pytest.raises(PublicationConflict, match="租约"):
-        store.heartbeat_runtime_job(job.id, "worker-b", 50)
+        store.heartbeat_runtime_job(job.id, "worker-b", 50, generation=claimed.attempt_number)
 
     completed = store.finish_runtime_job(
         job.id,
@@ -103,6 +103,7 @@ def test_runtime_job_lease_outbox_and_terminal_invariants(tmp_path):
         status=RuntimeJobStatus.completed,
         result_resource_type="decision_analysis",
         result_resource_id="A001",
+        generation=claimed.attempt_number,
     )
     assert completed.status is RuntimeJobStatus.completed
     assert completed.progress == 100
@@ -230,8 +231,9 @@ def test_emergency_intake_outbox_recovers_replan_after_restart(monkeypatch, tmp_
             request_fingerprint=content_hash({"scenario_id": "main", "work_order": order}),
             replan_job_payload={"request": request.model_dump(mode="json", exclude_unset=True)},
         )
-        job_id = f"JOB-EMG-{content_hash({'namespace': intake_namespace, 'key': intake_key})[:16]}"
-        assert store.get_runtime_job(job_id).status is RuntimeJobStatus.queued
+        job = next(item for item in store.list_runtime_jobs("main") if item.job_type == "REPLAN")
+        job_id = job.id
+        assert job.input_payload["request"]["intake_idempotency_key"] == intake_key
 
     main_module = importlib.reload(main_module)
     with TestClient(main_module.app) as client:

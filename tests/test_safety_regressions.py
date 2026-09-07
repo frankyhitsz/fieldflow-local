@@ -1034,7 +1034,7 @@ def test_running_command_reconciles_to_retryable_after_restart(tmp_path):
         payload={"run_id": "RUN-ABANDONED"},
     )
     assert created is True
-    restarted = Store(database)
+    restarted = Store(database, recover_runtime=True)
     command = restarted.get_command_record(
         "schedule-solve",
         "main:optimize:recoverable-command",
@@ -1078,7 +1078,7 @@ def test_restart_after_replan_intake_committed_is_recoverable(tmp_path):
         publication_key=publication_key,
     )
 
-    restarted = Store(database)
+    restarted = Store(database, recover_runtime=True)
     command = restarted.get_command_record(namespace, key, "fingerprint-emergency-001")
     assert command["status"] == "FAILED_RETRYABLE"
     assert command["publication_key"] == publication_key
@@ -1106,7 +1106,7 @@ def test_completed_intake_record_is_not_mistaken_for_abandoned_replan(tmp_path):
         resource_id="WO-EMG-INTAKE",
         payload={"work_order_id": "WO-EMG-INTAKE"},
     )
-    restarted = Store(database)
+    restarted = Store(database, recover_runtime=True)
     command = restarted.get_command_record(
         "main:emergency-intake",
         "intake-only-001",
@@ -1145,7 +1145,7 @@ def test_restart_reconciles_emergency_command_with_explicit_publication_key(monk
         publication_key=publication_key,
     )
 
-    restarted = Store(database)
+    restarted = Store(database, recover_runtime=True)
     command = restarted.get_command_record(namespace, key, "emergency-published-fingerprint")
     assert command["status"] == "COMPLETED"
     assert command["resource_id"] == published_plan["id"]
@@ -1659,7 +1659,7 @@ def test_replan_idempotency_key_cannot_replay_an_old_aggregate(monkeypatch, tmp_
         )
         stale_replay = client.post("/api/scenarios/main/replan", json=payload)
         assert stale_replay.status_code == 409
-        assert "不同请求" in str(stale_replay.json()["detail"])
+        assert stale_replay.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
 
 
 def test_verifier_rejects_missing_duplicate_overlap_and_forged_kpis():

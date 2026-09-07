@@ -4,6 +4,7 @@ import ast
 import os
 import platform
 import sqlite3
+import tomllib
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -14,7 +15,9 @@ from .models import DecisionAnalysisContext, DecisionInputManifest, PlanVersion,
 DECISION_ALGORITHM_VERSION = "FIELD_SERVICE_DECISION_V3"
 DECISION_SOURCE_FILES = (
     "decision.py",
+    "execution.py",
     "hashing.py",
+    "normalization.py",
     "planning.py",
     "provenance.py",
     "scheduler.py",
@@ -22,6 +25,48 @@ DECISION_SOURCE_FILES = (
     "travel.py",
     "verification.py",
 )
+
+
+def decision_source_closure(backend_root: Path) -> list[dict[str, str]]:
+    source: list[dict[str, str]] = []
+    for filename in DECISION_SOURCE_FILES:
+        path = backend_root / filename
+        content = path.read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(content)):
+            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+                if node.module not in {"models", "_version"} and node.module + ".py" not in DECISION_SOURCE_FILES:
+                    raise RuntimeError(f"Decision source dependency is not declared: {filename} -> {node.module}")
+        source.append({"path": filename, "content": content})
+    main_source = (backend_root / "main.py").read_text(encoding="utf-8")
+    names = {
+        "execute_decision_analysis_run",
+        "paired_metric_summary",
+        "compare_plan_risk_paired",
+        "resolve_decision_analysis_context",
+    }
+    for node in ast.parse(main_source).body:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            source.append({"path": f"main.py#{node.name}", "content": ast.get_source_segment(main_source, node) or ""})
+    source.extend(_decision_model_source_closure(backend_root))
+    return source
+
+
+def runtime_dependency_inputs(root: Path) -> list[dict[str, object]]:
+    inputs: list[dict[str, object]] = []
+    project_path = root / "pyproject.toml"
+    if project_path.exists():
+        project = tomllib.loads(project_path.read_text(encoding="utf-8")).get("project", {})
+        inputs.append(
+            {
+                "path": "pyproject.toml#runtime",
+                "requires-python": project.get("requires-python"),
+                "dependencies": project.get("dependencies", []),
+            }
+        )
+    lock = root / "requirements-runtime.lock"
+    if lock.exists():
+        inputs.append({"path": lock.name, "content": lock.read_text(encoding="utf-8")})
+    return inputs
 
 
 def _decision_model_source_closure(backend_root: Path) -> list[dict[str, str]]:
@@ -124,15 +169,7 @@ def decision_build_sha() -> str:
     if injected:
         return injected
     backend_root = Path(__file__).resolve().parent
-    source = [
-        {
-            "path": path.name,
-            "content": path.read_text(encoding="utf-8"),
-        }
-        for name in DECISION_SOURCE_FILES
-        if (path := backend_root / name).exists()
-    ]
-    source.extend(_decision_model_source_closure(backend_root))
+    source = decision_source_closure(backend_root)
     return f"dev-{content_hash(source)[:16]}"
 
 
@@ -160,12 +197,10 @@ def _runtime_distribution_inventory(lock_path: Path) -> dict[str, str]:
 @lru_cache(maxsize=1)
 def decision_runtime_manifest() -> RuntimeManifest:
     root = Path(__file__).resolve().parent.parent
+    if (Path(__file__).resolve().parent / "_runtime").is_dir():
+        root = Path(__file__).resolve().parent / "_runtime"
     runtime_lock = root / "requirements-runtime.lock"
-    lock_inputs: list[dict[str, str]] = []
-    for relative in ("pyproject.toml", "requirements-runtime.lock"):
-        path = root / relative
-        if path.exists():
-            lock_inputs.append({"path": relative, "content": path.read_text(encoding="utf-8")})
+    lock_inputs = runtime_dependency_inputs(root)
     return RuntimeManifest(
         hash_schema_version=HASH_SCHEMA_VERSION,
         python_version=platform.python_version(),
@@ -183,6 +218,8 @@ def decision_runtime_manifest() -> RuntimeManifest:
 @lru_cache(maxsize=1)
 def release_manifest() -> ReleaseManifest:
     root = Path(__file__).resolve().parent.parent
+    if (Path(__file__).resolve().parent / "_runtime").is_dir():
+        root = Path(__file__).resolve().parent / "_runtime"
     frontend_lock = root / "frontend" / "package-lock.json"
     return ReleaseManifest(
         release_build_sha=os.getenv("FIELDFLOW_RELEASE_SHA", "dev-unreleased").strip() or "dev-unreleased",
