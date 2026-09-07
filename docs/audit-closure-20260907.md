@@ -2,7 +2,7 @@
 
 起点：`35d3d6b41e3d193819a93937f8ea133d3310b27d`，v0.5.11 / schema 27。
 
-实现终点：`2fe12586ad353aebd5811eb94a4edf5e8ca052bf`，v0.5.12 / schema 28。后端/存储提交 `c78ddec`，前端提交 `60a4189`，发行与性能提交 `2fe1258`。
+实现终点：`b86aa30105263e2f0e533c3c66ea97154f5bd897`，v0.5.12 / schema 28。后端/存储提交 `c78ddec`，前端提交 `60a4189`，发行与性能提交 `2fe1258`；CI 复验后的停机恢复修复为 `b86aa30`。
 
 本记录区分静态判断、隔离机制实验和仓库实测。只有完成回归并取得输出的条目才标为关闭。迁移使用历史提交生成的临时数据库，不修改仓库根目录的用户数据库。
 
@@ -21,7 +21,7 @@
 | F07 | 成立。成功命令先从可信终态资源重放，不重新拿当前备注/状态与接收快照做完整 hash 比较。 | 上述备注重放测试、`test_emergency_command_replays_after_emergency_start`、旧执行命令重放回归 |
 | F08 | 成立。发布返回准确的 PlanVersion，后续命令、Receipt 和 Job 不再重查活动指针来决定本次结果。 | `test_other_plan_published_before_ack_cannot_change_command_result`，受控交错中第一请求仍返回 V001，第二请求为 V002 |
 | F09 | 成立，作为发布阻断处理。正式发布与 Job 完成在同一写事务决定；取消胜出时不能发布。 | `test_cancel_and_publish_have_one_transaction_winner` 的提交前/提交后两种 Event 交错 |
-| F10 | 成立。新增持续 Dispatcher、到期租约回收、重派上限和数据库入队上限；短任务保留工作槽，等待 30 秒的任务提升优先级。 | 持久重启恢复、代际回收、容量测试、`test_waiting_long_job_is_promoted_without_losing_short_job_priority` |
+| F10 | 成立。新增持续 Dispatcher、到期租约回收、重派上限和数据库入队上限；短任务保留工作槽，等待 30 秒的任务提升优先级。服务退出保留可续跑的 INTERRUPTED，不冒充用户取消。 | 持久重启恢复、代际回收、容量测试、`test_waiting_long_job_is_promoted_without_losing_short_job_priority`、六类 `test_service_shutdown_interrupts_started_job_and_restart_resumes` |
 | F11 | 条件成立。普通 Store 打开不恢复任务；启动恢复必须获得每库协调器锁，第二服务不能中断现存所有者。 | `test_child_store_does_not_run_application_restart_recovery`、协调器/维护锁回归 |
 | F12 | 成立。owner、generation、有效租约与取消状态共同控制心跳、A/Run/Candidate 写入、实验保存和 Plan 提交。 | `test_same_owner_old_generation_cannot_heartbeat_finish_or_commit` |
 | F13 | 成立。A 预留与 JobAttempt 绑定同事务；进程启动也位于异常收束范围；停止采用 terminate→有界 join→kill。 | `test_analysis_binding_survives_crash_before_ipc_and_cancel_interrupts_owner`、真实 spawn 启动失败测试 |
@@ -51,6 +51,8 @@
 
 完整门禁还发现新 Blob 引用触发器会阻碍 schema 1–15 的旧表重建。迁移现先在备份后移除该组触发器，完成表迁移再重建；24 项历史/维护回归和随后 348 项全量回归通过。收尾检查继续补齐紧急重排冻结模型、KPI 使用服务端比较结果和构建脚本精确选择本次产物，避免目录中的旧包干扰验收。
 
+实现提交在 CI #72 全绿后，只有文档变化的 CI #75 又在 macOS 触发一项重启失败（351 通过、1 失败）。原因不是文档：停机与用户取消共用了处理路径，加上旧测试让持续 Dispatcher 与模拟的同步 A 进程退出同时竞争，取决于任务何时被领取。修复将停机作为可恢复的 attempt 中断，取消仍保持终态；策略实验中断后回到 QUEUED，清理旧进度与错误展示。旧测试明确控制排队时机，另用真实进程和 Event 覆盖六类任务在启动后停机与重启，避免靠重复运行掩盖竞态。
+
 ## 任务包与取舍
 
 FF-1901–FF-1908 对应上表的历史兼容、维护、可信测试、实验、Receipt、取消和任务运行时。故障交错使用测试中对事务入口、进程启动器和确认入口的 Event/替换注入，不给正式接口添加调试断点。可原子提交的 Plan/command/Receipt/Job 在同一事务完成，因此没有再引入一套重复的 COMMITTED_PENDING_ACK 状态。
@@ -73,14 +75,16 @@ FF-1913 的独立发行包、构建锁、SBOM、恢复演练和本机边界已�
 
 ## 验证记录
 
+停机补修后的完整 `make verify` 退出码为 0：359 项后端通过（覆盖率 87.35%，436.03 秒）、26 项 React、7 项 Playwright、8/8 mutation，以及静态检查、依赖审计、生成契约、构建、Demo、历史性能和独立发行包验证均通过。日志：`/tmp/fieldflow-sept7-shutdown-verify.log`。停机专项 8 项另连续五轮通过，日志：`/tmp/fieldflow-sept7-shutdown-repeat.log`。
+
 首次完整 `make verify` 已通过：348 项后端、覆盖率 87.14%、8/8 mutation、24 项 React、7 项 Playwright，以及锁文件、静态检查、生成契约、依赖审计、构建、Demo、历史基准、wheel/sdist 独立安装服务链。此前的失败回归保留为修复过程，不用“定向测试通过”替代完整门禁。
 
 收尾补充验证：22 项运行时、15 项存储、15 项旧库/维护回归通过；26 项 React 连续五轮通过，7 项 Playwright 再次通过。原有执行时间测试改为等待快照核验后按钮可用，未绕过页面门禁。静态检查、构建、Demo、性能及发行包门禁均复验通过。
 
-冻结源码的 `make test`：352 passed，覆盖率 87.36%，退出码 0，耗时 423.54 秒。最后扩充的旧库 CLI 恢复再升级流程另跑 15 项，全部通过。
+停机补修前的 `make test`：352 passed，覆盖率 87.36%，退出码 0，耗时 423.54 秒。扩充的旧库 CLI 恢复再升级流程另跑 15 项，全部通过。
 
 最终验证命令的退出码均为 0：`make lock-check`、`make lint`、`make audit`、`make test`、`make mutation-test`、`make test-frontend`、`make build`、`make demo-check`、`make benchmark`、`make history-benchmark`、`make distribution-check`、`make test-e2e`。本地日志分别在 `/tmp/fieldflow-sept7-final-352.log`、`/tmp/fieldflow-sept7-final-gates.log`、`/tmp/fieldflow-sept7-react-repeat.log` 和 `/tmp/fieldflow-sept7-restore-cycle.log`；提交后的 CI 为干净检出提供复验。
 
-远端验证见 [实现提交的 GitHub Actions #72](https://github.com/frankyhitsz/fieldflow-local/actions/runs/34087295579)，覆盖 Ubuntu Python 3.11、Ubuntu Python 3.12 完整流程和 macOS Python 3.12。结果与失败输出以该运行记录为准，本地验证不代替远端检查。后续文档提交的检查可在 [Actions 列表](https://github.com/frankyhitsz/fieldflow-local/actions/workflows/ci.yml) 查看。
+初次远端验证 [GitHub Actions #72](https://github.com/frankyhitsz/fieldflow-local/actions/runs/34087295579) 三平台通过；随后 [CI #75](https://github.com/frankyhitsz/fieldflow-local/actions/runs/34088004099) 的 macOS 失败已按上文修复，没有把第一次绿灯当作最终结论。补修后的定向结果为 36 项运行时通过，停机相关 8 项连续五轮通过。最新提交的终态及日志见 [Actions 列表](https://github.com/frankyhitsz/fieldflow-local/actions/workflows/ci.yml)。
 
 构建依赖锁另经 `pip-audit -r requirements-build.lock` 检查，退出码 0，未发现已知漏洞。

@@ -15,6 +15,8 @@
 - [x] 冻结源码全量后端 352 项通过，覆盖率 87.36%；26 项 React 连续五轮和 7 项 Playwright 通过。独立发行包、旧库恢复再升级、构建、静态检查、依赖审计与性能门禁通过。
 - [x] 按后端/存储、前端、发行/性能拆分提交：`c78ddec`、`60a4189`、`2fe1258`。
 - [x] 实现提交已推送到 `main`，终点为 `2fe12586ad353aebd5811eb94a4edf5e8ca052bf`。远端验证记录见 [GitHub Actions #72](https://github.com/frankyhitsz/fieldflow-local/actions/runs/34087295579)，以运行页面的终态和日志为准。
+- [x] CI #72 三平台通过；文档提交的 CI #75 在 macOS 重启测试暴露停机被记为用户取消的间歇问题。已分离停机中断与用户取消，并把旧模拟故障测试与持续 Dispatcher 的交错改为受控条件。六类任务恢复与取消边界的 36 项定向测试通过。
+- [x] 停机补修 `b86aa30105263e2f0e533c3c66ea97154f5bd897` 的完整 `make verify` 通过：359 项后端、覆盖率 87.35%、26 项 React、7 项 Playwright、8/8 mutation，构建、依赖审计、历史性能及发行包检查通过。停机专项 8 项另连续五轮通过；最新远端结果见 [Actions](https://github.com/frankyhitsz/fieldflow-local/actions/workflows/ci.yml)。
 
 ## 2026-08-29 历史目标
 
