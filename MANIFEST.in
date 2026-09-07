@@ -1,0 +1,9 @@
+include requirements-runtime.lock
+include requirements-build.lock
+include docs/sbom-runtime.cdx.json
+include frontend/package-lock.json
+recursive-include frontend/dist *
+prune tests
+prune review-stage
+exclude pro-plan.md
+exclude FieldFlow_Local_Audit_and_Taskbook_2026-09-07.md

@@ -4,9 +4,21 @@
 
 FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场执行事实、求解候选、正式方案和经营分析分开保存；失败、重复请求或进程中断不能改写最后一份可执行方案，也不能让公开编号无故跳号。
 
-本轮以 2026-08-29 更新的 `pro-plan.md` 为审查输入。每条建议都以当前代码、SQLite 关系和可运行流程复核；合理项直接实现并验证，过度推断则记录反证。任务书中的持久运行时、现场业务闭环和决策科学扩展也进入本轮渐进交付范围，不因跨版本而自动延期，但未完成的能力不能以占位类型或文档声明冒充完成。
+本轮以 2026-09-07 审查任务书为输入，逐项复核 F01–F30。维护目标是旧证据兼容、安全迁移恢复、精确命令结果、取消与提交裁决、持久任务调度、前端一致状态和可验证发行包。FF-1914 的多次上门等产品路线按任务书留作后续业务设计。
 
-当前发布目标为 v0.5.11 Correctness Freeze：Start 与 Complete 使用各自的权威事实；紧急接收有独立 Receipt；调度读取绑定同一 D/V/E；Run、Candidate、恢复变换、命令和发布都具有可验证清单；报告明确区分冻结与当前；Risk V7 和 Capacity Artifact 能自包含地解释结果。
+当前发布目标为 v0.5.12 / schema 28。沿用 Start/Complete 权威拆分、Receipt、D/V/E 快照和版本化证明，补齐旧证据读入、维护锁、取消裁决、任务代际、任务中心和独立发行包。
+
+## 本轮合同
+
+- Job 的入队身份、语义复用和执行代际分开。协调器持续领取任务，最多 3 个工作槽，长任务最多占 2 个；数据库最多接收 64 个活动任务，其中策略实验最多 4 个。基线、优化、重排的同步 HTTP 接口适配同一持久任务入口；历史切换等短事务操作直接提交，不创建影子任务。
+- 支持的欧氏/矩阵行程模型在新任务入队时冻结；排程和实验若发现模型已变则拒绝执行，分析子进程使用保存的模型。分析任务还冻结决策代码身份，升级后不冒充原环境精确重试；普通排程/实验在执行时绑定实际运行政策，其结果清单记录该政策。旧队列缺少的输入身份不能据此推断为入队时已证明。
+- 发布与 Job 终态在同一写事务裁决。取消先发生则拒绝正式发布；提交先发生则返回已提交结果。所有结果写入核对 owner、generation、有效租约和取消状态。
+- 基线、重排和成本任务优先，同组按入队时间领取；等待 30 秒后提升优先级，避免连续短请求饿死长任务。长任务仍最多占两个槽，提升优先级不突破并发上限。
+- 普通 Store 打开不进行迁移、重启恢复、种子填充或全历史扫描。完整历史核验可显式运行；调度缓存只复用同一 SQLite data_version、同一数据库 inode 的核验结果，当前 D/V/E 来源每次仍校验。
+- 前端业务操作只接受一致快照的 READY 状态。未知、刷新中和读取失败不解释为“可执行”或“无风险”；完成服务使用可信 ActiveBookingView，不依赖当前方案包含该工单。
+- 首页冻结 KPI 的基线差值来自后端 Comparison DTO；相同 D 并不自动代表相同统计范围，比较失败或不可比时不显示改善提示。
+- Plan/Analysis/Job 列表按 100 条分页。正式 D/V/E/A、命令和终态 Job 不自动删除；Blob GC 仅清理超过保留期且无引用的对象，不能当成全部业务历史的清理策略。运行时持久记录的增长通过分页和备份管理，不隐式删审计事实。
+- 离线维护使用 SQLite backup、排他文件锁、唯一备份名和 fsync 替换日志；物理完整性、领域完整性、schema 兼容性分别检查。当前 schema 缺失原生证明不得补签为有效。
 
 ## 当前范围
 
@@ -25,7 +37,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 - `PlanVersion` 的冻结 payload 不保存运行时 `active`、`coverage_status` 或名称变化；Schema v21 的 `plan_applicability` 独立投影路线可执行、覆盖完整、规划/指标/商业数据是否当前、再优化机会和无效 assignment，名称、备注和标签由 `plan_metadata` 覆盖。`coverage_status` 只由多轴状态投影，不再作为第二套事实。
 - PlanningReservation 在一个 `BEGIN IMMEDIATE` 中冻结已校验的 Scenario、活动 Plan、来源 Plan、执行水位和上下文；ScheduleRun 与 Candidate 绑定 reservation ID/hash。发布事务在分配 V 之前复核 reservation、候选 D、活动/来源 V 及执行上下文；任一变化都拒绝陈旧候选，失败请求不占版本号。
 - baseline、optimize、replan、activate、restore、reattest、人工改派和实验发布使用同一活动 V 前置条件。冲突返回结构化 code 和 expected/current ID，不把 Store 异常退化成字符串。
-- `D000` 是每个场景唯一根，后续编号必须连续。原生写入只验证关系行保存的链头和最新节点，保持 O(1)；启动扫描负责整链验证。损坏节点之后的修订标记为 `ANCESTOR_INVALID`，不会被重新解释为新根；迁移回填证明标记为 `MIGRATION_BACKFILLED`。
+- `D000` 是每个场景唯一根，后续编号必须连续。原生写入只验证关系行保存的链头和最新节点，保持 O(1)；显式审计、调度首次读取及缓存失效后的读取负责整链验证。损坏节点之后的修订标记为 `ANCESTOR_INVALID`，不会被重新解释为新根；迁移回填证明标记为 `MIGRATION_BACKFILLED`。
 - `scenarios.payload`、关系 ID、当前快照 hash、最新 D 编号/hash 和最新修订快照必须完全一致。失败时 GET、编辑、求解、发布和分析均拒绝，不能通过下一次正常编辑把未留痕修改洗入历史。
 - PlanApplicability 保存被评估的 D、场景快照 hash、reducer 版本和 projection hash。Operational View 只使用与当前链头完全匹配的投影，并为每张工单返回唯一 disposition，统一驱动 KPI、队列、地图、时间轴、详情和开工门禁。
 
@@ -93,7 +105,7 @@ FieldFlow 是离线现场服务调度台。系统必须把业务数据、现场�
 
 ## 兼容与迁移
 
-- Schema v10–v23 保留原有成本、方案、分析、适用性、修订链头和 PlanningReservation 演进；v24 增加 Emergency Intake Receipt；v25 增加 Run/Candidate/Command/Restore 清单；v26 增加 Runtime Job、Outbox 和 Risk Comparison Saga；v27 增加内容寻址 Artifact Blob。
+- Schema v10–v23 保留原有成本、方案、分析、适用性、修订链头和 PlanningReservation 演进；v24 增加 Emergency Intake Receipt；v25 增加 Run/Candidate/Command/Restore 清单；v26 增加 Runtime Job、Outbox 和 Risk Comparison Saga；v27 增加内容寻址 Artifact Blob；v28 增加 Job/Analysis 所有权绑定、命令证明来源和 Blob 引用保护。
 - 应用启动只初始化空数据库，不隐式升级已有 schema。`fieldflow migrate dry-run/apply/verify/restore` 在临时副本验证、备份并原子替换。大 Artifact 使用内容哈希和 zlib 压缩去重；维护命令只能清理超过保留期且没有关系引用的 Blob。
 - Python 生产与开发依赖分别使用带 SHA-256 的 `requirements-runtime.lock` 和 `requirements-dev.lock`，安装强制 `--require-hashes`。决策运行时清单 V2 只绑定生产 lock，并保存实际 distribution inventory。当前支持 Python 3.11–3.13、Linux/macOS；CI 覆盖 Ubuntu 3.11/3.12 与 macOS 3.12。`docs/sbom-runtime.cdx.json` 由锁文件确定性生成并在验证门禁检查。
 - v1 旧方案历史缺少完整业务快照，按已确认的产品决定先生成时间戳备份再重建，当前业务数据保留。

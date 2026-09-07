@@ -58,7 +58,9 @@ def test_user_facing_copy_stays_direct_and_version_numbers_stay_consistent():
     readme = Path("README.md").read_text()
     assert "<http://127.0.0.1:8000/docs>" in readme
     assert "`fieldflow.db`" in readme
-    assert "不会进入 Git" in readme
+    assert "FIELDFLOW_DB" in readme
+    assert "*.db" in Path(".gitignore").read_text()
+    assert "*.db-*" in Path(".gitignore").read_text()
     assert "V{plan_number:03d}" in Path("backend/report.py").read_text()
 
 

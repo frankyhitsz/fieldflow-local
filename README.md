@@ -17,18 +17,25 @@ make demo PORT=8001
 
 需要查看或试调接口时，打开 <http://127.0.0.1:8000/docs>。
 
-每次运行的数据都写在项目根目录的 `fieldflow.db` 中。这个文件只留在本机，不会进入 Git；迁移备份、虚拟环境、`node_modules` 和前端构建目录也一样。
+默认数据库是启动目录中的 `fieldflow.db`。需要放到其他位置时，设置 `FIELDFLOW_DB=/绝对路径/fieldflow.db`。
 
-`make setup` 按 `requirements-runtime.lock` 和 `requirements-dev.lock` 安装已解析的 Python 依赖，再安装本项目。当前脚本和依赖锁支持 Linux、macOS；Windows 尚未纳入支持与 CI 范围。
+`make setup` 使用带校验和的生产、开发和构建依赖锁，再安装本项目。当前脚本和依赖锁支持 Linux、macOS；Windows 尚未纳入支持与 CI 范围。
 
-升级已有数据库时先检查并演练迁移。应用启动不会替你改写旧 schema：
+v0.5.12 使用 schema 28。升级旧数据库前先停止服务；维护锁会拒绝替换仍在使用的数据库。激活虚拟环境后执行：
 
 ```bash
+source .venv/bin/activate
 fieldflow migrate inspect
 fieldflow migrate dry-run
 fieldflow migrate apply
 fieldflow migrate verify
 ```
+
+迁移会先生成 `*.pre-migrate-时间戳.db` 备份，保留方案与执行历史。恢复时使用 `fieldflow migrate restore /绝对路径/备份.db --force`；不要手动复制正在使用的主库文件或删除 WAL。
+
+任务中心可查看、取消后台排程和分析任务。关闭页面不等于取消；已发布的结果不会因随后点击取消而撤回。同一数据库只运行一个服务进程，不启用多个 Uvicorn worker。
+
+`make distribution-check` 会构建 wheel 和源码包，在独立虚拟环境中安装并验证网页及完整服务流程，制品和校验和写入 `dist/`。wheel 已包含前端，无须在安装目录运行 npm。
 
 ## 先试一遍
 
@@ -115,7 +122,7 @@ fieldflow migrate verify
 - `INVALID_MODEL` / `FAILED` / `CANCELLED`：模型、运行或取消状态。
 - `OPTIMAL`：只在求解器明确返回最优性证明时使用。
 
-未分配工单会给出原因码和处理建议。工单详情中的“开始服务”和“完成服务”会校验当前正式分配并写入执行事件；局部重排保留服务中的安排并排除已完成工单。系统仍不会根据计划时间猜测“已出发”或“已到场”。
+未分配工单会给出原因码和处理建议。“开始服务”校验当前正式分配，“完成服务”校验已经登记的开始事件与 Booking，不要求当前方案仍包含该工单。局部重排保留服务中的安排并排除已完成工单。系统不会根据计划时间猜测“已出发”或“已到场”。
 
 ## 检查
 

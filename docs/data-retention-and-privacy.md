@@ -12,6 +12,10 @@ fieldflow artifacts prune --retention-days 30 --apply
 fieldflow artifacts vacuum
 ```
 
+Command, Job, and dispatched Outbox records are also retained. They can contain frozen requests and diagnostic details; pagination limits response size, not database growth. There is no automatic Outbox archive or business-history deletion command. Risk summaries are the default; full trial diagnostics require an explicit request and are limited to 1,000 trials per analysis.
+
+Stop the service before migration, restore, or vacuum. The application, workers, and maintenance commands use the same per-database lock protocol. Do not remove lock files or SQLite WAL files to bypass an in-use error.
+
 Migration commands create safety backups next to the database. Review and remove obsolete backups according to the operator's own retention requirements. FieldFlow cannot determine when a customer contract, regulation, or incident hold requires data to be retained.
 
 The content hashes detect accidental changes and broken relationships. They are stored beside the data and are not signatures against an administrator who can rewrite the database. See `SECURITY.md` before binding the service to anything other than `127.0.0.1`.

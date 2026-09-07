@@ -1,4 +1,4 @@
-.PHONY: setup lock-check lint audit test mutation-test mutation-smoke test-frontend test-e2e build verify demo demo-check benchmark benchmark-smoke clean-data
+.PHONY: setup lock-check lint audit test mutation-test mutation-smoke test-frontend test-e2e build verify demo demo-check benchmark benchmark-smoke history-benchmark distribution-check clean-data
 
 PYTHON := .venv/bin/python
 PYTEST := .venv/bin/pytest
@@ -7,8 +7,8 @@ PORT ?= 8000
 
 setup:
 	python3 -m venv .venv
-	.venv/bin/pip install --require-hashes -r requirements-dev.lock
-	.venv/bin/pip install -e . --no-deps
+	.venv/bin/pip install --require-hashes -r requirements-dev.lock -r requirements-build.lock
+	.venv/bin/pip install -e . --no-deps --no-build-isolation
 	cd frontend && npm ci --cache $(NPM_CACHE)
 
 lock-check:
@@ -52,7 +52,13 @@ benchmark:
 
 benchmark-smoke: benchmark
 
-verify: lock-check lint audit test mutation-test test-frontend build demo-check benchmark test-e2e
+history-benchmark:
+	PYTHONPATH=. $(PYTHON) scripts/benchmark_history.py
+
+distribution-check: build
+	$(PYTHON) scripts/distribution_smoke.py --output dist
+
+verify: lock-check lint audit test mutation-test test-frontend build demo-check benchmark history-benchmark distribution-check test-e2e
 
 demo: build
 	@echo "FieldFlow Local → http://127.0.0.1:$(PORT)"

@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 *.db
+*.db-*
 node_modules/
 dist/
 playwright-report/
@@ -18,3 +19,8 @@ frontend/vite.config.d.ts
 .aris/
 review-stage/
 REVIEWER_MEMORY.md
+.mutation-results/
+build/
+*.access.lock
+*.coordinator.lock
+*.maintenance.json

@@ -1,0 +1,45 @@
+{
+  "platform": "macOS-13.7.8-arm64-arm-64bit-Mach-O",
+  "python": "3.13.12",
+  "samples": [
+    {
+      "revisions": 10,
+      "cold_dispatch_ms": 2.381,
+      "p50_dispatch_ms": 0.937,
+      "p95_dispatch_ms": 0.992,
+      "queries_per_dispatch": 5,
+      "worker_open_ms": 0.2,
+      "write_lock_ms": 0.034,
+      "peak_rss_bytes": 79298560,
+      "db_bytes": 634880,
+      "wal_bytes": 0,
+      "blob_bytes": 0
+    },
+    {
+      "revisions": 1000,
+      "cold_dispatch_ms": 100.604,
+      "p50_dispatch_ms": 0.933,
+      "p95_dispatch_ms": 1.175,
+      "queries_per_dispatch": 5,
+      "worker_open_ms": 0.178,
+      "write_lock_ms": 0.027,
+      "peak_rss_bytes": 84934656,
+      "db_bytes": 2646016,
+      "wal_bytes": 4136512,
+      "blob_bytes": 0
+    },
+    {
+      "revisions": 10000,
+      "cold_dispatch_ms": 1041.732,
+      "p50_dispatch_ms": 0.96,
+      "p95_dispatch_ms": 1.201,
+      "queries_per_dispatch": 5,
+      "worker_open_ms": 0.251,
+      "write_lock_ms": 0.04,
+      "peak_rss_bytes": 117850112,
+      "db_bytes": 21942272,
+      "wal_bytes": 4161232,
+      "blob_bytes": 0
+    }
+  ]
+}
