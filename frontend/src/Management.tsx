@@ -1,4 +1,4 @@
-import { Component, type ErrorInfo, type ReactNode, useEffect, useState } from 'react'
+import { Component, type ErrorInfo, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle, BarChart3, Edit3, Plus, Save, ShieldCheck, Trash2, X, Zap,
 } from 'lucide-react'
@@ -40,7 +40,12 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, { error
   }
 }
 
-export function VersionsView({ scenario, plans, onOpen, onActivate, onReattest, onClone, onRestore, onCompare, onRename, onReset }: { scenario: Scenario; plans: PlanVersion[]; onOpen: (plan: PlanVersion) => void; onActivate: (plan: PlanVersion) => void; onReattest: (plan: PlanVersion) => void; onClone: (plan: PlanVersion) => void; onRestore: (plan: PlanVersion) => void; onCompare: (before: PlanVersion, after: PlanVersion) => void; onRename: (plan: PlanVersion, label: string) => void; onReset: () => void }) {
+export function VersionsView({ scenario, plans: initialPlans, onOpen, onActivate, onReattest, onClone, onRestore, onCompare, onRename, onReset }: { scenario: Scenario; plans: PlanVersion[]; onOpen: (plan: PlanVersion) => void; onActivate: (plan: PlanVersion) => void; onReattest: (plan: PlanVersion) => void; onClone: (plan: PlanVersion) => void; onRestore: (plan: PlanVersion) => void; onCompare: (before: PlanVersion, after: PlanVersion) => void; onRename: (plan: PlanVersion, label: string) => void; onReset: () => void }) {
+  const [olderPlans, setOlderPlans] = useState<PlanVersion[]>([])
+  const [historyError, setHistoryError] = useState('')
+  const [moreHistory, setMoreHistory] = useState(true)
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const plans = [...new Map([...olderPlans, ...initialPlans].map(item => [item.id, item])).values()].sort((a, b) => a.number - b.number)
   const ordered = [...plans].reverse()
   const [actionFilter, setActionFilter] = useState('all')
   const [strategyFilter, setStrategyFilter] = useState('all')
@@ -62,6 +67,13 @@ export function VersionsView({ scenario, plans, onOpen, onActivate, onReattest, 
       <div className="version-filters"><label>动作<select aria-label="按动作筛选" value={actionFilter} onChange={event => setActionFilter(event.target.value)}><option value="all">全部动作</option><option value="baseline">人工基线</option><option value="optimize">优化</option><option value="replan">局部重排</option><option value="activate">历史激活</option><option value="restore">业务回滚</option><option value="reattest">重新验证</option><option value="experiment_publish">实验发布</option></select></label><label>策略<select aria-label="按策略筛选" value={strategyFilter} onChange={event => setStrategyFilter(event.target.value)}><option value="all">全部策略</option>{strategies.map(item => <option key={item} value={item}>{strategyLabel[item] || item}</option>)}</select></label><label>求解状态<select aria-label="按求解状态筛选" value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option value="all">全部状态</option>{statuses.map(item => <option key={item} value={item}>{item}</option>)}</select></label></div>
       <div className="version-compare"><span>跨版本比较</span><select aria-label="比较起点" value={beforeId} onChange={event => setBeforeId(event.target.value)}><option value="">起点版本</option>{trustedPlans.map(item => <option key={item.id} value={item.id}>V{String(item.number).padStart(3, '0')} · {item.label}</option>)}</select><span>→</span><select aria-label="比较终点" value={afterId} onChange={event => setAfterId(event.target.value)}><option value="">终点版本</option>{trustedPlans.map(item => <option key={item.id} value={item.id}>V{String(item.number).padStart(3, '0')} · {item.label}</option>)}</select><button disabled={!beforeId || !afterId || beforeId === afterId} onClick={() => { const before = trustedPlans.find(item => item.id === beforeId); const after = trustedPlans.find(item => item.id === afterId); if (before && after) onCompare(before, after) }}><BarChart3 size={15} />比较</button></div>
     </div>
+    {historyError && <p role="alert">{historyError}</p>}
+    {initialPlans.length >= 100 && moreHistory && <button disabled={loadingHistory} onClick={async () => {
+      setLoadingHistory(true)
+      try { const page = await api.olderPlanVersions(scenario.id, 100 + olderPlans.length); setOlderPlans(current => [...page, ...current]); setMoreHistory(page.length === 100); setHistoryError('') }
+      catch (error) { setHistoryError(error instanceof Error ? error.message : '历史读取失败') }
+      finally { setLoadingHistory(false) }
+    }}>{loadingHistory ? '正在读取历史' : '载入更早的 100 个版本'}</button>}
     <div className="version-list">
       {visible.map(item => {
         const schedule = item.selected
@@ -97,6 +109,8 @@ export function TechniciansView({ scenario, schedule, onEdit, onAdd }: { scenari
 }
 
 export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { scenarioId: string; planVersionId?: string; schedule?: Schedule; baseline?: Schedule }) {
+  const polling = useRef(new AbortController())
+  useEffect(() => { const controller = new AbortController(); polling.current = controller; return () => controller.abort() }, [])
   const [cost, setCost] = useState<CostAnalysis>()
   const [risk, setRisk] = useState<RiskSimulation>()
   const [capacity, setCapacity] = useState<CapacityAnalysis>()
@@ -165,7 +179,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
   const retryAnalysis = async (run: DecisionAnalysisRun) => {
     setLoadingDecision(true); setDecisionErrors([])
     try {
-      const retried = await waitForRun(await api.retryDecisionAnalysisRun(scenarioId, run.id))
+      const retried = await waitForRun(await api.retryDecisionAnalysisRun(scenarioId, run.id, undefined, polling.current.signal))
       if (retried.status !== 'COMPLETED' || !retried.result) {
         rememberRetryable(retried)
         throw new Error(`A${String(retried.number).padStart(3, '0')}：${typeof retried.error?.message === 'string' ? retried.error.message : '重试没有完成'}`)
@@ -188,7 +202,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     const runCost = async (): Promise<string | undefined> => {
       let run: DecisionAnalysisRun<CostAnalysis> | undefined
       try {
-        run = await waitForRun(await api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { horizonDays: effectiveHorizonDays }))
+        run = await waitForRun(await api.createDecisionAnalysisRun<CostAnalysis>(scenarioId, planVersionId, 'COST', { signal: polling.current.signal, horizonDays: effectiveHorizonDays }))
         setCost(completedResult(run, '成本分析'))
         setAnalysisNumbers(current => ({ ...current, cost: run?.number }))
       } catch (error) {
@@ -200,7 +214,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     const runRisk = async (): Promise<string | undefined> => {
       let run: DecisionAnalysisRun<RiskSimulation> | undefined
       try {
-        run = await waitForRun(await api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { horizonDays: effectiveHorizonDays, emergencyLocationPolicy }))
+        run = await waitForRun(await api.createDecisionAnalysisRun<RiskSimulation>(scenarioId, planVersionId, 'RISK', { signal: polling.current.signal, horizonDays: effectiveHorizonDays, emergencyLocationPolicy }))
         setRisk(completedResult(run, '风险分析'))
         setRiskAnalysisRunId(run.id); setRiskScenarioArtifact(undefined)
         setAnalysisNumbers(current => ({ ...current, risk: run?.number }))
@@ -218,7 +232,7 @@ export function ReviewView({ scenarioId, planVersionId, schedule, baseline }: { 
     setLoadingDecision(true); setDecisionErrors([])
     let run: DecisionAnalysisRun<CapacityAnalysis> | undefined
     try {
-      const created = await waitForRun(await api.createDecisionAnalysisRun<CapacityAnalysis>(scenarioId, planVersionId, 'CAPACITY', { referenceMode: capacityMode, horizonDays: effectiveHorizonDays }))
+      const created = await waitForRun(await api.createDecisionAnalysisRun<CapacityAnalysis>(scenarioId, planVersionId, 'CAPACITY', { signal: polling.current.signal, referenceMode: capacityMode, horizonDays: effectiveHorizonDays }))
       run = created
       setCapacity(completedResult(created, '容量分析')); setCapacityAnalysisRunId(created.id); setCapacityArtifact(undefined); setAnalysisNumbers(current => ({ ...current, capacity: created.number }))
     } catch (error) { if (run) rememberRetryable(run); setDecisionErrors([error instanceof Error ? error.message : '容量分析失败']) }

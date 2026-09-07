@@ -8,6 +8,15 @@ export interface components {
           expected_revision: number;
           idempotency_key: string;
         };
+    ActiveBookingView: {
+          actual_start_at: number;
+          booking_id: string;
+          planned_finish_at: (number) | (null);
+          planned_start_at: (number) | (null);
+          start_event_id: string;
+          technician_id: string;
+          work_order_id: string;
+        };
     AdditionalTechnicianCostMode: "WAGE_ONLY" | "FIXED_ONLY" | "WAGE_PLUS_FIXED";
     AnalysisFailureManifest: {
           error_code: string;
@@ -264,6 +273,7 @@ export interface components {
           delta: {
             [key: string]: (number) | (number) | (null);
           };
+          incomparable_reasons?: Array<string>;
           modified_work_orders?: Array<string>;
           raw_objective_comparable?: boolean;
           raw_objective_comparison_reason?: string;
@@ -591,6 +601,7 @@ export interface components {
           valid_assigned_count: number;
         };
     OperationalWorkOrderView: {
+          active_booking?: (components['schemas']["ActiveBookingView"]) | (null);
           assignment?: (components['schemas']["ScheduleAssignment"]) | (null);
           blocking_reason_code?: (string) | (null);
           complete_allowed?: boolean;

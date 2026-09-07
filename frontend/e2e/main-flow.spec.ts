@@ -100,3 +100,39 @@ test('changing a lock marks the displayed plan stale', async ({ page, request })
   await expect(page.getByText('现有路线仍可执行，展示指标已过期')).toBeVisible()
   await expect(page.getByText(/D\d{3}/).first()).toBeVisible()
 })
+
+test('task center survives reload with the selected scenario and durable job', async ({ page, request }) => {
+  const created = await request.post('/api/scenarios', { data: { fixture_id: 'main', name: 'E2E 持久任务' } })
+  const scenarioId = (await created.json()).id
+  expect((await request.post(`/api/scenarios/${scenarioId}/baseline`)).ok()).toBeTruthy()
+  const plan = (await (await request.get(`/api/scenarios/${scenarioId}/plan-versions`)).json())[0]
+  const queued = await request.post(`/api/v2/scenarios/${scenarioId}/plan-versions/${plan.id}/analysis-jobs`, {
+    headers: { 'Idempotency-Key': 'e2e-persisted-task' }, data: { analysis_type: 'COST' },
+  })
+  expect(queued.status()).toBe(202)
+  const job = await queued.json()
+  await page.goto(`/?scenario=${encodeURIComponent(scenarioId)}&view=jobs`)
+  await expect(page.getByRole('heading', { name: '任务中心' })).toBeVisible()
+  await expect(page.getByText(job.id, { exact: true })).toBeVisible()
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'E2E 持久任务' })).toBeVisible()
+  await expect(page.getByText(job.id, { exact: true })).toBeVisible()
+  const row = page.getByText(job.id, { exact: true }).locator('..').locator('..')
+  await expect(row.getByRole('button', { name: '查看结果' })).toBeVisible({ timeout: 15_000 })
+  await row.getByRole('button', { name: '查看结果' }).click()
+  await expect(page.getByText(/日总经济影响/)).toBeVisible()
+})
+
+test('dispatch refresh failure cannot show executable routes or enable publishing', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: '生成推荐方案' })).toBeEnabled()
+  await page.route('**/dispatch-snapshot', route => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ detail: '模拟连接中断' }) }))
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByText('当前调度状态核对失败')).toBeVisible()
+  await expect(page.getByRole('button', { name: '生成推荐方案' })).toBeDisabled()
+  await expect(page.getByText('当前风险状态未知')).toBeVisible()
+  await expect(page.locator('.route-line')).toHaveCount(0)
+  await page.unroute('**/dispatch-snapshot')
+  await page.getByRole('button', { name: '重新核对' }).click()
+  await expect(page.getByRole('button', { name: '生成推荐方案' })).toBeEnabled()
+})

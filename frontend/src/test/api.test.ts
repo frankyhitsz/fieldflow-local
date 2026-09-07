@@ -7,6 +7,24 @@ afterEach(() => {
 })
 
 describe('API write contracts', () => {
+  it('sends explicit D and V preconditions to the v2 plan endpoint', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => Response.json({}))
+    vi.stubGlobal('fetch', fetchMock)
+    await api.baseline('main', 7, null, 'baseline-precondition')
+    const [url, request] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/v2/scenarios/main/baseline')
+    expect(request?.headers).toMatchObject({ 'If-Match': 'D7' })
+    expect(JSON.parse(String(request?.body))).toEqual({ expected_active_plan_version_id: null })
+  })
+
+  it('does not lose an already aborted caller signal', async () => {
+    const controller = new AbortController(); controller.abort()
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.signal?.aborted).toBe(true)
+      throw new DOMException('aborted', 'AbortError')
+    }))
+    await expect(api.dispatchSnapshot('main', controller.signal)).rejects.toThrow('请求已取消')
+  })
   it('does not send aggregate identity or execution status in a work-order update', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ id: 'main' }), {
       status: 200,
@@ -37,7 +55,7 @@ describe('API write contracts', () => {
       },
     }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
 
-    const failure = await api.optimize('main').catch((error: unknown) => error)
+    const failure = await api.optimize('main', 'balanced', undefined, 'test-optimize', 'PV-1', 0).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(ApiError)
     expect(failure).toMatchObject({
       status: 409,

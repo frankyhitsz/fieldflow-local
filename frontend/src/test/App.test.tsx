@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { StrictMode } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import App from '../App'
 import { VersionsView, WorkOrderEditor } from '../Management'
@@ -45,7 +46,7 @@ const plan: PlanVersion = {
 
 const profiles: StrategyProfile[] = [{ id: 'balanced', name: '均衡', description: '均衡业务指标', builtin: true, time_limit_seconds: 2, created_at: '2026-08-23T00:00:00Z', weights: { travel_weight: 4, sla_late_weight: 12, overtime_weight: 8, imbalance_weight: 1, replan_change_weight: 80, unassigned_penalty_scale: 1 } }]
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/') })
 
 function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; existingFailed?: boolean; noEmergency?: boolean; riskGate?: Promise<void>; dispatchPlan?: PlanVersion } = {}) {
   const submittedAnalyses = new Map<string, { analysis_type: 'COST' | 'CAPACITY' | 'RISK'; analysis_scope?: string; request: { analysis_horizon?: { days: number } } }>()
@@ -88,6 +89,31 @@ function mockApi(activePlan: PlanVersion = plan, options: { failRisk?: boolean; 
 }
 
 describe('FieldFlow navigation and render safety', () => {
+  it.each([true, false])('uses server KPI comparability (%s), not matching client-side metadata', async comparable => {
+    mockApi()
+    const original = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/comparison?')) return new Response(JSON.stringify({
+        comparable, before: { ...schedule, id: 'SCH-BASE' }, after: schedule,
+        delta: { travel_minutes: -7, overtime_minutes: -2 },
+      }))
+      return original(input, init)
+    }))
+    render(<App />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成推荐方案' })).toBeEnabled())
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/comparison?after=PV-1'), expect.anything()))
+    if (comparable) expect(await screen.findByText('7 较基线')).toBeInTheDocument()
+    else expect(screen.queryByText(/较基线/)).not.toBeInTheDocument()
+  })
+  it('can submit analyses under React StrictMode after effect replay', async () => {
+    mockApi(); render(<StrictMode><App /></StrictMode>)
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成推荐方案' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '运营复盘' }))
+    const submit = await screen.findByRole('button', { name: '生成成本与风险分析' })
+    await waitFor(() => expect(submit).toBeEnabled())
+    fireEvent.click(submit)
+    expect(await screen.findByText(/日总经济影响/)).toBeInTheDocument()
+  })
   it('opens every primary navigation page', async () => {
     mockApi(); render(<App />)
     await screen.findByRole('heading', { name: '今日调度测试' })
@@ -127,6 +153,52 @@ describe('FieldFlow navigation and render safety', () => {
     await screen.findByRole('heading', { name: '今日调度测试' })
     await waitFor(() => expect(screen.getByText('正在核对当前业务状态')).toBeInTheDocument())
     expect(screen.queryByText('0 / 1 单可执行 · 0 单分配失效')).not.toBeInTheDocument()
+    expect(await screen.findByText('方案连续发生变化，尚未取得一致快照。请重新核对。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '生成推荐方案' })).toBeDisabled()
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/dispatch-snapshot'))).toHaveLength(3)
+  })
+
+  it('fails closed after a previously valid dispatch snapshot cannot refresh', async () => {
+    mockApi(); render(<App />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成推荐方案' })).toBeEnabled())
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation(async (input, init) => String(input).endsWith('/dispatch-snapshot')
+      ? new Response(JSON.stringify({ detail: 'snapshot unavailable' }), { status: 503 }) : original(input, init))
+    fireEvent(window, new Event('focus'))
+    expect(await screen.findByText('当前调度状态核对失败')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '生成推荐方案' })).toBeDisabled()
+    expect(screen.getByText('状态未核对')).toBeInTheDocument()
+    expect(screen.getByText('当前风险状态未知')).toBeInTheDocument()
+    expect(screen.queryByText('当前没有风险工单')).not.toBeInTheDocument()
+    expect(document.querySelectorAll('.route-line')).toHaveLength(0)
+  })
+
+  it('can complete a trusted active booking without any active plan assignment', async () => {
+    mockApi()
+    const original = vi.mocked(fetch).getMockImplementation()!
+    const started: Scenario = { ...scenario, revision: 1, work_orders: [{ ...scenario.work_orders[0], status: 'started' }] }
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/plan-versions')) return Response.json([])
+      if (url.endsWith('/api/scenarios/main')) return Response.json(started)
+      const response = await original(input, init)
+      if (!url.endsWith('/dispatch-snapshot')) return response
+      const snapshot = await response.json()
+      snapshot.scenario = started; snapshot.active_plan = null
+      snapshot.operational_view = { ...snapshot.operational_view, scenario_revision: 1, active_plan_version_id: null,
+        work_orders: [{ work_order_id: 'WO-1', disposition: 'STARTED', assignment: null, start_allowed: false,
+          complete_allowed: true, active_booking: { booking_id: 'BOOK-1', start_event_id: 'EV-START-1',
+            work_order_id: 'WO-1', technician_id: 'TECH-01', actual_start_at: 561, planned_start_at: 560, planned_finish_at: 590 } }] }
+      return Response.json(snapshot)
+    })
+    render(<App />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成推荐方案' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '全部' }))
+    fireEvent.click(screen.getByText('WO-1'))
+    fireEvent.click(screen.getByRole('button', { name: '完成服务' }))
+    expect(screen.getByRole('dialog', { name: '登记完成服务' })).toBeInTheDocument()
+    expect(screen.getByLabelText('执行技师')).toHaveValue('林乔')
+    expect(screen.getByLabelText('实际发生时间')).toHaveValue(590)
   })
 
   it('shows an actionable startup diagnosis when the backend is unavailable', async () => {
@@ -184,7 +256,9 @@ describe('FieldFlow navigation and render safety', () => {
     fireEvent.change(screen.getByLabelText('重排时点（当日起分钟数）'), { target: { value: '900' } })
     fireEvent.click(screen.getByRole('button', { name: '全部' }))
     fireEvent.click(screen.getByText('WO-1'))
-    fireEvent.click(screen.getByRole('button', { name: '开始服务' }))
+    const start = await screen.findByRole('button', { name: '开始服务' })
+    await waitFor(() => expect(start).toBeEnabled())
+    fireEvent.click(start)
     expect(screen.getByRole('dialog', { name: '登记开始服务' })).toBeInTheDocument()
     expect(screen.getByLabelText('实际发生时间')).toHaveValue(560)
     expect(screen.getByText('09:20，与重排时点相互独立')).toBeInTheDocument()

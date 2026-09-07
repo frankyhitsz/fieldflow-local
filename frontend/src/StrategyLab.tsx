@@ -50,30 +50,46 @@ function ProfileEditor({ initial, onClose, onSaved }: { initial?: StrategyProfil
   </section></div>
 }
 
-export function StrategyLab({ scenario, profiles, loadingDataset, expectedActivePlanId, onSelectDataset, onReloadProfiles, onPublished, onToast }: { scenario: Scenario; profiles: StrategyProfile[]; loadingDataset: boolean; expectedActivePlanId?: string | null; onSelectDataset: (id: string) => void; onReloadProfiles: () => Promise<void>; onPublished: (plan: PlanVersion) => void; onToast: (message: string) => void }) {
+export function StrategyLab({ scenario, profiles, loadingDataset, expectedActivePlanId, initialExperimentId, onSelectDataset, onReloadProfiles, onPublished, onToast }: { scenario: Scenario; profiles: StrategyProfile[]; loadingDataset: boolean; expectedActivePlanId: string | null; initialExperimentId?: string; onSelectDataset: (id: string) => void; onReloadProfiles: () => Promise<void>; onPublished: (plan: PlanVersion) => void; onToast: (message: string) => void }) {
   const selectable = profiles.filter(profile => profile.id !== 'stable')
   const [selected, setSelected] = useState<string[]>(() => selectable.map(profile => profile.id))
   const [experiment, setExperiment] = useState<StrategyExperiment>()
   const [editor, setEditor] = useState<StrategyProfile | null | undefined>()
   const [working, setWorking] = useState('')
 
-  const experimentId = experiment?.id
-  const experimentStatus = experiment?.status
-  const experimentScenarioId = experiment?.scenario_id
   useEffect(() => {
-    if (!experimentId || !experimentScenarioId || !experimentStatus || !activeExperimentStatuses.includes(experimentStatus)) return
-    let cancelled = false
     const controller = new AbortController()
-    const timer = window.setTimeout(async () => {
+    let saved: string | null = null
+    try { saved = localStorage.getItem(`fieldflow-experiment:${scenario.id}`) } catch { /* task center can still reopen it */ }
+    const id = initialExperimentId || saved
+    if (id) void api.experiment(scenario.id, id, controller.signal).then(setExperiment)
+      .catch(error => { if (!controller.signal.aborted) onToast(error.message) })
+    return () => controller.abort()
+  }, [scenario.id, initialExperimentId, onToast])
+
+  const experimentId = experiment?.id
+  useEffect(() => {
+    if (!experimentId) return
+    try { localStorage.setItem(`fieldflow-experiment:${scenario.id}`, experimentId) } catch { /* server list remains authoritative */ }
+    const controller = new AbortController()
+    let timer: number | undefined
+    let failures = 0
+    const poll = async () => {
       try {
-        const next = await api.experiment(experimentScenarioId, experimentId, controller.signal)
-        if (!cancelled) setExperiment(next)
+        const next = await api.experiment(scenario.id, experimentId, controller.signal)
+        if (controller.signal.aborted) return
+        setExperiment(next); failures = 0
+        if (!activeExperimentStatuses.includes(next.status)) return
       } catch (cause) {
-        if (!cancelled && !controller.signal.aborted) onToast(cause instanceof Error ? cause.message : '实验进度读取失败')
+        if (controller.signal.aborted) return
+        failures += 1
+        onToast(cause instanceof Error ? cause.message : '实验进度读取失败')
       }
-    }, 650)
-    return () => { cancelled = true; controller.abort(); window.clearTimeout(timer) }
-  }, [experimentId, experimentScenarioId, experimentStatus, onToast])
+      timer = window.setTimeout(poll, Math.min(650 * 2 ** failures, 10000))
+    }
+    timer = window.setTimeout(poll, 650)
+    return () => { controller.abort(); window.clearTimeout(timer) }
+  }, [experimentId, scenario.id, onToast])
 
   const run = async () => {
     setWorking('正在准备实验')
@@ -95,7 +111,7 @@ export function StrategyLab({ scenario, profiles, loadingDataset, expectedActive
   const cancel = async () => {
     if (!experiment) return
     setWorking('正在取消实验')
-    try { setExperiment(await api.cancelExperiment(scenario.id, experiment.id)); onToast('已提交取消请求，当前求解结束后会停止。') }
+    try { setExperiment(await api.cancelExperiment(scenario.id, experiment.id)); onToast('已提交取消请求，正在停止后台求解。') }
     catch (cause) { onToast(cause instanceof Error ? cause.message : '实验取消失败') }
     finally { setWorking('') }
   }
